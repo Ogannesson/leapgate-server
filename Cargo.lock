@@ -1431,35 +1431,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hbbs"
-version = "1.1.17"
-dependencies = [
- "async-speed-limit",
- "async-trait",
- "base64 0.13.0",
- "chrono",
- "clap 2.34.0",
- "dns-lookup",
- "flexi_logger 0.22.3",
- "hbb_common",
- "ipnetwork",
- "lazy_static",
- "local-ip-address",
- "once_cell",
- "reqwest",
- "rust-ini",
- "serde",
- "serde_derive",
- "serde_json",
- "sodiumoxide",
- "sqlx",
- "tempfile",
- "tokio-tungstenite",
- "tungstenite",
- "uuid",
-]
-
-[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2452,6 +2423,35 @@ dependencies = [
  "cpufeatures",
  "opaque-debug",
  "universal-hash",
+]
+
+[[package]]
+name = "porta-server"
+version = "1.1.17"
+dependencies = [
+ "async-speed-limit",
+ "async-trait",
+ "base64 0.13.0",
+ "chrono",
+ "clap 2.34.0",
+ "dns-lookup",
+ "flexi_logger 0.22.3",
+ "hbb_common",
+ "ipnetwork",
+ "lazy_static",
+ "local-ip-address",
+ "once_cell",
+ "reqwest",
+ "rust-ini",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "sodiumoxide",
+ "sqlx",
+ "tempfile",
+ "tokio-tungstenite",
+ "tungstenite",
+ "uuid",
 ]
 
 [[package]]
