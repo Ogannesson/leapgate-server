@@ -15,6 +15,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
+    sync::Mutex,
     time::{Duration, Instant},
 };
 use tempfile::TempDir;
@@ -333,19 +334,40 @@ impl Drop for Server {
     }
 }
 
-/// A random P with TCP P-2, P-1, P, P+2 and UDP P all free.
+/// Ports this test process already handed out: the probe below frees them again, so parallel tests
+/// could otherwise pick overlapping ranges before their servers bind.
+static RESERVED: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+
+/// A random P with TCP P-2, P-1, P, P+2 and UDP P all free and not handed out before.
 fn free_base_port() -> u16 {
     let mut rng = hbb_common::rand::thread_rng();
+    let mut reserved = RESERVED.lock().unwrap();
     for _ in 0..200 {
         let p: u16 = rng.gen_range(20000..60000);
-        let tcp_ok = [p - 2, p - 1, p, p + 2]
+        let ports = [p - 2, p - 1, p, p + 2];
+        if ports.iter().any(|q| reserved.contains(q)) {
+            continue;
+        }
+        let tcp_ok = ports
             .iter()
             .all(|&q| TcpListener::bind((Ipv4Addr::UNSPECIFIED, q)).is_ok());
         if tcp_ok && UdpSocket::bind((Ipv4Addr::UNSPECIFIED, p)).is_ok() {
+            reserved.extend(ports);
             return p;
         }
     }
     panic!("no free port range found");
+}
+
+#[test]
+fn free_base_port_never_hands_out_a_port_twice() {
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..500 {
+        let p = free_base_port();
+        for q in [p - 2, p - 1, p, p + 2] {
+            assert!(seen.insert(q), "port {q} handed out twice");
+        }
+    }
 }
 
 /// `POST /api/login` like the client (note 03 §2.2). Returns `(status, parsed body or Null)`.

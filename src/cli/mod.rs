@@ -1,6 +1,7 @@
 //! Command line management (PORTA.md §14): `porta-server <subcommand> …`.
 //! Opens the same database as the server (`DB_URL`, read the same way: `.env`, `-c` INI, environment,
-//! command line; migrations run on open); subcommands that need runtime state talk to the local
+//! command line; migrations run on open; a missing database is an error, not created); subcommands
+//! that write print its absolute path; subcommands that need runtime state talk to the local
 //! console (127.0.0.1:`port-1`).
 
 mod manage;
@@ -72,18 +73,35 @@ pub fn run(argv: Vec<String>) -> ResultType<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
+    let db_url = crate::database::db_url();
+    let changes = changes_database(&args);
     rt.block_on(async {
         let ctx = Ctx {
-            db: crate::database::open(&crate::database::db_url()).await?,
+            db: crate::database::open(&db_url, false).await?,
             console: SocketAddr::from(([127, 0, 0, 1], port - 1)),
             porta_config: PathBuf::from(get_arg_or("porta-config", "porta.toml".to_owned())),
             secret_key: PathBuf::from(crate::crypto::SECRET_KEY_FILE),
         };
         let stdin = std::io::stdin();
-        let out = exec(&ctx, args, &mut stdin.lock()).await?;
+        let mut out = exec(&ctx, args, &mut stdin.lock()).await?;
+        if changes {
+            out += &format!("Database: {}\n", crate::database::db_file(&db_url)?.display());
+        }
         print!("{out}");
         Ok(())
     })
+}
+
+/// Whether the subcommand in `args` writes to the database. Its output then names the database file,
+/// so a change made through a wrong `DB_URL` shows.
+fn changes_database(args: &Args) -> bool {
+    let mut words = args.pos.iter().map(String::as_str);
+    match (words.next(), words.next()) {
+        (Some("user" | "group" | "ab" | "device"), Some("list")) | (Some("strategy"), Some("show")) => false,
+        (Some("relay" | "route" | "geo" | "stats"), _) => false,
+        (Some("import"), _) => !args.opts.iter().any(|(n, _)| n == "--dry-run"),
+        _ => true,
+    }
 }
 
 /// The same sources as the server's `init_args`, in the same order: `.env`, then the `-c` INI
@@ -377,6 +395,36 @@ pub(super) mod tests {
         assert!(Args::parse(vec!["user".into(), "--nope".into()]).is_err());
         assert!(Args::parse(vec!["user".into(), "--owner".into()]).is_err());
         assert!(Args::parse(vec!["user".into(), "--admin=1".into()]).is_err());
+    }
+
+    #[test]
+    fn only_writes_name_the_database() {
+        for words in [
+            &["user", "add", "alice"][..],
+            &["user", "passwd", "alice"],
+            &["group", "member", "add", "g", "alice"],
+            &["ab", "grant", "b", "--user", "alice", "rw"],
+            &["device", "pin-relay", "123", "none"],
+            &["strategy", "set", "*", "k", "v"],
+            &["strategy", "repush", "*"],
+            &["import", "rustdesk-api", "x.db"],
+        ] {
+            assert!(changes_database(&args(words)), "{words:?}");
+        }
+        for words in [
+            &["user", "list"][..],
+            &["group", "list"],
+            &["ab", "list"],
+            &["device", "list", "--legacy"],
+            &["strategy", "show", "123"],
+            &["relay", "status"],
+            &["route", "test", "1.1.1.1", "8.8.8.8"],
+            &["geo", "update"],
+            &["stats", "--days", "7"],
+            &["import", "rustdesk-api", "x.db", "--dry-run"],
+        ] {
+            assert!(!changes_database(&args(words)), "{words:?}");
+        }
     }
 
     #[test]
