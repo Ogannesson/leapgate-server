@@ -23,11 +23,12 @@ use std::{
 const PAIR_MERGE_MS: i64 = 2_000;
 /// No reply this long after the last request → `no_reply`. 待实测.
 const NO_REPLY_MS: i64 = 20_000;
-/// Direct window W = max(45 s, 6 × (reply_at − started_at) + 10 s): A's direct timeout is the punch
-/// time × 6 with no cap (client `connect_timeout`). 待实测.
+/// Direct window W = max(45 s, 6 × (reply_at − started_at) + 20 s): A's direct timeout is the punch
+/// time × 6 with no cap (client `connect_timeout`). The client's punch time also counts connecting to
+/// hbbs and the KeyExchange, which hbbs never sees; the margin covers up to about 3 s of that. 待实测.
 const DIRECT_MIN_MS: i64 = 45_000;
 const DIRECT_PUNCH_FACTOR: i64 = 6;
-const DIRECT_MARGIN_MS: i64 = 10_000;
+const DIRECT_MARGIN_MS: i64 = 20_000;
 /// An attempt with `RequestRelay`s is finalized this long after the last one (A waits up to 18 s for
 /// each `RelayResponse`). 待实测.
 const RELAY_SETTLE_MS: i64 = 20_000;
@@ -752,7 +753,7 @@ mod tests {
         let mut s = TrackerState::default();
         s.punch_request(punch(a1(), Signal::PunchHole), T0);
         s.reply(reply(a1(), ReplyKind::PunchHoleSent), T0 + 500);
-        // W = 45 s (6 × 0.5 s + 10 s < 45 s)
+        // W = 45 s (6 × 0.5 s + 20 s < 45 s)
         assert!(sweep(&mut s, T0 + 500 + 45_000 - 1).is_empty());
         let f = only(&mut s, T0 + 500 + 45_000);
         assert_eq!(f.outcome, "direct_tcp");
@@ -971,12 +972,12 @@ mod tests {
     #[test]
     fn request_relay_window_follows_punch_time() {
         let mut s = TrackerState::default();
-        // Punch took 10 s → W = 6 × 10 + 10 = 70 s.
+        // Punch took 10 s → W = 6 × 10 + 20 = 80 s.
         s.punch_request(punch(a1(), Signal::PunchHole), T0);
         s.reply(reply(a1(), ReplyKind::PunchHoleSent), T0 + 10_000);
-        s.request_relay(relay_req(p3(40003), "r1:21117"), T0 + 10_000 + 70_000);
-        s.relay_response(fallback_resp(p3(40003)), T0 + 80_200);
-        assert_eq!(sweep(&mut s, T0 + 100_000), ["relay"]);
+        s.request_relay(relay_req(p3(40003), "r1:21117"), T0 + 10_000 + 80_000);
+        s.relay_response(fallback_resp(p3(40003)), T0 + 90_200);
+        assert_eq!(sweep(&mut s, T0 + 110_000), ["relay"]);
 
         // Fast punch → W = 45 s; a RequestRelay after that is relay_only, and the punch is direct.
         s.punch_request(punch(a1(), Signal::PunchHole), T0 + 200_000);
@@ -985,6 +986,14 @@ mod tests {
         let mut v: Vec<_> = sweep(&mut s, T0 + 300_000);
         v.sort();
         assert_eq!(v, ["direct_tcp", "relay_failed"]);
+
+        // Review C-12: 3 s of connect + KeyExchange that hbbs doesn't see, then 5 s request → reply
+        // as hbbs sees it. A's direct timeout is 6 × 8 s = 48 s after the reply: still the same attempt
+        // (W = 6 × 5 + 20 = 50 s).
+        s.punch_request(punch(a1(), Signal::PunchHole), T0 + 400_000);
+        s.reply(reply(a1(), ReplyKind::PunchHoleSent), T0 + 405_000);
+        s.request_relay(relay_req(p3(40005), "r1:21117"), T0 + 405_000 + 48_000);
+        assert_eq!(sweep(&mut s, T0 + 500_000), ["relay_failed"]);
     }
 
     #[test]
