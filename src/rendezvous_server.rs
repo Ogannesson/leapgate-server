@@ -139,13 +139,7 @@ impl RendezvousServer {
         let db = crate::database::open(&crate::database::db_url()).await?;
         let cfg = crate::config::Config::from_args()?;
         let api_listen = cfg.api.listen_addr(port)?;
-        let state = AppState::new(
-            db,
-            cfg,
-            std::path::Path::new(crate::crypto::SECRET_KEY_FILE),
-            key.clone(),
-            sk.clone(),
-        )?;
+        let state = AppState::new(db, cfg, std::path::Path::new(crate::crypto::SECRET_KEY_FILE))?;
         let pm = state.pm.clone();
         log::info!("serial={}", serial);
         let rendezvous_servers = get_servers(&get_arg("rendezvous-servers"), "rendezvous-servers");

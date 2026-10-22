@@ -61,7 +61,7 @@
   - `tracker: Arc<ConnTracker>`
   - `secret: Arc<SecretBox>`（§13）
   - `cfg: Arc<Config>`
-  - `server_pk`、`sk`（`get_server_sk` 的结果，KeyExchange 和签名用）
+  - `get_server_sk` 的结果（KeyExchange 和 `IdPk` 签名用的私钥）不进 `AppState`，只存在 `RendezvousServer` 的 `inner.sk` 一份；API 侧以后要签名时再挪进来，不要两边各存一份。
 - 模块自己的小状态（登录失败计数、审计 nonce 去重表）放在模块内的 `static`，不进 `AppState`。
 - Porta 新增的代码（路由、结果记录、API、GeoIP、新表）里，IP 在比较、查库、落库前先规范化：`::ffff:a.b.c.d` → IPv4（`to_canonical()` 或 `try_into_v4`）。原版会合逻辑里已有的地址处理保持原样（`same_intranet`、`update_addr`/`RegisterPk` 的 ip 比较、`peer.info.ip` 落库、`tcp_punch` 的键），也不要在 accept 处统一改写地址，否则同公网 IP 的设备拿不到局域网直连，或升级后每台设备都被判成"IP 变了"。
 

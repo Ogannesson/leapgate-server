@@ -4,7 +4,6 @@ use crate::{
     config::Config, conn_tracker::ConnTracker, crypto::SecretBox, peer::PeerMap, router::Router,
 };
 use hbb_common::ResultType;
-use sodiumoxide::crypto::sign;
 use sqlx::SqlitePool;
 use std::{path::Path, sync::Arc};
 
@@ -17,21 +16,11 @@ pub(crate) struct AppState {
     pub tracker: Arc<ConnTracker>,
     pub secret: Arc<SecretBox>,
     pub cfg: Arc<Config>,
-    /// `get_server_sk`'s key (public key checked against `licence_key`; may be empty).
-    pub server_pk: String,
-    /// `get_server_sk`'s signing key (KeyExchange, `IdPk` signatures).
-    pub sk: Option<sign::SecretKey>,
 }
 
 impl AppState {
     /// Builds the state; background tasks are not spawned here (`spawn_tasks`).
-    pub fn new(
-        db: SqlitePool,
-        cfg: Config,
-        secret_key_file: &Path,
-        server_pk: String,
-        sk: Option<sign::SecretKey>,
-    ) -> ResultType<Self> {
+    pub fn new(db: SqlitePool, cfg: Config, secret_key_file: &Path) -> ResultType<Self> {
         let cfg = Arc::new(cfg);
         Ok(Self {
             pm: PeerMap::new(db.clone()),
@@ -39,8 +28,6 @@ impl AppState {
             tracker: Arc::new(ConnTracker::new(db.clone())),
             secret: Arc::new(SecretBox::load_or_create(secret_key_file)?),
             cfg,
-            server_pk,
-            sk,
             db,
         })
     }
