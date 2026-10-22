@@ -12,16 +12,22 @@ const CLI_COMMANDS: &[&str] = &[
 ];
 
 fn main() -> ResultType<()> {
-    let _logger = Logger::try_with_env_or_str("info")?
-        .log_to_stdout()
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let is_cli = argv
+        .first()
+        .is_some_and(|a| CLI_COMMANDS.contains(&a.as_str()));
+    let logger = Logger::try_with_env_or_str("info")?;
+    // Command line mode keeps stdout for the command's result.
+    let logger = if is_cli {
+        logger.log_to_stderr()
+    } else {
+        logger.log_to_stdout()
+    };
+    let _logger = logger
         .format(opt_format)
         .write_mode(WriteMode::Async)
         .start()?;
-    let argv: Vec<String> = std::env::args().skip(1).collect();
-    if argv
-        .first()
-        .is_some_and(|a| CLI_COMMANDS.contains(&a.as_str()))
-    {
+    if is_cli {
         return cli::run(argv);
     }
     let args = format!(
