@@ -3,7 +3,7 @@
 //! Everything is read into a [`Plan`] first (old rustdesk-api ids), the report is printed, and unless
 //! `--dry-run` the plan is written in one transaction, mapping old ids to new ones as rows are inserted.
 
-use crate::{cli::RESERVED_BOOK_NAMES, crypto::SecretBox};
+use crate::{api::account::MAX_NAME_LEN, cli::RESERVED_BOOK_NAMES, crypto::SecretBox};
 use hbb_common::{bail, ResultType};
 use sqlx::{
     sqlite::SqliteConnectOptions, Connection as _, SqliteConnection, SqlitePool,
@@ -153,8 +153,19 @@ async fn plan(db: &SqlitePool, src_path: &Path) -> ResultType<Plan> {
     let mut users = Vec::new();
     let mut unknown_pw = Vec::new();
     for (old_id, name, email, password, nickname, remark, group, is_admin, status, created_at) in rows {
+        // Like every user that is not imported, their books, entries, tags and rules are dropped
+        // too, and their devices are imported without an owner.
         if name.is_empty() {
-            let _ = writeln!(r, "Dropped: user id {old_id} has an empty username");
+            let _ = writeln!(r, "Dropped: user id {old_id} has an empty username, with their address books and device ownership");
+            continue;
+        }
+        // Login refuses longer names, so such a user could never sign in.
+        if name.len() > MAX_NAME_LEN {
+            let _ = writeln!(
+                r,
+                "Dropped: user id {old_id} has a user name longer than {MAX_NAME_LEN} bytes ({:?}…), with their address books and device ownership",
+                name.chars().take(32).collect::<String>()
+            );
             continue;
         }
         let password_hash = if ["$2a$", "$2b$", "$2y$"].iter().any(|p| password.starts_with(p)) {
@@ -1047,6 +1058,49 @@ INSERT INTO peers(row_id, id, uuid, user_id, hostname, os, username, version, la
         let mut conn = SqliteConnection::connect_with(&opt).await.unwrap();
         let n: i64 = sqlx::query_scalar("select count(*) from users").fetch_one(&mut conn).await.unwrap();
         assert_eq!(n, 6);
+    }
+
+    /// Login refuses names over `MAX_NAME_LEN` bytes: such users are dropped like nameless ones.
+    #[tokio::test]
+    async fn over_long_user_names_dropped() {
+        let f = fixture().await;
+        let long = "é".repeat(MAX_NAME_LEN / 2) + "x";
+        let max = "m".repeat(MAX_NAME_LEN);
+        let mut conn = SqliteConnection::connect_with(&SqliteConnectOptions::new().filename(&f.src)).await.unwrap();
+        sqlx::query("INSERT INTO users(id, username, group_id) VALUES (20, ?, 1), (21, ?, 1)")
+            .bind(&long)
+            .bind(&max)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO address_books(user_id, collection_id, id, tags) VALUES (20, 0, 'L1', '[]'), (20, 15, 'L2', '[]');
+             INSERT INTO address_book_collections(id, user_id, name) VALUES (15, 20, 'Long owner');
+             INSERT INTO address_book_collection_rules(user_id, collection_id, type, to_id, rule) VALUES (1, 10, 1, 20, 2);
+             INSERT INTO peers(id, uuid, user_id) VALUES ('L3', 'u', 20);",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        conn.close().await.unwrap();
+
+        let p = plan(&f.db, &f.src).await.unwrap();
+        assert!(p.users.iter().all(|u| u.old_id != 20));
+        assert!(p.users.iter().any(|u| u.old_id == 21), "exactly {MAX_NAME_LEN} bytes is fine");
+        assert!(p.entries.iter().all(|e| e.id != "L1" && e.id != "L2"));
+        assert!(p.books.iter().all(|b| b.old_id != 15));
+        assert!(p.user_rules.iter().all(|r| r.1 != 20));
+        assert_eq!(p.devices.iter().find(|d| d.id == "L3").unwrap().user, None);
+        let short: String = long.chars().take(32).collect();
+        for needle in [
+            format!("Dropped: user id 20 has a user name longer than {MAX_NAME_LEN} bytes ({short:?}…)"),
+            "\"Long owner\" (id 15), its owner was not imported".to_owned(),
+            "Users: 6 ".to_owned(),
+        ] {
+            assert!(p.report.contains(&needle), "missing {needle:?} in:\n{}", p.report);
+        }
+        write(&f.db, &f.secret, &p).await.unwrap();
+        assert_eq!(count(&f.db, "select max(length(cast(name as blob))) from user").await, MAX_NAME_LEN as i64);
     }
 
     #[tokio::test]

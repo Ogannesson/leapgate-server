@@ -65,6 +65,7 @@ pub(crate) fn router(state: AppState) -> axum::Router {
         .route("/api/ab/tag/update/{guid}", put(ab::tag_update))
         .route("/api/ab/tag/{guid}", delete(ab::tag_delete))
         .fallback(not_found)
+        .layer(middleware::from_fn(json_rejections))
         .layer(middleware::from_fn(catch_panic))
         .with_state(state)
 }
@@ -329,6 +330,22 @@ async fn not_found() -> Response {
     error(StatusCode::NOT_FOUND, "Not Found")
 }
 
+/// axum's own 405 (wrong method) and 413 (body over the 2 MB default limit of `Bytes`) are plain
+/// text; §9.1 wants JSON errors. No handler of ours answers either status.
+async fn json_rejections(req: Request<Body>, next: Next) -> Response {
+    let resp = next.run(req).await;
+    let msg = match resp.status() {
+        StatusCode::METHOD_NOT_ALLOWED => "Method Not Allowed",
+        StatusCode::PAYLOAD_TOO_LARGE => "Request body too large",
+        _ => return resp,
+    };
+    let mut json = error(resp.status(), msg);
+    if let Some(allow) = resp.headers().get(header::ALLOW) {
+        json.headers_mut().insert(header::ALLOW, allow.clone());
+    }
+    json
+}
+
 /// A panicking handler answers like any other internal error instead of dropping the connection
 /// (needs `panic = "unwind"`, the default; the release profile no longer aborts).
 async fn catch_panic(req: Request<Body>, next: Next) -> Response {
@@ -359,6 +376,29 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(ct, JSON);
         assert_eq!(&body[..], br#"{"error":"Not Found"}"#);
+    }
+
+    #[tokio::test]
+    async fn wrong_method_and_big_body_are_json() {
+        let t = testutil::app().await;
+        let req = axum::http::Request::builder().method("GET").uri("/api/login").body(Body::empty()).unwrap();
+        let resp = tower::ServiceExt::oneshot(t.app.clone(), req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(resp.headers()[header::CONTENT_TYPE], JSON);
+        assert!(resp.headers().contains_key(header::ALLOW));
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], br#"{"error":"Method Not Allowed"}"#);
+
+        let big = "x".repeat(3 << 20);
+        for path in ["/api/login", "/api/heartbeat", "/api/audit/conn"] {
+            let (status, ct, body) = send(&t.app, "POST", path, None, &big).await;
+            assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{path}");
+            assert_eq!(ct, JSON, "{path}");
+            assert_eq!(&body[..], br#"{"error":"Request body too large"}"#, "{path}");
+        }
+        // Still within the limit: the handler's own answer.
+        let (status, ct, _) = send(&t.app, "POST", "/api/login", None, &"x".repeat(1 << 20)).await;
+        assert_eq!((status, ct.as_str()), (StatusCode::BAD_REQUEST, JSON));
     }
 
     #[tokio::test]

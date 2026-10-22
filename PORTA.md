@@ -307,7 +307,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 
 ### 9.1 必须遵守（任何一条写错，原版客户端都会走错分支）
 1. **任何接口都不回 5xx**：客户端遇到 5xx 或连不上会改走 hbbs 的 TCP 代理（第一期不做），白等最长 36 秒，心跳也跟着卡住。内部错误：审计接口回 200 + `{"error":"…"}`（客户端会重试）；`/api/currentUser` 回 200 + `{"error":"…"}`（客户端收到 400 会清本地令牌、401 会全部重置，一次临时错误不能把用户登出）；其他接口回 400 + `{"error":"…"}`。
-2. 请求体一律用 `Bytes` 收、自己解析 JSON；不用 axum 的 `Json` 提取器（出错回 415/422 纯文本）。JSON 响应带 `Content-Type: application/json; charset=utf-8`；`SYSINFO_UPDATED` 用 `text/plain; charset=utf-8`；空 body 的响应（sysinfo 403、审计成功、地址簿写接口成功）不要求 Content-Type。
+2. 请求体一律用 `Bytes` 收、自己解析 JSON；不用 axum 的 `Json` 提取器（出错回 415/422 纯文本）。JSON 响应带 `Content-Type: application/json; charset=utf-8`；`SYSINFO_UPDATED` 用 `text/plain; charset=utf-8`；空 body 的响应（sysinfo 403、审计成功、地址簿写接口成功）不要求 Content-Type。axum 自己产生的错误也回 JSON：用错 HTTP 方法回 405 + `{"error":"Method Not Allowed"}`，请求体超过 2 MB（`Bytes` 的默认上限）回 413 + `{"error":"Request body too large"}`。
 3. 令牌无效、过期、账号禁用 → **401**（客户端据此清登录态）。
 4. `/api/login-options` 回 `[]`（没有第三方登录）。
 5. 用户信息里 `name` 必须是非空字符串；登录成功必须带 `user`；`info`、`is_admin`、`status` 不能是 null（笔记 03 §2.5）。
@@ -351,11 +351,12 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 
 ## 11. 账号、令牌、密码（`auth.rs`、`account.rs`）
 
-- 密码：argon2id（`argon2` crate 默认参数）。校验时按前缀识别 `$argon2id$`、`$2a$/$2b$/$2y$`（bcrypt）、`md5:`（rustdesk-api 旧格式 `md5(明文+"rustdesk-api")`，笔记 05 §3）；旧格式校验通过后当场改存 argon2id。`password_hash = ''` 的账号不能密码登录。
+- 密码：argon2id（`argon2` crate 默认参数）。校验时按前缀识别 `$argon2id$`、`$2a$/$2b$/$2y$`（bcrypt）、`md5:`（rustdesk-api 旧格式 `md5(明文+"rustdesk-api")`，笔记 05 §3）；旧格式校验通过后当场改存 argon2id，只在库里仍是刚校验的旧哈希时才写（期间 `user passwd` 改过的不覆盖，这次登录回 401）；库里已被另一个并发登录升级成 argon2id、且本次明文能通过它时照常签令牌。`password_hash = ''` 的账号不能密码登录。
 - 令牌：32 字节随机数的 base64url（无填充），库里只存 sha256 hex。没有过期时间；登出、改密码、禁用账号时删掉该用户的令牌（登出只删当前这个）。每次使用更新 `last_used_at`。
 - 登录时把请求体里的设备 `id`/`uuid` 记进令牌行；再做 §9.3 同样的弱校验：`peer` 表里有这个 id、且 uuid 不符时，登录照常成功但不改 `device.user_id`（防止别人把你的设备挂到自己名下）；校验通过或 `peer` 表里没有这个 id 时，把 `device.user_id` 设成这个用户（设备行不存在就建）。登出时若 `device.user_id` 是本人则清空。
 - 账号可用的判定写死为 `status = 1`。
 - 登录失败限流：只按用户名，15 分钟内失败 5 次后，15 分钟内直接拒绝（回 `{"error": "…"}`）。不按来源 IP 限：API 在反向代理后面时看到的全是代理地址，按 IP 限会把所有人一起锁住。
+- 密码校验（argon2，不存在的用户名也算一次）同时最多核数个，其余排队；排队的最多 4 × 核数个（常量写死），再来的直接回 429 + `{"error": "…"}`，不无限排队。不存在的用户名不受上面的限流，没有这个上限时，不带凭据的请求就能让正常登录无限期排在后面。
 - `async fn auth::token_owner(db, token) -> Option<(user_id, user_name, device_id)>` 给结果记录模块用（在后台调用，不在会合热路径上 await）。
 
 ## 12. 地址簿、权限、用户组（`ab.rs`、`group.rs`）
@@ -418,7 +419,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 
 - 只读打开 rustdesk-api 的 SQLite，按笔记 05 §8 的 SQL 读取（下面写明的地方除外）；Porta 库里已有用户时拒绝执行（只支持往空库导入一次）。`--dry-run` 只打印将导入的数量、冲突和被丢弃的数据。
 - 导入：用户、用户组和成员、个人簿、共享簿、授权规则、条目、标签、设备归属（`peers.user_id`，可选）。令牌、登录日志、审计不导入。导入在一个事务里完成，结束时打印所用密钥文件的绝对路径。
-- 用户：`username→name`、`nickname→display_name`、`email→email`、`remark→note`，avatar 丢弃。`status` 为 1 → 1，其他值（rustdesk-api 的 2=禁用）→ 0；`is_admin` 用 `CAST(is_admin AS INTEGER)`，非 0 → 1。`created_at` 按 `%Y-%m-%d %H:%M:%S%.f%:z` 解析成 unix 秒，NULL 或解析失败用导入时间；其余表的时间一律用导入时间。建立旧 user id → 新 id 的映射。
+- 用户：`username→name`、`nickname→display_name`、`email→email`、`remark→note`，avatar 丢弃。`status` 为 1 → 1，其他值（rustdesk-api 的 2=禁用）→ 0；`is_admin` 用 `CAST(is_admin AS INTEGER)`，非 0 → 1。`created_at` 按 `%Y-%m-%d %H:%M:%S%.f%:z` 解析成 unix 秒，NULL 或解析失败用导入时间；其余表的时间一律用导入时间。建立旧 user id → 新 id 的映射。用户名为空或超过 128 字节（§14，登录接口拒绝更长的名字）的用户不导入，写进报告；和其他没导入的用户一样，他们名下的个人簿、共享簿、条目、标签、授权规则一并丢弃，设备照常导入但不设归属。
 - 密码：以 `$2a$`/`$2b$`/`$2y$` 开头的原样写入；恰好 32 位 `[0-9a-f]` 的写成 `md5:` + 原值；空串写 `''`；其他无法识别的非空值写 `''`。密码为 `''` 的用户（含只能靠 OAuth/LDAP 登录的）照样导入，打印清单，提示用 `user passwd` 设密码。登录时按 §11 升级。
 - 用户组：组 = `groups` 表的行 ∪ `users.group_id` 里出现过、`groups` 表却没有的 id；后者建占位组 `rustdesk-api-group-<旧 id>`，`share_devices=0`。`groups.type=2` → `share_devices=1`。成员按 `users.group_id` 导入（每人一个组）。组名重复时第二个起追加 `-<旧 id>` 改名并打印。
 - 授权规则：**不用笔记 05 §8.3 的展开 SQL**（它把组规则展开成个人规则，违背 §12.2），换成两条，都按 MAX 去重：
