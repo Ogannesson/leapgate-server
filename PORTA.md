@@ -61,7 +61,7 @@
   - `tracker: Arc<ConnTracker>`
   - `secret: Arc<SecretBox>`（§13）
   - `cfg: Arc<Config>`
-  - `server_pk`、`sk`（`get_server_sk` 的结果，KeyExchange 和签名用）
+  - `get_server_sk` 的结果（KeyExchange 和 `IdPk` 签名用的私钥）不进 `AppState`，只存在 `RendezvousServer` 的 `inner.sk` 一份；API 侧以后要签名时再挪进来，不要两边各存一份。
 - 模块自己的小状态（登录失败计数、审计 nonce 去重表）放在模块内的 `static`，不进 `AppState`。
 - Porta 新增的代码（路由、结果记录、API、GeoIP、新表）里，IP 在比较、查库、落库前先规范化：`::ffff:a.b.c.d` → IPv4（`to_canonical()` 或 `try_into_v4`）。原版会合逻辑里已有的地址处理保持原样（`same_intranet`、`update_addr`/`RegisterPk` 的 ip 比较、`peer.info.ip` 落库、`tcp_punch` 的键），也不要在 accept 处统一改写地址，否则同公网 IP 的设备拿不到局域网直连，或升级后每台设备都被判成"IP 变了"。
 
@@ -393,10 +393,10 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 
 ## 13. 密码字段加密（`crypto.rs`）
 
-- 工作目录下的 `porta_secret.key`（32 字节随机数，权限 0600，和 `id_ed25519` 放在一起）。**只有服务模式**在缺失时生成；命令行（含 import）只读已有的文件，不存在就报错退出，提示到服务的工作目录下运行或先启动一次服务（否则在别处跑命令行会多生成一把密钥，导入的密码就解不开了）。
+- 工作目录下的 `porta_secret.key`（32 字节随机数，权限 0600，和 `id_ed25519` 放在一起）。**只有服务模式**在缺失时生成；命令行（含 import）只读已有的文件，不存在就报错退出，提示到服务的工作目录下运行或先启动一次服务（否则在别处跑命令行会多生成一把密钥，导入的密码就解不开了）。服务模式发现文件不存在、库里却已有密文（`select 1 from ab_peer where hash_enc <> '' or password_enc <> '' limit 1` 查到行）时拒绝启动，报错提示恢复密钥文件，或有意清空这两列（已存的密码全部作废）；不生成新密钥。
 - `sodiumoxide::crypto::secretbox`；存储格式 `sb1:` + base64(nonce ‖ 密文)。
 - 加密的字段：`ab_peer.hash_enc`、`ab_peer.password_enc`。服务端运维者本人仍能解开，目的是防数据库文件和备份泄露。
-- 备份数据库时要连同 `porta_secret.key` 一起备份，丢了这个文件，地址簿里的密码就解不开了。
+- 备份数据库时要连同 `porta_secret.key` 一起备份，丢了这个文件，地址簿里的密码就解不开了。`/api/ab/peers` 遇到解不开的值只省略这条的 `hash`/`password` 键并记 warn 日志（簿 guid 和设备 id，不打密文），其余条目照常返回。
 
 ## 14. 命令行（`src/cli/`）
 

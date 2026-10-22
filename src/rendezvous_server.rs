@@ -47,7 +47,6 @@ use std::{
 #[derive(Clone, Debug)]
 enum Data {
     Msg(Box<RendezvousMessage>, SocketAddr),
-    RelayServers0(String),
 }
 
 const REG_TIMEOUT: i64 = 30_000;
@@ -139,13 +138,7 @@ impl RendezvousServer {
         let db = crate::database::open(&crate::database::db_url()).await?;
         let cfg = crate::config::Config::from_args()?;
         let api_listen = cfg.api.listen_addr(port)?;
-        let state = AppState::new(
-            db,
-            cfg,
-            std::path::Path::new(crate::crypto::SECRET_KEY_FILE),
-            key.clone(),
-            sk.clone(),
-        )?;
+        let state = AppState::new(db, cfg, std::path::Path::new(crate::crypto::SECRET_KEY_FILE)).await?;
         let pm = state.pm.clone();
         log::info!("serial={}", serial);
         let rendezvous_servers = get_servers(&get_arg("rendezvous-servers"), "rendezvous-servers");
@@ -293,7 +286,6 @@ impl RendezvousServer {
                 Some(data) = rx.recv() => {
                     match data {
                         Data::Msg(msg, addr) => { allow_err!(socket.send(msg.as_ref(), addr).await); }
-                        Data::RelayServers0(rs) => { self.parse_relay_servers(&rs); }
                     }
                 }
                 res = socket.next() => {
@@ -1062,12 +1054,6 @@ impl RendezvousServer {
         true
     }
 
-    fn parse_relay_servers(&self, relay_servers: &str) {
-        self.state
-            .router
-            .set_configured(crate::config::parse_relay_list(relay_servers));
-    }
-
     async fn check_cmd(&self, cmd: &str) -> String {
         use std::fmt::Write as _;
 
@@ -1088,7 +1074,8 @@ impl RendezvousServer {
             }
             Some("relay-servers" | "rs") => {
                 if let Some(rs) = fds.next() {
-                    self.tx.send(Data::RelayServers0(rs.to_owned())).ok();
+                    // The list lives in the shared Router: replaced before the console answers.
+                    self.state.router.set_configured(crate::config::parse_relay_list(rs));
                 } else {
                     res = self.state.router.status_text();
                 }
@@ -1658,10 +1645,8 @@ mod tests {
 
         /// What hbbs sends to B over UDP.
         async fn to_b(&mut self) -> (RendezvousMessage, SocketAddr) {
-            match timeout(3000, self.rx.recv()).await.unwrap().unwrap() {
-                Data::Msg(msg, addr) => (*msg, addr),
-                other => panic!("unexpected {other:?}"),
-            }
+            let Data::Msg(msg, addr) = timeout(3000, self.rx.recv()).await.unwrap().unwrap();
+            (*msg, addr)
         }
     }
 
@@ -1876,7 +1861,8 @@ mod tests {
     async fn console_commands_use_the_router() {
         let h = harness(true, None).await;
         assert!(h.rs.check_cmd("rs").await.contains(RELAY));
-        h.rs.parse_relay_servers(" r1:21117, r2 ,r1:21117,");
+        // Applied synchronously: the very next command already sees the new list.
+        assert_eq!(h.rs.check_cmd("rs r1:21117,r2,r1:21117,").await, "");
         let status = h.rs.check_cmd("rs").await;
         assert!(status.contains("r1:21117") && status.contains("r2") && !status.contains(RELAY));
         let test = h.rs.check_cmd("tg 1.1.1.1 ::ffff:2.2.2.2").await;
