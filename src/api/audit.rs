@@ -3,7 +3,7 @@
 //! client retries); bad body: 400. Handlers return `Response` so `?` cannot produce a plain 400.
 
 use super::{device::uuid_matches, ok_empty, ok_internal, parse_json};
-use crate::state::AppState;
+use crate::{conn_tracker::clip, peer::MAX_PEER_ID_LEN, state::AppState};
 use axum::{body::Bytes, extract::State, response::Response};
 use once_cell::sync::Lazy;
 use serde::de::DeserializeOwned;
@@ -23,6 +23,32 @@ const NONCE_TTL: Duration = Duration::from_secs(300);
 const MAX_NONCE_LEN: usize = 64;
 /// Nonces held at most; once full, new ones are not registered and their reports just lose dedupe.
 const MAX_NONCES: usize = 100_000;
+
+// What a report can make us store (review A-9). Longer values are clipped at a char boundary and
+// stored: the audits answer 200 whatever comes (§9.1.8). `device_id` is the checked id (at most
+// `MAX_PEER_ID_LEN`); `peer_id` is clipped to the same.
+/// `audit_conn.ip`: an IPv6 text is at most 45 bytes.
+const MAX_IP_LEN: usize = 64;
+/// `audit_conn.peer_name`, the controller's name.
+const MAX_PEER_NAME_LEN: usize = 256;
+/// `audit_conn.auth` (serialized; see `auth_json`) and `.note` (the client's note field takes 256
+/// characters, at most 1 KB), `audit_file.path` and `.info` (the top 10 files with their sizes),
+/// `audit_alarm.info`.
+const MAX_TEXT_LEN: usize = 4096;
+/// The `rest` keys of an authed report that known clients send (note 03 §5.2): what `auth` keeps when
+/// the whole of `rest` is over `MAX_TEXT_LEN`.
+const AUTH_KEYS: [&str; 3] = ["primary_auth", "two_factor", "conn_audit_ref"];
+
+/// The audit tables, each kept to `MAX_ROWS` rows (`make_room`) and `RETENTION_SECS` (`purge`).
+pub(crate) const TABLES: [&str; 3] = ["audit_conn", "audit_file", "audit_alarm"];
+/// Rows per audit table. Worst-case rows (every text column at its limit, measured on SQLite with
+/// 4 KB pages, indexes included): audit_conn ≈ 9.5 KB (253 + 253 + 256 + 64 + 4096 + 4096 bytes of
+/// text, mostly in overflow pages), audit_file ≈ 8.8 KB (253 + 253 + 4096 + 4096), audit_alarm ≈
+/// 4.6 KB (253 + 4096). 20,000 × (9.5 + 8.8 + 4.6) KB ≈ 0.46 GB for the three together; freed pages
+/// are reused, so the file stays there. Real rows are a few hundred bytes (20,000 ≈ 6 MB a table).
+const MAX_ROWS: i64 = 20_000;
+/// Rows created longer ago than this are deleted by the hourly purge.
+const RETENTION_SECS: i64 = 180 * 24 * 3600;
 
 /// Nonces of records already written, in two generations of `NONCE_TTL`: each is kept for 5 to 10
 /// minutes, and old ones go a whole generation at a time instead of by scanning.
@@ -78,6 +104,46 @@ fn remember_nonce(nonce: &str) {
 
 fn parse<T: DeserializeOwned>(body: &[u8]) -> Result<T, Response> {
     parse_json(body).map_err(|e| e.0)
+}
+
+/// Makes room for one more row in `table` (one of `TABLES`): deletes the rows `MAX_ROWS - 1` ids or
+/// more below the newest, so with the insert that follows at most `MAX_ROWS` are left. Ids only grow
+/// (a new rowid is the largest + 1), so this is a range on the primary key that deletes nothing or
+/// one row. Done on every insert, not by the hourly purge: the reports are not rate limited, so an
+/// hour of them is not bounded. Runs before the insert, so a failure leaves nothing that the
+/// client's retry would duplicate.
+async fn make_room(db: &SqlitePool, table: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(&format!("delete from {table} where id <= (select max(id) from {table}) - ?"))
+        .bind(MAX_ROWS - 1)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// Hourly, from `conn_tracker`'s purge: deletes the rows of `table` (one of `TABLES`) created more
+/// than `RETENTION_SECS` before `now` (unix seconds). A scan of at most `MAX_ROWS` rows.
+pub(crate) async fn purge(db: &SqlitePool, table: &str, now: i64) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query(&format!("delete from {table} where created_at < ?"))
+        .bind(now - RETENTION_SECS)
+        .execute(db)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+/// `audit_conn.auth`: the rest of an authed report as JSON; over `MAX_TEXT_LEN`, only `AUTH_KEYS`
+/// are kept, and if that is still too long the text is clipped.
+fn auth_json(rest: &Map<String, Value>) -> String {
+    let mut auth = serde_json::to_string(rest).unwrap_or_default();
+    if auth.len() > MAX_TEXT_LEN {
+        let known: Map<String, Value> = rest
+            .iter()
+            .filter(|(k, _)| AUTH_KEYS.contains(&k.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        auth = serde_json::to_string(&known).unwrap_or_default();
+        clip(&mut auth, MAX_TEXT_LEN);
+    }
+    auth
 }
 
 /// Shared by the device-side audits: a repeated nonce is a success without writing; a failed
@@ -137,10 +203,17 @@ struct ConnReq {
 
 /// `POST /api/audit/conn`: new / authed / close, and the controller's session note (no uuid, no nonce).
 pub(crate) async fn conn(State(state): State<AppState>, body: Bytes) -> Response {
-    let req: ConnReq = match parse(&body) {
+    let mut req: ConnReq = match parse(&body) {
         Ok(req) => req,
         Err(resp) => return resp,
     };
+    if let Some(note) = &mut req.note {
+        clip(note, MAX_TEXT_LEN);
+    }
+    clip(&mut req.ip, MAX_IP_LEN);
+    for (field, max) in req.peer.iter_mut().zip([MAX_PEER_ID_LEN, MAX_PEER_NAME_LEN]) {
+        clip(field, max);
+    }
     let db = &state.db;
     if let (Some(note), None) = (&req.note, &req.uuid) {
         // Session note: no identity to check; updates every record of the session (remote desktop
@@ -167,6 +240,7 @@ async fn write_conn(db: &SqlitePool, req: &ConnReq) -> Result<(), sqlx::Error> {
         "(select max(id) from audit_conn where device_id = ? and conn_id = ? and closed_at is null)";
     match req.action.as_deref() {
         Some("new") => {
+            make_room(db, "audit_conn").await?;
             sqlx::query("insert into audit_conn(device_id, conn_id, ip, created_at) values(?, ?, ?, ?)")
                 .bind(&req.id)
                 .bind(req.conn_id)
@@ -187,7 +261,7 @@ async fn write_conn(db: &SqlitePool, req: &ConnReq) -> Result<(), sqlx::Error> {
             let peer_id = req.peer.first().map(String::as_str).unwrap_or_default();
             let peer_name = req.peer.get(1).map(String::as_str).unwrap_or_default();
             let session_id = req.session_id.to_string();
-            let auth = Value::Object(req.rest.clone()).to_string();
+            let auth = auth_json(&req.rest);
             let updated = sqlx::query(&format!(
                 "update audit_conn set peer_id = ?, peer_name = ?, conn_type = ?, session_id = ?, auth = ?,
                    authed_at = ?
@@ -206,6 +280,7 @@ async fn write_conn(db: &SqlitePool, req: &ConnReq) -> Result<(), sqlx::Error> {
             .rows_affected();
             if updated == 0 {
                 // The `new` report was lost.
+                make_room(db, "audit_conn").await?;
                 sqlx::query(
                     "insert into audit_conn(device_id, conn_id, session_id, peer_id, peer_name, conn_type,
                                             auth, created_at, authed_at)
@@ -252,11 +327,15 @@ struct FileReq {
 
 /// `POST /api/audit/file`.
 pub(crate) async fn file(State(state): State<AppState>, body: Bytes) -> Response {
-    let req: FileReq = match parse(&body) {
+    let mut req: FileReq = match parse(&body) {
         Ok(req) => req,
         Err(resp) => return resp,
     };
+    clip(&mut req.peer_id, MAX_PEER_ID_LEN);
+    clip(&mut req.path, MAX_TEXT_LEN);
+    clip(&mut req.info, MAX_TEXT_LEN);
     let write = async {
+        make_room(&state.db, "audit_file").await?;
         sqlx::query(
             "insert into audit_file(device_id, conn_id, peer_id, type, path, is_file, info, created_at)
              values(?, ?, ?, ?, ?, ?, ?, ?)",
@@ -290,11 +369,13 @@ struct AlarmReq {
 
 /// `POST /api/audit/alarm`.
 pub(crate) async fn alarm(State(state): State<AppState>, body: Bytes) -> Response {
-    let req: AlarmReq = match parse(&body) {
+    let mut req: AlarmReq = match parse(&body) {
         Ok(req) => req,
         Err(resp) => return resp,
     };
+    clip(&mut req.info, MAX_TEXT_LEN);
     let write = async {
+        make_room(&state.db, "audit_alarm").await?;
         sqlx::query("insert into audit_alarm(device_id, conn_id, typ, info, created_at) values(?, ?, ?, ?, ?)")
             .bind(&req.id)
             .bind(req.conn_id)
@@ -483,6 +564,123 @@ mod tests {
         nonces.remember(&n);
         assert!(!nonces.seen(&n));
         assert!(nonces.seen("0"));
+    }
+
+    #[tokio::test]
+    async fn fields_are_clipped() {
+        let t = testutil::app().await;
+        let db = &t.state.db;
+        add_peer(db, "111").await;
+        let uuid = base64::encode(UUID);
+        // 2-byte chars: an odd limit cuts at the char boundary below it.
+        let wide = |bytes: usize| "é".repeat(bytes / 2 + 1);
+        let long = |bytes: usize| "x".repeat(bytes + 1);
+
+        ok(&t.app, "/api/audit/conn", json!({"id": "111", "uuid": uuid, "action": "new", "conn_id": 1, "ip": wide(MAX_IP_LEN)})).await;
+        let auth = json!({"id": "111", "uuid": uuid, "conn_id": 1, "session_id": 7, "type": 0, "primary_auth": 2,
+                          "two_factor": 1, "peer": [wide(MAX_PEER_ID_LEN), long(MAX_PEER_NAME_LEN)],
+                          "junk": long(MAX_TEXT_LEN)});
+        ok(&t.app, "/api/audit/conn", auth).await;
+        ok(&t.app, "/api/audit/conn", json!({"id": "111", "session_id": 7, "note": wide(MAX_TEXT_LEN)})).await;
+        let row: (String, String, String, String, String) =
+            sqlx::query_as("select ip, peer_id, peer_name, auth, note from audit_conn").fetch_one(db).await.unwrap();
+        assert_eq!(row.0, "é".repeat(MAX_IP_LEN / 2));
+        assert_eq!(row.1, "é".repeat(MAX_PEER_ID_LEN / 2));
+        assert_eq!(row.2, "x".repeat(MAX_PEER_NAME_LEN));
+        // `rest` over the limit: the unknown key is dropped, the known ones are kept.
+        assert_eq!(serde_json::from_str::<Value>(&row.3).unwrap(), json!({"primary_auth": 2, "two_factor": 1}));
+        assert_eq!(row.4, "é".repeat(MAX_TEXT_LEN / 2));
+
+        // A known key alone over the limit: clipped text. Under the limit: everything is kept.
+        let huge = json!({"id": "111", "uuid": uuid, "conn_id": 2, "session_id": 8, "conn_audit_ref": long(MAX_TEXT_LEN), "x": 1});
+        ok(&t.app, "/api/audit/conn", huge).await;
+        // `{"x":"…"}`: exactly MAX_TEXT_LEN bytes.
+        let fits = json!({"id": "111", "uuid": uuid, "conn_id": 3, "session_id": 9, "x": "y".repeat(MAX_TEXT_LEN - 8)});
+        ok(&t.app, "/api/audit/conn", fits).await;
+        let auths: Vec<String> = sqlx::query_scalar("select auth from audit_conn where conn_id in (2, 3) order by conn_id")
+            .fetch_all(db)
+            .await
+            .unwrap();
+        assert_eq!(auths[0].len(), MAX_TEXT_LEN);
+        assert!(auths[0].starts_with(r#"{"conn_audit_ref":"xxx"#));
+        assert_eq!(auths[1].len(), MAX_TEXT_LEN);
+        assert_eq!(serde_json::from_str::<Value>(&auths[1]).unwrap()["x"].as_str().unwrap().len(), MAX_TEXT_LEN - 8);
+
+        let file = json!({"id": "111", "uuid": uuid, "conn_id": 1, "peer_id": long(MAX_PEER_ID_LEN), "type": 0,
+                          "path": wide(MAX_TEXT_LEN), "is_file": true, "info": long(MAX_TEXT_LEN)});
+        ok(&t.app, "/api/audit/file", file).await;
+        let row: (String, String, String) =
+            sqlx::query_as("select peer_id, path, info from audit_file").fetch_one(db).await.unwrap();
+        assert_eq!(row, ("x".repeat(MAX_PEER_ID_LEN), "é".repeat(MAX_TEXT_LEN / 2), "x".repeat(MAX_TEXT_LEN)));
+        ok(&t.app, "/api/audit/alarm", json!({"id": "111", "uuid": uuid, "typ": 0, "info": wide(MAX_TEXT_LEN)})).await;
+        let info: String = sqlx::query_scalar("select info from audit_alarm").fetch_one(db).await.unwrap();
+        assert_eq!(info, "é".repeat(MAX_TEXT_LEN / 2));
+    }
+
+    /// Driven by placing rows at chosen ids: `MAX_ROWS` real inserts are not needed.
+    #[tokio::test]
+    async fn every_insert_keeps_the_newest_rows() {
+        let t = testutil::app().await;
+        let db = &t.state.db;
+        add_peer(db, "111").await;
+        let uuid = base64::encode(UUID);
+        let reports = [
+            ("audit_conn", "/api/audit/conn", json!({"id": "111", "uuid": uuid, "action": "new", "conn_id": 1})),
+            // Authed without an open record: the other insert of audit_conn.
+            ("audit_conn", "/api/audit/conn", json!({"id": "111", "uuid": uuid, "conn_id": 2, "session_id": 1})),
+            ("audit_file", "/api/audit/file", file_body("111", Some(UUID), None)),
+            ("audit_alarm", "/api/audit/alarm", json!({"id": "111", "uuid": uuid, "typ": 0})),
+        ];
+        for (table, path, body) in reports {
+            sqlx::query(&format!("delete from {table}")).execute(db).await.unwrap();
+            for id in [2, 3, MAX_ROWS + 1] {
+                // Every audit table has these columns (`conn_id` and `typ` are only required in some).
+                let cols = match table {
+                    "audit_alarm" => "id, device_id, typ, created_at",
+                    _ => "id, device_id, conn_id, created_at",
+                };
+                sqlx::query(&format!("insert into {table}({cols}) values(?, 'x', 0, 0)"))
+                    .bind(id)
+                    .execute(db)
+                    .await
+                    .unwrap();
+            }
+            ok(&t.app, path, body).await;
+            // The new row gets MAX_ROWS + 2: ids 3 ..= MAX_ROWS + 2 are the newest MAX_ROWS.
+            let ids: Vec<i64> = sqlx::query_scalar(&format!("select id from {table} order by id"))
+                .fetch_all(db)
+                .await
+                .unwrap();
+            assert_eq!(ids, [3, MAX_ROWS + 1, MAX_ROWS + 2], "{table} via {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn old_rows_are_purged() {
+        let t = testutil::app().await;
+        let db = &t.state.db;
+        let now = 1_800_000_000;
+        for table in TABLES {
+            // Created 180 days + 1 s before `now`, exactly 180 days before, and recently.
+            for created_at in [now - RETENTION_SECS - 1, now - RETENTION_SECS, now - 1] {
+                let cols = match table {
+                    "audit_alarm" => "device_id, typ, created_at",
+                    _ => "device_id, conn_id, created_at",
+                };
+                sqlx::query(&format!("insert into {table}({cols}) values('x', 0, ?)"))
+                    .bind(created_at)
+                    .execute(db)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(purge(db, table, now).await.unwrap(), 1, "{table}");
+            let left: Vec<i64> = sqlx::query_scalar(&format!("select created_at from {table} order by id"))
+                .fetch_all(db)
+                .await
+                .unwrap();
+            assert_eq!(left, [now - RETENTION_SECS, now - 1], "{table}");
+            assert_eq!(purge(db, table, now).await.unwrap(), 0, "{table}");
+        }
     }
 
     #[tokio::test]

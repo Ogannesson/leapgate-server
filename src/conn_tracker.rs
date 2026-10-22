@@ -57,10 +57,10 @@ const TOTAL_ROWS_PER_MIN: u32 = 120;
 /// (every text column at its clip limit, `a_user`/`a_device_id` from a valid token) is a ~1.6 KB
 /// record, two to a page, plus its `idx_ca_b` entry with a copy of `b_id`: about 2.4 KB on disk.
 /// Between two purges at most `TOTAL_ROWS_PER_MIN` × 60 = 7,200 rows (plus the few minutes of
-/// attempts still open at the last purge) come on top, so the table peaks near 308,000 rows ≈
-/// 0.75 GB; freed pages are reused, so the file stays there. Without a valid token (no `a_user`,
-/// `a_device_id`) a row takes about 1.4 KB: ≈ 0.43 GB.
-const MAX_ROWS: i64 = 300_000;
+/// attempts still open at the last purge) come on top, so the table peaks near 207,200 rows ×
+/// 2.4 KB ≈ 0.5 GB; freed pages are reused, so the file stays there. Without a valid token (no
+/// `a_user`, `a_device_id`) a row takes about 1.4 KB: ≈ 0.29 GB.
+const MAX_ROWS: i64 = 200_000;
 /// Finalized attempts waiting for the writer; when full, new ones are dropped and counted.
 const WRITE_QUEUE: usize = 10_000;
 /// At most this many rows per insert transaction.
@@ -69,6 +69,7 @@ const WRITE_BATCH: usize = 1_000;
 const RETENTION_MS: i64 = 90 * 24 * 3600 * 1000;
 /// Hourly, so at most an hour of new rows comes on top of `MAX_ROWS`. The 90-day delete shares the
 /// timer: a range on `idx_ca_started` that finds nothing most hours, not worth a timer of its own.
+/// So do the audit tables' retention and the device table's limit (`hourly_purge`).
 const PURGE_INTERVAL: Duration = Duration::from_secs(3600);
 /// Dropped records are logged at most this often.
 const DROP_LOG_INTERVAL: Duration = Duration::from_secs(60);
@@ -350,8 +351,8 @@ fn has_room(window: &mut (i64, u32), now: i64, max: u32) -> bool {
     window.1 < max
 }
 
-/// Truncates `s` to at most `max` bytes, at a char boundary.
-fn clip(s: &mut String, max: usize) {
+/// Truncates `s` to at most `max` bytes, at a char boundary. Also used by the device reports.
+pub(crate) fn clip(s: &mut String, max: usize) {
     if s.len() > max {
         let mut end = max;
         while !s.is_char_boundary(end) {
@@ -722,6 +723,35 @@ async fn trim(db: &SqlitePool, keep: i64) -> ResultType<u64> {
     Ok(res.rows_affected())
 }
 
+/// The hourly cleanup of every bounded table: `conn_attempt` (`purge`), the audit tables'
+/// retention (`audit::purge`) and the device table's limit (`device::evict`). Logs one line with
+/// what each deleted (nothing when nothing was deleted and nothing failed).
+async fn hourly_purge(db: &SqlitePool, now: i64) {
+    use crate::api::{audit, device};
+    let mut steps = vec![("conn_attempt", purge(db, now).await)];
+    for table in audit::TABLES {
+        steps.push((table, audit::purge(db, table, now / 1000).await.map_err(Into::into)));
+    }
+    steps.push(("device", device::evict(db).await.map_err(Into::into)));
+    let failed = steps.iter().any(|(_, r)| r.is_err());
+    if !failed && steps.iter().all(|(_, r)| matches!(r, Ok(0))) {
+        return;
+    }
+    let report = steps
+        .iter()
+        .map(|(table, r)| match r {
+            Ok(n) => format!("{table} {n}"),
+            Err(e) => format!("{table} failed: {e}"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if failed {
+        log::error!("Hourly purge, rows deleted: {report}");
+    } else {
+        log::info!("Hourly purge, rows deleted (past retention or over the row limits): {report}");
+    }
+}
+
 pub struct ConnTracker {
     db: SqlitePool,
     state: Mutex<TrackerState>,
@@ -755,7 +785,7 @@ impl ConnTracker {
         self.state.lock().unwrap().request_relay(req, now_ms());
     }
 
-    /// The 5-second finalizer, the database writer and the daily purge, spawned on the server's runtime.
+    /// The 5-second finalizer, the database writer and the hourly purge, spawned on the server's runtime.
     pub fn spawn_tasks(self: &Arc<Self>) {
         let (tx, mut rx) = mpsc::channel::<Finalized>(WRITE_QUEUE);
         let this = self.clone();
@@ -802,11 +832,7 @@ impl ConnTracker {
             let mut timer = tokio::time::interval(PURGE_INTERVAL);
             loop {
                 timer.tick().await;
-                match purge(&db, now_ms()).await {
-                    Ok(0) => {}
-                    Ok(n) => log::info!("conn_attempt: deleted {n} rows (older than 90 days or beyond the newest {MAX_ROWS})"),
-                    Err(e) => log::error!("conn_attempt purge: {e}"),
-                }
+                hourly_purge(&db, now_ms()).await;
             }
         });
     }
