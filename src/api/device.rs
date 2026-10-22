@@ -2,11 +2,22 @@
 //! No authentication (compatibility debt); only devices registered with hbbs, checked by `uuid`.
 
 use super::{ok_json, parse_json, text, ApiResult, ClientIp};
-use crate::{conn_tracker::clip, peer::MAX_PEER_ID_LEN, state::AppState};
+use crate::{
+    conn_tracker::{clip, has_room, now_ms, source_key, IP_WINDOW_MS},
+    peer::MAX_PEER_ID_LEN,
+    state::AppState,
+};
 use axum::{body::Bytes, extract::State, http::StatusCode, response::IntoResponse};
+use hbb_common::throttled_log;
+use once_cell::sync::Lazy;
 use serde_derive::{Deserialize, Serialize};
-use sqlx::SqlitePool;
-use std::collections::BTreeMap;
+use sqlx::{SqliteConnection, SqlitePool};
+use std::{
+    collections::{BTreeMap, HashMap},
+    net::IpAddr,
+    sync::Mutex,
+    time::Duration,
+};
 
 /// Longest `uuid` (base64 text) the device reports and the login accept. Real ones are the base64
 /// of a machine id, well under this.
@@ -16,11 +27,74 @@ pub(crate) const MAX_UUID_LEN: usize = 128;
 const MAX_SYSINFO_LEN: usize = 8 * 1024;
 /// `hostname`, `username`, `os` and `version` are stored again in their own columns, clipped to this.
 const MAX_SYSINFO_FIELD_LEN: usize = 253;
-/// Device rows kept by the hourly purge (`evict`). Registering with hbbs is not authenticated, so
-/// made-up devices that pass `uuid_matches` can still add rows (review A-10). A row is at most about
-/// 10.5 KB on disk (8 KB of sysinfo, 4 × 253 bytes of split fields, the id and uuid; measured with
-/// 4 KB pages, the primary key index included): 10,000 rows ≈ 0.1 GB, plus an hour of registrations.
+/// Device rows at most. Registering with hbbs is not authenticated, so made-up devices that pass
+/// `uuid_matches` can still add rows (review A-10). Kept when a report creates a row (`make_room`),
+/// not by a periodic purge: between two purges every id ever registered could come back (review
+/// C-10/C-18/C-26). A row is at most about 10.5 KB on disk (8 KB of sysinfo, 4 × 253 bytes of split
+/// fields, the id and uuid; measured with 4 KB pages, the primary key index included): 10,000 rows ≈
+/// 0.1 GB. Rows `make_room` may not evict are kept even past this, and reports then create no rows;
+/// logins (`account.rs`) and imports add rows without this check, owned ones (see `EVICTABLE`).
 const MAX_DEVICES: i64 = 10_000;
+/// A heartbeat that changes nothing else writes `last_seen_at` only once the stored one is this many
+/// seconds old: heartbeats come every 15 s (every 3 s while the device is in a session), and every
+/// write takes the database's write lock, which hbbs's registrations also wait on (§4.1).
+const LAST_SEEN_STEP: i64 = 60;
+/// Reports (heartbeat, sysinfo, audits) per source per minute (`report_allowed`). A NAT with 50
+/// devices, all in sessions: 50 × 20 heartbeats (one every 3 s; idle devices send 4 a minute) =
+/// 1,000; sysinfo and audits, a few per session, fit in what devices not in a session leave. Without
+/// a budget one source could keep the write lock busy with reports that create rows (`make_room`, a
+/// write transaction each) and, through `busy_timeout`, stall hbbs's registrations.
+const REPORTS_PER_MIN: u32 = 1_000;
+/// Sources with a budget at most (about 50 bytes each, ~3 MB). When full and no window has ended, a
+/// new source goes without a budget, as with hbbs's `IP_BLOCKER`: whoever holds that many sources
+/// gets that many budgets anyway.
+const MAX_REPORT_SOURCES: usize = 65_536;
+
+/// Per-source report budgets, counted per `source_key` (an IPv4 address or an IPv6 /64) in fixed
+/// one-minute windows, the same way as `conn_tracker`'s new-row limit.
+#[derive(Default)]
+struct ReportBudgets {
+    /// `source_key` → (start of its current minute, reports in it), unix ms.
+    sources: HashMap<IpAddr, (i64, u32)>,
+    /// When the ended windows were last dropped: at most once a window, so a full map does not
+    /// cost a scan per request.
+    pruned_at: i64,
+}
+
+impl ReportBudgets {
+    fn allow(&mut self, ip: IpAddr, now: i64) -> bool {
+        let key = source_key(ip);
+        if !self.sources.contains_key(&key) && self.sources.len() >= MAX_REPORT_SOURCES {
+            if now - self.pruned_at >= IP_WINDOW_MS {
+                self.sources.retain(|_, (start, _)| now - *start < IP_WINDOW_MS);
+                self.pruned_at = now;
+            }
+            if self.sources.len() >= MAX_REPORT_SOURCES {
+                throttled_log!(
+                    Duration::from_secs(60),
+                    warn,
+                    "Device report budgets are full ({MAX_REPORT_SOURCES} sources): {key} goes without one"
+                );
+                return true;
+            }
+        }
+        let window = self.sources.entry(key).or_insert((now, 0));
+        if !has_room(window, now, REPORTS_PER_MIN) {
+            return false;
+        }
+        window.1 += 1;
+        true
+    }
+}
+
+static REPORT_BUDGETS: Lazy<Mutex<ReportBudgets>> = Lazy::new(Default::default);
+
+/// Counts a device report (heartbeat, sysinfo, audit) from `ip` (`ClientIp`) against its source's
+/// `REPORTS_PER_MIN`; false when over it. Behind a reverse proxy on this machine the source is the
+/// proxy's `X-Real-IP` (§10).
+pub(crate) fn report_allowed(ip: IpAddr) -> bool {
+    REPORT_BUDGETS.lock().unwrap_or_else(|e| e.into_inner()).allow(ip, now_ms())
+}
 
 /// Identity check of the unauthenticated device reports and of the login's device binding (§9.3):
 /// hbbs' `peer` table must know `id` (real clients register before they report), and `uuid` must be
@@ -40,52 +114,74 @@ pub(crate) async fn uuid_matches(db: &SqlitePool, id: &str, uuid: Option<&str>) 
     Ok(known.is_some_and(|known| base64::decode(uuid).is_ok_and(|u| u == known)))
 }
 
-/// Late binding (§11) of a device that passed `uuid_matches` and has no owner: a login on it made
-/// before it was registered with hbbs (the login binds only registered devices) left a token row
-/// with its id and uuid. The newest such token (`last_used_at`) of an enabled account gives the
-/// owner. As safe as the login's binding: the token's uuid is the one just checked against hbbs.
-async fn bind_owner(db: &SqlitePool, id: &str, uuid: &str) -> Result<(), sqlx::Error> {
-    let owner: Option<i64> = sqlx::query_scalar(
-        "select t.user_id from token t join user u on u.id = t.user_id
-         where t.device_id = ? and t.device_uuid = ? and u.status = 1
-         order by t.last_used_at desc limit 1",
-    )
-    .bind(id)
-    .bind(uuid)
-    .fetch_optional(db)
-    .await?;
-    if let Some(owner) = owner {
-        sqlx::query("update device set user_id = ? where id = ? and user_id is null")
-            .bind(owner)
-            .bind(id)
-            .execute(db)
-            .await?;
+/// Late binding (§11) of a device that passed `uuid_matches` and has no owner, written as
+/// `user_id = coalesce(user_id, OWNER_FROM_TOKEN)` by the statement that writes the device row, with
+/// the device's id as `?1` and the reported uuid as `?2`: a login on it made before it was
+/// registered with hbbs (the login binds only registered devices) left a token row with its id and
+/// uuid. The newest such token (`last_used_at`) of an enabled account gives the owner. As safe as
+/// the login's binding: the token's uuid is the one just checked against hbbs. Reading the token
+/// and writing the owner in one statement keeps a logout from deleting the token in between and
+/// being undone (review C-24).
+const OWNER_FROM_TOKEN: &str = "(select t.user_id from token t join user u on u.id = t.user_id
+     where t.device_id = ?1 and t.device_uuid = ?2 and u.status = 1
+     order by t.last_used_at desc limit 1)";
+
+/// The `?1` oldest (`last_seen_at`) rows a report may delete to make room: unowned ones, and owned
+/// ones whose owner has no token left on the device (review C-19: a login binds any registered id,
+/// but a user keeps at most `MAX_TOKENS` = 50 tokens, so the owned rows kept are at most 50 per user,
+/// and a binding made up with a login goes once its token does). Never a row with a `device_policy`
+/// or device-scoped `strategy_option` row (neither table references `device`, so nothing goes with
+/// the row). Both arms read the `device_user_seen` index (migration 0002), never the table's
+/// `last_seen_at`, which sits after the 8 KB sysinfo in overflow pages (review C-16); the unowned arm
+/// in `last_seen_at` order, the owned arm sorting the owned rows. The planner takes a full scan for
+/// `user_id is not null` without `indexed by`.
+const EVICTABLE: &str = "
+    select id, last_seen_at from (
+      select id, last_seen_at from device d where user_id is null
+        and not exists (select 1 from device_policy p where p.device_id = d.id)
+        and not exists (select 1 from strategy_option s where s.scope = d.id)
+      order by last_seen_at limit ?1)
+    union all
+    select id, last_seen_at from (
+      select id, last_seen_at from device d indexed by device_user_seen where user_id is not null
+        and not exists (select 1 from token t where t.user_id = d.user_id and t.device_id = d.id)
+        and not exists (select 1 from device_policy p where p.device_id = d.id)
+        and not exists (select 1 from strategy_option s where s.scope = d.id)
+      order by last_seen_at limit ?1)
+    order by last_seen_at limit ?1";
+
+/// Before a report writes the row of `id` that did not exist, in `tx` (`begin immediate`): true
+/// when the row exists by now (a concurrent first report) or there is room for it, after deleting
+/// the oldest evictable rows (`EVICTABLE`) down to `MAX_DEVICES - 1` if needed (normally one row;
+/// more only after logins or an import took the table past the limit); false when not enough rows
+/// may be evicted, and then the caller writes nothing and drops `tx`, which undoes the deletes. An
+/// evicted device that comes back gets a new row, and its heartbeat asks for its sysinfo again
+/// (`sysinfo` key, §10). Real devices report every 15 s, so the oldest rows are ones that stopped.
+async fn make_room(tx: &mut SqliteConnection, id: &str) -> Result<bool, sqlx::Error> {
+    let exists: bool = sqlx::query_scalar("select exists(select 1 from device where id = ?)")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if exists {
+        return Ok(true);
     }
-    Ok(())
+    let rows: i64 = sqlx::query_scalar("select count(*) from device").fetch_one(&mut *tx).await?;
+    if rows < MAX_DEVICES {
+        return Ok(true);
+    }
+    let excess = rows - MAX_DEVICES + 1;
+    let deleted = sqlx::query(&format!("delete from device where id in (select id from ({EVICTABLE}))"))
+        .bind(excess)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    Ok(deleted as i64 == excess)
 }
 
-/// Hourly, from `conn_tracker`'s purge: over `MAX_DEVICES` rows, deletes the excess, oldest
-/// `last_seen_at` first, among the rows with no owner and no `device_policy` / device-scoped
-/// `strategy_option` rows (neither table references `device`, so nothing else goes with them). Rows
-/// that do not qualify are kept even over the limit. An evicted device that comes back gets a new row
-/// on its next heartbeat, which asks for its sysinfo again (`sysinfo` key, §10).
-pub(crate) async fn evict(db: &SqlitePool) -> Result<u64, sqlx::Error> {
-    let rows: i64 = sqlx::query_scalar("select count(*) from device").fetch_one(db).await?;
-    if rows <= MAX_DEVICES {
-        return Ok(0);
-    }
-    let res = sqlx::query(
-        "delete from device where id in (
-           select id from device d where user_id is null
-             and not exists (select 1 from device_policy p where p.device_id = d.id)
-             and not exists (select 1 from strategy_option s where s.scope = d.id)
-           order by last_seen_at limit ?)",
-    )
-    .bind(rows - MAX_DEVICES)
-    .execute(db)
-    .await?;
-    Ok(res.rows_affected())
-}
+/// A write transaction that takes the write lock up front: one that reads first and writes later
+/// fails with `SQLITE_BUSY_SNAPSHOT` when another connection wrote in between, which `busy_timeout`
+/// does not retry.
+const BEGIN_WRITE: &str = "begin immediate";
 
 /// sysinfo body (note 01 §5.2): every value is a string; the rest of the keys are kept in the raw text.
 #[derive(Deserialize)]
@@ -102,42 +198,45 @@ struct SysinfoReq {
     version: String,
 }
 
-/// `POST /api/sysinfo`: plain text `SYSINFO_UPDATED` on success, never `ID_NOT_FOUND`.
-pub(crate) async fn sysinfo(State(state): State<AppState>, body: Bytes) -> ApiResult {
+/// `POST /api/sysinfo`: plain text `SYSINFO_UPDATED` on success, never `ID_NOT_FOUND`; a refusal
+/// (over the source's budget, too long, not a registered device, no room in the device table) is
+/// 403 with an empty body, which the client retries after 120 s. Rare (a device sends it when it
+/// starts or its sysinfo changes), so it always writes in a `make_room` transaction.
+pub(crate) async fn sysinfo(State(state): State<AppState>, ClientIp(ip): ClientIp, body: Bytes) -> ApiResult {
+    let refused = || Ok(StatusCode::FORBIDDEN.into_response());
+    if !report_allowed(ip) || body.len() > MAX_SYSINFO_LEN {
+        return refused();
+    }
     let mut req: SysinfoReq = parse_json(&body)?;
-    if body.len() > MAX_SYSINFO_LEN || !uuid_matches(&state.db, &req.id, req.uuid.as_deref()).await? {
-        // The client retries after 120 s.
-        return Ok(StatusCode::FORBIDDEN.into_response());
+    if !uuid_matches(&state.db, &req.id, req.uuid.as_deref()).await? {
+        return refused();
     }
     for field in [&mut req.hostname, &mut req.username, &mut req.os, &mut req.version] {
         clip(field, MAX_SYSINFO_FIELD_LEN);
     }
-    let uuid = req.uuid.as_deref().unwrap_or_default();
-    let now = crate::common::now() as i64;
-    let owner: Option<i64> = sqlx::query_scalar(
+    let mut tx = state.db.begin_with(BEGIN_WRITE).await?;
+    if !make_room(&mut tx, &req.id).await? {
+        return refused();
+    }
+    const SET: &str = "uuid = ?2, hostname = ?3, username = ?4, os = ?5, version = ?6,
+         client_type = 'rustdesk', sysinfo = ?7, last_seen_at = ?8";
+    sqlx::query(&format!(
         "insert into device(id, uuid, hostname, username, os, version, client_type, sysinfo,
-                            first_seen_at, last_seen_at)
-         values(?, ?, ?, ?, ?, ?, 'rustdesk', ?, ?, ?)
-         on conflict(id) do update set uuid = excluded.uuid, hostname = excluded.hostname,
-           username = excluded.username, os = excluded.os, version = excluded.version,
-           client_type = excluded.client_type, sysinfo = excluded.sysinfo,
-           last_seen_at = excluded.last_seen_at
-         returning user_id",
-    )
+                            first_seen_at, last_seen_at, user_id)
+         values(?1, ?2, ?3, ?4, ?5, ?6, 'rustdesk', ?7, ?8, ?8, {OWNER_FROM_TOKEN})
+         on conflict(id) do update set {SET}, user_id = coalesce(user_id, excluded.user_id)"
+    ))
     .bind(&req.id)
-    .bind(uuid)
+    .bind(req.uuid.as_deref().unwrap_or_default())
     .bind(&req.hostname)
     .bind(&req.username)
     .bind(&req.os)
     .bind(&req.version)
     .bind(String::from_utf8_lossy(&body))
-    .bind(now)
-    .bind(now)
-    .fetch_one(&state.db)
+    .bind(crate::common::now() as i64)
+    .execute(&mut *tx)
     .await?;
-    if owner.is_none() {
-        bind_owner(&state.db, &req.id, uuid).await?;
-    }
+    tx.commit().await?;
     Ok(text("SYSINFO_UPDATED"))
 }
 
@@ -169,36 +268,78 @@ struct Strategy {
 }
 
 /// `POST /api/heartbeat`: always a JSON object (at least `{}`); strategy only when `modified_at != rev`.
+/// Over the source's budget or not a registered device: `{}`. The client has no branch for either
+/// (rustdesk@bd92623:src/hbbs_http/sync.rs `start_hbbs_sync_async` only looks for keys) and sends
+/// the next one 15 s later. No room for a new row (`make_room`): served without the row, so without
+/// the `sysinfo` key.
 pub(crate) async fn heartbeat(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
     body: Bytes,
 ) -> ApiResult {
+    if !report_allowed(ip) {
+        return Ok(ok_json(&HeartbeatResp::default()));
+    }
     let req: HeartbeatReq = parse_json(&body)?;
     if !uuid_matches(&state.db, &req.id, req.uuid.as_deref()).await? {
         return Ok(ok_json(&HeartbeatResp::default()));
     }
     let uuid = req.uuid.as_deref().unwrap_or_default();
     let now = crate::common::now() as i64;
-    let (sysinfo, owner): (String, Option<i64>) = sqlx::query_as(
-        "insert into device(id, uuid, ver, first_seen_at, last_seen_at, last_ip) values(?, ?, ?, ?, ?, ?)
-         on conflict(id) do update set ver = excluded.ver, last_seen_at = excluded.last_seen_at,
-           last_ip = excluded.last_ip
-         returning sysinfo, user_id",
-    )
-    .bind(&req.id)
-    .bind(uuid)
-    .bind(req.ver)
-    .bind(now)
-    .bind(now)
-    .bind(ip.to_string())
-    .fetch_one(&state.db)
-    .await?;
-    if owner.is_none() {
-        bind_owner(&state.db, &req.id, uuid).await?;
-    }
+    let ip = ip.to_string();
+    let seen: Option<(i64, i64, String, bool)> =
+        sqlx::query_as("select ver, last_seen_at, last_ip, sysinfo = '' from device where id = ?")
+            .bind(&req.id)
+            .fetch_optional(&state.db)
+            .await?;
+    // Whether the stored row has no sysinfo yet; `None` when there is no row.
+    let no_sysinfo: Option<bool> = match seen {
+        Some((ver, last_seen, last_ip, no_sysinfo))
+            if ver == req.ver && last_ip == ip && now - last_seen < LAST_SEEN_STEP =>
+        {
+            Some(no_sysinfo)
+        }
+        // Changed, or `last_seen_at` due. `None` if the row was evicted since the select: served
+        // without it, the next heartbeat makes a new one.
+        Some(_) => sqlx::query_scalar(&format!(
+            "update device set ver = ?3, last_seen_at = ?4, last_ip = ?5,
+               user_id = coalesce(user_id, {OWNER_FROM_TOKEN})
+             where id = ?1 returning sysinfo = ''"
+        ))
+        .bind(&req.id)
+        .bind(uuid)
+        .bind(req.ver)
+        .bind(now)
+        .bind(&ip)
+        .fetch_optional(&state.db)
+        .await?,
+        None => {
+            let mut tx = state.db.begin_with(BEGIN_WRITE).await?;
+            if make_room(&mut tx, &req.id).await? {
+                // `on conflict`: another first heartbeat of the same device may have made the row.
+                let no_sysinfo = sqlx::query_scalar(&format!(
+                    "insert into device(id, uuid, ver, first_seen_at, last_seen_at, last_ip, user_id)
+                     values(?1, ?2, ?3, ?4, ?4, ?5, {OWNER_FROM_TOKEN})
+                     on conflict(id) do update set ver = ?3, last_seen_at = ?4, last_ip = ?5,
+                       user_id = coalesce(user_id, excluded.user_id)
+                     returning sysinfo = ''"
+                ))
+                .bind(&req.id)
+                .bind(uuid)
+                .bind(req.ver)
+                .bind(now)
+                .bind(&ip)
+                .fetch_one(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                Some(no_sysinfo)
+            } else {
+                None
+            }
+        }
+    };
     let mut resp = HeartbeatResp {
-        sysinfo: sysinfo.is_empty().then_some(true),
+        sysinfo: no_sysinfo.filter(|&missing| missing),
         ..Default::default()
     };
     let (rev, options) = crate::strategy::effective(&state.db, &req.id).await?;
@@ -211,14 +352,26 @@ pub(crate) async fn heartbeat(
     Ok(ok_json(&resp))
 }
 
+/// `explain query plan` of `sql` (parameters written as literals): the `detail` of every step.
+#[cfg(test)]
+pub(crate) async fn query_plan(db: &SqlitePool, sql: &str) -> Vec<String> {
+    let rows: Vec<(i64, i64, i64, String)> =
+        sqlx::query_as(&format!("explain query plan {sql}")).fetch_all(db).await.unwrap();
+    rows.into_iter().map(|r| r.3).collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{MAX_DEVICES, MAX_PEER_ID_LEN, MAX_SYSINFO_FIELD_LEN, MAX_SYSINFO_LEN, MAX_UUID_LEN};
+    use super::{
+        query_plan, ReportBudgets, EVICTABLE, LAST_SEEN_STEP, MAX_DEVICES, MAX_PEER_ID_LEN, MAX_REPORT_SOURCES,
+        MAX_SYSINFO_FIELD_LEN, MAX_SYSINFO_LEN, MAX_UUID_LEN, REPORTS_PER_MIN,
+    };
     use crate::testutil::{self, send};
     use axum::http::StatusCode;
     use hbb_common::tokio;
     use serde_json::{json, Value};
     use sqlx::SqlitePool;
+    use std::net::IpAddr;
 
     const UUID: &[u8] = b"8f2c1d4e-1111-2222-3333-444455556666";
 
@@ -443,10 +596,21 @@ mod tests {
         assert_eq!(row, ("é".repeat(MAX_SYSINFO_FIELD_LEN / 2), x.clone(), x.clone(), x, raw));
     }
 
+    async fn count(db: &SqlitePool, sql: &str) -> i64 {
+        sqlx::query_scalar(sql).fetch_one(db).await.unwrap()
+    }
+
+    async fn has_row(db: &SqlitePool, id: &str) -> bool {
+        count(db, &format!("select count(*) from device where id = '{id}'")).await == 1
+    }
+
+    /// Review C-10/C-18/C-26/C-19: a report that creates a row first evicts the oldest evictable one
+    /// when the table is at `MAX_DEVICES`; with none evictable it creates nothing.
     #[tokio::test]
-    async fn evict_only_unowned_unconfigured_oldest() {
+    async fn new_rows_keep_the_table_capped() {
         let t = testutil::app().await;
         let db = &t.state.db;
+        let uuid = b64(UUID);
         let insert = |id: &'static str, last_seen: i64| async move {
             sqlx::query("insert into device(id, first_seen_at, last_seen_at) values(?, 0, ?)")
                 .bind(id)
@@ -455,65 +619,147 @@ mod tests {
                 .await
                 .unwrap();
         };
-        // MAX_DEVICES - 3 recent rows, seen at 1001, 1002, …
+        // MAX_DEVICES - 5 recent rows, seen at 1001, 1002, …
         sqlx::query(
             "with recursive n(i) as (select 1 union all select i + 1 from n where i < ?)
              insert into device(id, first_seen_at, last_seen_at) select 'bulk' || i, 0, 1000 + i from n",
         )
-        .bind(MAX_DEVICES - 3)
+        .bind(MAX_DEVICES - 5)
         .execute(db)
         .await
         .unwrap();
-        // The oldest rows: one owned, one with a pinned relay, one with a device option.
-        let (uid, _) = testutil::create_user(db, "ev-amy", "", false).await;
-        insert("owned", 1).await;
-        sqlx::query("update device set user_id = ? where id = 'owned'").bind(uid).execute(db).await.unwrap();
-        insert("pinned", 2).await;
+        // The oldest rows: owned with the owner's token on it, a pinned relay, a device option (all
+        // kept); owned with no token of the owner on it, and unowned (both evictable).
+        let (amy, _) = testutil::create_user(db, "ev-amy", "pw", false).await;
+        for (id, seen) in [("owned", 1), ("pinned", 2), ("optioned", 3), ("orphaned", 4), ("old", 5)] {
+            insert(id, seen).await;
+        }
+        sqlx::query("update device set user_id = ? where id in ('owned', 'orphaned')").bind(amy).execute(db).await.unwrap();
+        sqlx::query("insert into token(token_hash, user_id, device_id, created_at, last_used_at) values('h', ?, 'owned', 0, 0)")
+            .bind(amy)
+            .execute(db)
+            .await
+            .unwrap();
         sqlx::query("insert into device_policy(device_id, relay_pin) values('pinned', 'r:21117')")
             .execute(db)
             .await
             .unwrap();
-        insert("optioned", 3).await;
         set_option(db, "optioned", "allow-auto-disconnect", "Y").await;
-        assert_eq!(super::evict(db).await.unwrap(), 0, "at the limit");
+        assert_eq!(count(db, "select count(*) from device").await, MAX_DEVICES);
 
-        // Three over the limit: the three oldest rows that qualify go, the older ones that do not stay.
-        insert("old-a", 4).await;
-        insert("old-b", 5).await;
-        insert("old-c", 6).await;
-        assert_eq!(super::evict(db).await.unwrap(), 3);
-        let n: i64 = sqlx::query_scalar("select count(*) from device").fetch_one(db).await.unwrap();
-        assert_eq!(n, MAX_DEVICES);
-        let gone: i64 = sqlx::query_scalar("select count(*) from device where id like 'old-%'")
-            .fetch_one(db)
-            .await
-            .unwrap();
-        assert_eq!(gone, 0);
-        for id in ["owned", "pinned", "optioned", "bulk1"] {
-            let kept: i64 = sqlx::query_scalar("select count(*) from device where id = ?")
-                .bind(id)
-                .fetch_one(db)
-                .await
-                .unwrap();
-            assert_eq!(kept, 1, "{id}");
+        // Each new device takes the place of the oldest evictable row.
+        for (new, gone) in [("n1", "orphaned"), ("n2", "old"), ("n3", "bulk1")] {
+            add_peer(db, new, UUID).await;
+            let r = heartbeat(&t.app, json!({"id": new, "uuid": uuid, "ver": 1005010, "modified_at": 0})).await;
+            assert_eq!(r["sysinfo"], json!(true), "{new}");
+            assert!(has_row(db, new).await && !has_row(db, gone).await, "{new} replaces {gone}");
+            assert_eq!(count(db, "select count(*) from device").await, MAX_DEVICES);
         }
-        // One over again: the oldest bulk row is the oldest that qualifies.
-        insert("new", 99_999).await;
-        assert_eq!(super::evict(db).await.unwrap(), 1);
-        let bulk1: i64 = sqlx::query_scalar("select count(*) from device where id = 'bulk1'")
-            .fetch_one(db)
-            .await
-            .unwrap();
-        assert_eq!(bulk1, 0);
-        // The configuration of the kept rows is untouched.
-        let (rows,): (i64,) = sqlx::query_as(
-            "select (select count(*) from device_policy where device_id = 'pinned')
-                  + (select count(*) from strategy_option where scope = 'optioned')",
-        )
-        .fetch_one(db)
-        .await
-        .unwrap();
-        assert_eq!(rows, 2);
+        for id in ["owned", "pinned", "optioned", "bulk2"] {
+            assert!(has_row(db, id).await, "{id}");
+        }
+        // A device with a row evicts nothing; sysinfo creates rows the same way.
+        heartbeat(&t.app, json!({"id": "n1", "uuid": uuid, "ver": 1005011, "modified_at": 0})).await;
+        assert!(has_row(db, "bulk2").await);
+        add_peer(db, "n4", UUID).await;
+        let (status, _, _) = send(&t.app, "POST", "/api/sysinfo", None, &sysinfo_body("n4", Some(&uuid), "h")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(has_row(db, "n4").await && !has_row(db, "bulk2").await);
+        // Past the limit (rows added without the check, e.g. by logins): back to it in one go.
+        insert("x1", 99_999).await;
+        insert("x2", 99_999).await;
+        add_peer(db, "n5", UUID).await;
+        heartbeat(&t.app, json!({"id": "n5", "uuid": uuid, "ver": 1005010, "modified_at": 0})).await;
+        assert_eq!(count(db, "select count(*) from device").await, MAX_DEVICES);
+        assert!(has_row(db, "n5").await && !has_row(db, "bulk3").await && !has_row(db, "bulk5").await);
+
+        // Nothing evictable: served without a row (strategy, no `sysinfo` key), sysinfo refused.
+        sqlx::query("insert or ignore into device_policy(device_id) select id from device").execute(db).await.unwrap();
+        add_peer(db, "n6", UUID).await;
+        let r = heartbeat(&t.app, json!({"id": "n6", "uuid": uuid, "ver": 1005010, "modified_at": 0})).await;
+        assert!(r["modified_at"].is_i64() && r.get("sysinfo").is_none(), "{r}");
+        let (status, _, body) = send(&t.app, "POST", "/api/sysinfo", None, &sysinfo_body("n6", Some(&uuid), "h")).await;
+        assert_eq!((status, body.is_empty()), (StatusCode::FORBIDDEN, true));
+        assert!(!has_row(db, "n6").await);
+        assert_eq!(count(db, "select count(*) from device").await, MAX_DEVICES);
+        // Devices with a row are still served and updated.
+        let r = heartbeat(&t.app, json!({"id": "n1", "uuid": uuid, "ver": 1005012, "modified_at": 0})).await;
+        assert!(r["modified_at"].is_i64());
+        assert_eq!(count(db, "select ver from device where id = 'n1'").await, 1005012);
+    }
+
+    /// Review C-16: picking the rows to evict reads the `device_user_seen` index in `last_seen_at`
+    /// order (no scan of the table, whose `last_seen_at` sits after the 8 KB sysinfo).
+    #[tokio::test]
+    async fn eviction_uses_the_owner_and_last_seen_index() {
+        let t = testutil::app().await;
+        let sql = format!("delete from device where id in (select id from ({}))", EVICTABLE.replace("?1", "1"));
+        let plan = query_plan(&t.state.db, &sql).await;
+        eprintln!("device eviction: {plan:#?}");
+        assert!(plan.iter().any(|l| l == "SEARCH d USING INDEX device_user_seen (user_id=?)"), "{plan:?}");
+        assert!(plan.iter().any(|l| l.starts_with("SEARCH d USING INDEX device_user_seen (user_id>?)")), "{plan:?}");
+        assert!(!plan.iter().any(|l| l.starts_with("SCAN d")), "{plan:?}");
+    }
+
+    /// A heartbeat that changes nothing writes `last_seen_at` once it is `LAST_SEEN_STEP` old.
+    #[tokio::test]
+    async fn heartbeat_writes_last_seen_once_a_step() {
+        let t = testutil::app().await;
+        let db = &t.state.db;
+        add_peer(db, "111", UUID).await;
+        let hb = |ver: i64| json!({"id": "111", "uuid": b64(UUID), "ver": ver, "modified_at": 0});
+        heartbeat(&t.app, hb(1005010)).await;
+        let now = crate::common::now() as i64;
+        let set_seen = |seen: i64| async move {
+            sqlx::query("update device set last_seen_at = ? where id = '111'").bind(seen).execute(db).await.unwrap();
+        };
+        let seen = || count(db, "select last_seen_at from device where id = '111'");
+
+        set_seen(now - LAST_SEEN_STEP + 5).await;
+        heartbeat(&t.app, hb(1005010)).await;
+        assert_eq!(seen().await, now - LAST_SEEN_STEP + 5, "not written yet");
+        set_seen(now - LAST_SEEN_STEP).await;
+        heartbeat(&t.app, hb(1005010)).await;
+        assert!(seen().await >= now, "written once due");
+        // Another field changed: written at once.
+        set_seen(now - 1).await;
+        heartbeat(&t.app, hb(1005011)).await;
+        assert!(seen().await >= now);
+        assert_eq!(count(db, "select ver from device where id = '111'").await, 1005011);
+    }
+
+    /// Driven on a private set of budgets with chosen times.
+    #[test]
+    fn report_budgets_per_source() {
+        let mut b = ReportBudgets::default();
+        let t0 = 1_000_000;
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        for _ in 0..REPORTS_PER_MIN {
+            assert!(b.allow(ip("198.51.100.7"), t0));
+        }
+        assert!(!b.allow(ip("198.51.100.7"), t0 + 59_999));
+        // Another address has its own budget; an IPv6 /64 is one source.
+        assert!(b.allow(ip("198.51.100.8"), t0));
+        for _ in 0..REPORTS_PER_MIN {
+            assert!(b.allow(ip("2001:db8:1:2::1"), t0));
+        }
+        assert!(!b.allow(ip("2001:db8:1:2:ffff::9"), t0));
+        assert!(b.allow(ip("2001:db8:1:3::1"), t0));
+        // The next minute is a new window.
+        assert!(b.allow(ip("198.51.100.7"), t0 + 60_000));
+
+        // Full: a new source goes without a budget until a window has ended and the map is pruned.
+        let mut b = ReportBudgets::default();
+        for i in 0..MAX_REPORT_SOURCES as u32 {
+            b.sources.insert(IpAddr::from(i.to_be_bytes()), (t0, 0));
+        }
+        b.pruned_at = t0;
+        for _ in 0..=REPORTS_PER_MIN {
+            assert!(b.allow(ip("203.0.113.1"), t0 + 1));
+        }
+        assert!(!b.sources.contains_key(&ip("203.0.113.1")));
+        assert!(b.allow(ip("203.0.113.1"), t0 + 60_000));
+        assert_eq!(b.sources.len(), 1);
     }
 
     async fn login(app: &axum::Router, name: &str, id: &str, uuid: &str) -> String {
@@ -574,6 +820,14 @@ mod tests {
         let (status, _, _) = send(&t.app, "POST", "/api/sysinfo", None, &sysinfo_body("333", Some(&uuid), "h")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(owner(db, "333").await, Some(amy));
+
+        // The token is read by the statement that writes the owner (review C-24): one gone before
+        // it binds nothing.
+        login(&t.app, "lb-amy", "444", &uuid).await;
+        add_peer(db, "444", UUID).await;
+        sqlx::query("delete from token where device_id = '444'").execute(db).await.unwrap();
+        heartbeat(&t.app, hb("444")).await;
+        assert_eq!(owner(db, "444").await, None);
     }
 
     #[tokio::test]
@@ -605,6 +859,50 @@ mod tests {
         assert_eq!(left.len(), 2);
         let (status, _, _) = send(&t.app, "POST", "/api/currentUser", Some(&elsewhere), "").await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    /// Reviews C-5, C-20: logout spares the user's tokens from the same device that were issued after
+    /// the one used (a new login while the logout was on its way) or used since it was issued
+    /// (another system account of the same machine); the others go.
+    #[tokio::test]
+    async fn logout_spares_tokens_issued_or_used_after_it() {
+        let t = testutil::app().await;
+        let db = &t.state.db;
+        let uuid = b64(UUID);
+        let (amy, _) = testutil::create_user(db, "ls-amy", "pw", false).await;
+        add_peer(db, "111", UUID).await;
+        let latest = login(&t.app, "ls-amy", "111", &uuid).await;
+        let issued: i64 = count(db, "select max(created_at) from token where device_id = '111'").await;
+        for (hash, created, used) in [
+            ("stale", issued - 100, issued - 100),
+            ("same-second", issued, issued),
+            ("sibling", issued - 100, issued + 50),
+            ("newer", issued + 100, issued + 100),
+        ] {
+            sqlx::query(
+                "insert into token(token_hash, user_id, device_id, device_uuid, created_at, last_used_at)
+                 values(?, ?, '111', ?, ?, ?)",
+            )
+            .bind(hash)
+            .bind(amy)
+            .bind(&uuid)
+            .bind(created)
+            .bind(used)
+            .execute(db)
+            .await
+            .unwrap();
+        }
+        let (status, _, _) = send(&t.app, "POST", "/api/logout", Some(&latest), "").await;
+        assert_eq!(status, StatusCode::OK);
+        let left: Vec<String> = sqlx::query_scalar("select token_hash from token where device_id = '111' order by token_hash")
+            .fetch_all(db)
+            .await
+            .unwrap();
+        assert_eq!(left, ["newer", "sibling"]);
+        // Unbound by the logout; the spared tokens bind the device back on its next written heartbeat.
+        assert_eq!(owner(db, "111").await, None);
+        heartbeat(&t.app, json!({"id": "111", "uuid": uuid, "ver": 1005010, "modified_at": 0})).await;
+        assert_eq!(owner(db, "111").await, Some(amy));
     }
 
     #[tokio::test]

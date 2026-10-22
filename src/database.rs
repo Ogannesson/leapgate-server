@@ -190,7 +190,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(n, 1);
+        assert_eq!(n as usize, sqlx::migrate!("./migrations").iter().count());
         // Running again is a no-op.
         drop(super::open(url, true).await.unwrap());
     }

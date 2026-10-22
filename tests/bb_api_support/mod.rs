@@ -257,8 +257,18 @@ impl Server {
 
     /// 停掉进程，在同一个工作目录、同一个端口上重新启动（库、密钥文件都保留）；日志接着追加。
     pub async fn restart(&mut self) {
+        self.stop();
+        self.start_again().await;
+    }
+
+    /// 停掉进程（库已迁移，测试自己的连接池照常能读写）。
+    pub fn stop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+
+    /// `stop` 之后在同一个工作目录、同一个端口上重新启动。
+    pub async fn start_again(&mut self) {
         self.child = spawn(&self.dir, self.port);
         self.wait_ready().await;
     }

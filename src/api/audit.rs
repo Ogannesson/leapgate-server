@@ -1,8 +1,12 @@
 //! Audit reports (PORTA.md §9.3; note 03 §5).
-//! Success: 200 + empty body (`ok_empty`); internal error: 200 + `{"error"}` (`ok_internal`, the
-//! client retries); bad body: 400. Handlers return `Response` so `?` cannot produce a plain 400.
+//! Success: 200 + empty body (`ok_empty`); internal error or over the source's report budget: 200 +
+//! `{"error"}` (`ok_internal`, `admit`; the client retries); bad body: 400. Handlers return
+//! `Response` so `?` cannot produce a plain 400.
 
-use super::{device::uuid_matches, ok_empty, ok_internal, parse_json};
+use super::{
+    device::{report_allowed, uuid_matches},
+    ok_empty, ok_error, ok_internal, parse_json, ClientIp,
+};
 use crate::{conn_tracker::clip, peer::MAX_PEER_ID_LEN, state::AppState};
 use axum::{body::Bytes, extract::State, response::Response};
 use once_cell::sync::Lazy;
@@ -13,6 +17,7 @@ use std::{
     collections::HashSet,
     fmt,
     future::Future,
+    net::IpAddr,
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -46,6 +51,9 @@ pub(crate) const TABLES: [&str; 3] = ["audit_conn", "audit_file", "audit_alarm"]
 const MAX_ROWS: i64 = 20_000;
 /// Rows created longer ago than this are deleted by the hourly purge.
 const RETENTION_SECS: i64 = 180 * 24 * 3600;
+/// Rows the retention purge deletes per statement: each statement holds the write lock (shared
+/// with hbbs's registrations and every API write) for one short batch, not for the whole backlog.
+const PURGE_BATCH: i64 = 1_000;
 
 /// Nonces of records already written, in two generations of `NONCE_TTL`: each is kept for 5 to 10
 /// minutes, and old ones go a whole generation at a time instead of by scanning.
@@ -99,16 +107,21 @@ fn remember_nonce(nonce: &str) {
     NONCES.lock().unwrap_or_else(|e| e.into_inner()).remember(nonce);
 }
 
-fn parse<T: DeserializeOwned>(body: &[u8]) -> Result<T, Response> {
+/// The source's report budget (`report_allowed`), then the body. Over the budget: 200 + `{"error"}`,
+/// nothing parsed or written; the client retries it like an internal error (10 s and 30 s later).
+fn admit<T: DeserializeOwned>(ip: IpAddr, body: &[u8]) -> Result<T, Response> {
+    if !report_allowed(ip) {
+        return Err(ok_error("Too many requests"));
+    }
     parse_json(body).map_err(|e| e.0)
 }
 
 /// Makes room for one more row in `table` (one of `TABLES`): deletes the rows `MAX_ROWS - 1` ids or
 /// more below the newest, so with the insert that follows at most `MAX_ROWS` are left. Ids only grow
 /// (a new rowid is the largest + 1), so this is a range on the primary key that deletes nothing or
-/// one row. Done on every insert, not by the hourly purge: the reports are not rate limited, so an
-/// hour of them is not bounded. Runs before the insert, so a failure leaves nothing that the
-/// client's retry would duplicate.
+/// one row. Done on every insert, not by the hourly purge: the reports are only rate limited per
+/// source (`report_allowed`), so an hour of them is not bounded. Runs before the insert, so a
+/// failure leaves nothing that the client's retry would duplicate.
 async fn make_room(db: &SqlitePool, table: &str) -> Result<(), sqlx::Error> {
     sqlx::query(&format!("delete from {table} where id <= (select max(id) from {table}) - ?"))
         .bind(MAX_ROWS - 1)
@@ -118,13 +131,24 @@ async fn make_room(db: &SqlitePool, table: &str) -> Result<(), sqlx::Error> {
 }
 
 /// Hourly, from `conn_tracker`'s purge: deletes the rows of `table` (one of `TABLES`) created more
-/// than `RETENTION_SECS` before `now` (unix seconds). A scan of at most `MAX_ROWS` rows.
+/// than `RETENTION_SECS` before `now` (unix seconds), `PURGE_BATCH` rows per statement. A range on
+/// the `created_at` index (migration 0002; review C-16: `created_at` sits after the 4 KB text
+/// columns, so without it every purge read the whole table's overflow pages in the write lock).
 pub(crate) async fn purge(db: &SqlitePool, table: &str, now: i64) -> Result<u64, sqlx::Error> {
-    let res = sqlx::query(&format!("delete from {table} where created_at < ?"))
-        .bind(now - RETENTION_SECS)
-        .execute(db)
-        .await?;
-    Ok(res.rows_affected())
+    let sql = format!("delete from {table} where id in (select id from {table} where created_at < ? limit ?)");
+    let mut deleted = 0;
+    loop {
+        let n = sqlx::query(&sql)
+            .bind(now - RETENTION_SECS)
+            .bind(PURGE_BATCH)
+            .execute(db)
+            .await?
+            .rows_affected();
+        deleted += n;
+        if n < PURGE_BATCH as u64 {
+            return Ok(deleted);
+        }
+    }
 }
 
 /// `audit_conn.auth`: the authed report's own keys (`Auth`) as JSON, the text clipped to `MAX_TEXT_LEN`.
@@ -239,8 +263,8 @@ struct ConnReq {
 }
 
 /// `POST /api/audit/conn`: new / authed / close, and the controller's session note (no uuid, no nonce).
-pub(crate) async fn conn(State(state): State<AppState>, body: Bytes) -> Response {
-    let mut req: ConnReq = match parse(&body) {
+pub(crate) async fn conn(State(state): State<AppState>, ClientIp(ip): ClientIp, body: Bytes) -> Response {
+    let mut req: ConnReq = match admit(ip, &body) {
         Ok(req) => req,
         Err(resp) => return resp,
     };
@@ -363,8 +387,8 @@ struct FileReq {
 }
 
 /// `POST /api/audit/file`.
-pub(crate) async fn file(State(state): State<AppState>, body: Bytes) -> Response {
-    let mut req: FileReq = match parse(&body) {
+pub(crate) async fn file(State(state): State<AppState>, ClientIp(ip): ClientIp, body: Bytes) -> Response {
+    let mut req: FileReq = match admit(ip, &body) {
         Ok(req) => req,
         Err(resp) => return resp,
     };
@@ -405,8 +429,8 @@ struct AlarmReq {
 }
 
 /// `POST /api/audit/alarm`.
-pub(crate) async fn alarm(State(state): State<AppState>, body: Bytes) -> Response {
-    let mut req: AlarmReq = match parse(&body) {
+pub(crate) async fn alarm(State(state): State<AppState>, ClientIp(ip): ClientIp, body: Bytes) -> Response {
+    let mut req: AlarmReq = match admit(ip, &body) {
         Ok(req) => req,
         Err(resp) => return resp,
     };
@@ -740,6 +764,35 @@ mod tests {
                 .unwrap();
             assert_eq!(left, [now - RETENTION_SECS, now - 1], "{table}");
             assert_eq!(purge(db, table, now).await.unwrap(), 0, "{table}");
+
+            // A backlog over several batches goes in one purge; the recent rows stay.
+            let backlog = 2 * PURGE_BATCH + 5;
+            sqlx::query(&format!(
+                "with recursive n(i) as (select 1 union all select i + 1 from n where i < ?)
+                 insert into {table}({cols}) select 'x', 0, ? from n",
+                cols = if table == "audit_alarm" { "device_id, typ, created_at" } else { "device_id, conn_id, created_at" },
+            ))
+            .bind(backlog)
+            .bind(now - RETENTION_SECS - 1)
+            .execute(db)
+            .await
+            .unwrap();
+            assert_eq!(purge(db, table, now).await.unwrap(), backlog as u64, "{table}");
+            assert_eq!(count(db, table).await, 2, "{table}");
+        }
+    }
+
+    /// Review C-16: the retention purge is a range on the `created_at` index (migration 0002), not a
+    /// scan of the table and its overflow pages.
+    #[tokio::test]
+    async fn purge_uses_the_created_at_index() {
+        let t = testutil::app().await;
+        for table in TABLES {
+            let sql = format!("delete from {table} where id in (select id from {table} where created_at < 1 limit 1000)");
+            let plan = crate::api::device::query_plan(&t.state.db, &sql).await;
+            eprintln!("{table} purge: {plan:?}");
+            assert!(plan.iter().any(|l| l == &format!("SEARCH {table} USING COVERING INDEX {table}_created (created_at<?)")), "{plan:?}");
+            assert!(!plan.iter().any(|l| l.starts_with("SCAN")), "{plan:?}");
         }
     }
 

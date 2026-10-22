@@ -1494,11 +1494,14 @@ async fn audit_conn_big_body_is_not_amplified() {
     assert!(grown_mb < 40, "peak RSS grew by {grown_mb} MB for four ~1.9 MB bodies");
 }
 
-/// §9.3、§10 每小时清理（服务启动时先跑一次）：审计表删掉 180 天前的行；device 表超过 1 万行时，
-/// 按 last_seen_at 从老到新淘汰没有主人、也没有 device_policy 和设备级 strategy_option 的行，其余的不动。
+/// §8、§9.3 每小时清理（服务启动时先跑一次）：审计表删掉 180 天前的行。device 表不在这里清理（插入时守上限，
+/// 见下一条），超过 1 万行也不动。
 #[tokio::test]
 async fn hourly_purge_runs_at_startup() {
     let mut s = Server::start().await;
+    // 停着的时候插数据：只有重启后那一次清理能删到它们，删除数合成一行日志（审查 C-23：边跑边插时，
+    // 第一个进程的启动清理可能先删掉一部分，计数分到两行里）。
+    s.stop();
     let old = now() - 181 * 24 * 3600;
     let recent = now() - 24 * 3600;
     for table in ["audit_conn", "audit_file", "audit_alarm"] {
@@ -1507,25 +1510,15 @@ async fn hourly_purge_runs_at_startup() {
             s.exec(&format!("insert into {table}({cols}) values('x', 0, {t})")).await;
         }
     }
-    // 9997 行较新的，加上三台最老的（有主人、固定了中继、有设备级选项），正好 1 万行；再加两台较老的无主设备。
     s.exec(
-        "with recursive n(i) as (select 1 union all select i + 1 from n where i < 9997)
-         insert into device(id, first_seen_at, last_seen_at) select 'bulk' || i, 0, 1000 + i from n",
+        "with recursive n(i) as (select 1 union all select i + 1 from n where i < 10002)
+         insert into device(id, first_seen_at, last_seen_at) select 'bulk' || i, 0, i from n",
     )
     .await;
-    let alice = s.create_user("alice", "pw", false).await;
-    for (id, seen) in [("owned", 1), ("pinned", 2), ("optioned", 3), ("old-a", 4), ("old-b", 5)] {
-        s.exec(&format!("insert into device(id, first_seen_at, last_seen_at) values('{id}', 0, {seen})")).await;
-    }
-    s.exec(&format!("update device set user_id = {alice} where id = 'owned'")).await;
-    s.exec("insert into device_policy(device_id, relay_pin) values('pinned', 'relay.example.com:21117')").await;
-    s.set_option("optioned", "allow-auto-disconnect", "Y").await;
 
-    s.restart().await;
+    s.start_again().await;
     // 各表删了多少行合成一条日志；这一行写出来时清理已经做完。
-    let purged = |log: String| {
-        log.lines().any(|l| ["audit_conn 1", "audit_file 1", "audit_alarm 1", "device 2"].iter().all(|x| l.contains(x)))
-    };
+    let purged = |log: String| log.lines().any(|l| ["audit_conn 1", "audit_file 1", "audit_alarm 1"].iter().all(|x| l.contains(x)));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     while !purged(s.log()) {
         assert!(std::time::Instant::now() < deadline, "no purge log line with every table's count:\n{}", s.log());
@@ -1535,13 +1528,84 @@ async fn hourly_purge_runs_at_startup() {
         let left: Vec<i64> = s.rows(&format!("select created_at from {table}")).await.iter().map(|r| get_i64(r, "created_at")).collect();
         assert_eq!(left, [recent], "{table}");
     }
+    let log = s.log();
+    assert!(!log.lines().any(|l| l.contains("Hourly purge") && l.contains("device")), "the purge must not touch the device table:\n{log}");
+    assert_eq!(s.count("device").await, 10_002);
+}
+
+/// §9.3 device 表最多 1 万行，在上报新建行时守住：表满时先删一行最老的可淘汰行再插入。可淘汰 = 没有主人，
+/// 或者主人在这台设备上已经没有令牌；有 device_policy 或设备级 strategy_option 的行不淘汰。
+/// 没有可淘汰行时不建行：心跳照样下发策略、不带 sysinfo 键，sysinfo 回 403。
+#[tokio::test]
+async fn device_table_cap_on_insert() {
+    let s = Server::start().await;
+    s.exec(
+        "with recursive n(i) as (select 1 union all select i + 1 from n where i < 9995)
+         insert into device(id, first_seen_at, last_seen_at) select 'bulk' || i, 0, 1000 + i from n",
+    )
+    .await;
+    // 最老的五台：有主人且主人在上面有令牌、固定了中继、有设备级选项（都留下）；主人在上面没有令牌、没有主人（可淘汰）。
+    let alice = s.create_user("alice", "pw", false).await;
+    for (id, seen) in [("owned", 1), ("pinned", 2), ("optioned", 3), ("orphaned", 4), ("old", 5)] {
+        s.exec(&format!("insert into device(id, first_seen_at, last_seen_at) values('{id}', 0, {seen})")).await;
+    }
+    s.exec(&format!("update device set user_id = {alice} where id in ('owned', 'orphaned')")).await;
+    s.exec(&format!("insert into token(token_hash, user_id, device_id, created_at, last_used_at) values('h', {alice}, 'owned', 0, 0)")).await;
+    s.exec("insert into device_policy(device_id, relay_pin) values('pinned', 'relay.example.com:21117')").await;
+    s.set_option("optioned", "allow-auto-disconnect", "Y").await;
     assert_eq!(s.count("device").await, 10_000);
-    for id in ["owned", "pinned", "optioned", "bulk1"] {
+
+    for (i, gone) in ["orphaned", "old", "bulk1"].into_iter().enumerate() {
+        let id = format!("80000010{i}");
+        let uuid = registered(&s, &id).await;
+        let v = hb_json(&s.heartbeat(&id, &uuid, 0).await);
+        assert_eq!(v["sysinfo"], json!(true), "{id}");
+        assert!(s.device_user(&id).await.is_some(), "{id} must get a row");
+        assert_eq!(s.device_user(gone).await, None, "{gone} must make room for {id}");
+        assert_eq!(s.count("device").await, 10_000);
+    }
+    for id in ["owned", "pinned", "optioned", "bulk2"] {
         assert!(s.device_user(id).await.is_some(), "{id} must be kept");
     }
-    for id in ["old-a", "old-b"] {
-        assert_eq!(s.device_user(id).await, None, "{id} must be evicted");
+
+    // 全部变成不可淘汰：新设备不建行。
+    s.exec("insert or ignore into device_policy(device_id) select id from device").await;
+    let uuid = registered(&s, "800000199").await;
+    let v = hb_json(&s.heartbeat("800000199", &uuid, 0).await);
+    assert!(v["modified_at"].is_i64() && v.get("sysinfo").is_none(), "{v}");
+    let r = s.sysinfo("800000199", &uuid).await;
+    assert_eq!((r.status, r.body.is_empty()), (403, true));
+    assert_eq!(s.device_user("800000199").await, None);
+    assert_eq!(s.count("device").await, 10_000);
+}
+
+/// §9.3 上报按来源限速：每个来源（IPv4 地址、IPv6 /64；经本机反代时取 X-Real-IP）每分钟 1000 次，
+/// 心跳、sysinfo、三个审计接口合计。超出后心跳回 `{}`、sysinfo 回 403、审计回 200 + `{"error"}`（客户端会重试）；
+/// 别的来源不受影响。
+#[tokio::test]
+async fn device_reports_rate_limited_per_source() {
+    let s = Server::start().await;
+    let id = "800000201";
+    let uuid = registered(&s, id).await;
+    let body = json!({"id": id, "uuid": uuid, "ver": 1005010, "modified_at": 0}).to_string();
+    let from = |ip: &'static str| [("X-Real-IP", ip)];
+    for _ in 0..1000 {
+        let r = s.request("POST", "/api/heartbeat", None, Some(&body), &from("203.0.113.50")).await;
+        assert!(hb_json(&r)["modified_at"].is_i64());
     }
-    assert_eq!(s.scalar_i64("select count(*) from device_policy where device_id = 'pinned'").await, 1);
-    assert_eq!(s.scalar_i64("select count(*) from strategy_option where scope = 'optioned'").await, 1);
+    assert_eq!(hb_json(&s.request("POST", "/api/heartbeat", None, Some(&body), &from("203.0.113.50")).await), json!({}));
+    let sysinfo = sysinfo_body(id, &uuid).to_string();
+    let r = s.request("POST", "/api/sysinfo", None, Some(&sysinfo), &from("203.0.113.50")).await;
+    assert_eq!((r.status, r.body.is_empty()), (403, true));
+    let audit = json!({"id": id, "uuid": uuid, "typ": 0, "info": "{}"}).to_string();
+    let r = s.request("POST", "/api/audit/alarm", None, Some(&audit), &from("203.0.113.50")).await;
+    assert_eq!(r.status, 200);
+    r.assert_error_body();
+    assert_eq!(s.count("audit_alarm").await, 0);
+
+    // 另一个来源照常。
+    let r = s.request("POST", "/api/heartbeat", None, Some(&body), &from("203.0.113.51")).await;
+    assert!(hb_json(&r)["modified_at"].is_i64());
+    assert_audit_ok(&s.request("POST", "/api/audit/alarm", None, Some(&audit), &from("203.0.113.51")).await, "alarm");
+    assert_eq!(s.count("audit_alarm").await, 1);
 }
