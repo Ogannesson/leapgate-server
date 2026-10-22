@@ -196,6 +196,36 @@ async fn cli_without_secret_key_refuses_and_never_creates_one() {
     assert!(!work.key_path().exists(), "command line must never create porta_secret.key");
 }
 
+/// 命令行不新建数据库（同 §13 不生成密钥的理由：在别的目录下跑，改动会落进服务看不到的新库）：
+/// 库不存在时报错退出，提示里有库的绝对路径和 `DB_URL`，不留下任何库文件；写操作的输出带上所用库的
+/// 绝对路径，只读命令不带。
+#[tokio::test]
+async fn cli_never_creates_the_database_and_writes_name_it() {
+    let work = Work::new();
+    work.write_secret_key();
+    let db_path = work.db_path().display().to_string();
+
+    let out = work.cli(&["user", "add", "zed"], "zedpw123\n");
+    out.refused();
+    assert!(out.all().contains(&db_path) && out.all().contains("DB_URL"), "{}", out.all());
+    work.cli(&["user", "list"], "").refused();
+    let left: Vec<_> = std::fs::read_dir(work.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("porta.sqlite3"))
+        .collect();
+    assert!(left.is_empty(), "command line created {left:?}");
+
+    let db = work.pool().await;
+    let out = work.cli(&["user", "add", "zed"], "zedpw123\n");
+    out.ok();
+    assert!(out.stdout.lines().any(|l| l == format!("Database: {db_path}")), "{}", out.stdout);
+    assert!(user_id(&db, "zed").await.is_some());
+    let out = work.cli(&["user", "list"], "");
+    out.ok();
+    assert!(!out.stdout.contains("Database:"), "{}", out.stdout);
+}
+
 // ---------------------------------------------------------------------------------------------
 // §14：user / group / ab / strategy / device
 // ---------------------------------------------------------------------------------------------

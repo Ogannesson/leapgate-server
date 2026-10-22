@@ -1,9 +1,9 @@
-use hbb_common::{log, ResultType};
+use hbb_common::{bail, log, ResultType};
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions},
     ConnectOptions,
 };
-use std::{str::FromStr, time::Duration};
+use std::{path::PathBuf, str::FromStr, time::Duration};
 
 /// `DB_URL`, or `db_v2.sqlite3` next to the executable's data (same default as upstream hbbs).
 pub(crate) fn db_url() -> String {
@@ -23,16 +23,29 @@ pub(crate) fn db_url() -> String {
     })
 }
 
+/// The database file `url` names, made absolute against the working directory (as SQLite opens it).
+pub(crate) fn db_file(url: &str) -> ResultType<PathBuf> {
+    Ok(std::path::absolute(SqliteConnectOptions::from_str(url)?.get_filename())?)
+}
+
 /// Opens the process-wide pool and applies the embedded migrations.
-/// Used by both the server and the command line.
-pub(crate) async fn open(url: &str) -> ResultType<SqlitePool> {
+/// The server creates a missing database (`create`); the command line does not: run from another
+/// directory, it would otherwise write into a fresh database the running server never reads.
+pub(crate) async fn open(url: &str, create: bool) -> ResultType<SqlitePool> {
     log::info!("DB_URL={}", url);
     let n: u32 = crate::common::get_arg_or("MAX_DATABASE_CONNECTIONS", "8".to_owned())
         .parse()
         .unwrap_or(8);
     log::debug!("MAX_DATABASE_CONNECTIONS={}", n);
-    let opt = SqliteConnectOptions::from_str(url)?
-        .create_if_missing(true)
+    let opt = SqliteConnectOptions::from_str(url)?;
+    if !create && !opt.get_filename().exists() {
+        bail!(
+            "{} not found: run this from the server's working directory, or set DB_URL",
+            db_file(url)?.display()
+        );
+    }
+    let opt = opt
+        .create_if_missing(create)
         .journal_mode(SqliteJournalMode::Wal)
         .busy_timeout(Duration::from_secs(5))
         .foreign_keys(true)
@@ -165,7 +178,7 @@ mod tests {
             .unwrap();
             pool.close().await;
         }
-        let pool = super::open(url).await.unwrap();
+        let pool = super::open(url, true).await.unwrap();
         let db = super::Database::new(pool.clone());
         assert!(db.get_peer("123456").await.unwrap().is_some());
         let n: i64 = sqlx::query_scalar("select count(*) from _sqlx_migrations")
@@ -174,6 +187,28 @@ mod tests {
             .unwrap();
         assert_eq!(n, 1);
         // Running again is a no-op.
-        drop(super::open(url).await.unwrap());
+        drop(super::open(url, true).await.unwrap());
+    }
+
+    // Only the server creates a missing database; the command line refuses and names the absolute path.
+    #[tokio::test]
+    async fn creates_a_missing_database_only_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite3");
+        let url = path.to_str().unwrap();
+        let err = super::open(url, false).await.unwrap_err().to_string();
+        assert!(err.contains(&format!("{} not found", path.display())), "{err}");
+        assert!(err.contains("DB_URL"), "{err}");
+        assert!(!path.exists());
+
+        drop(super::open(url, true).await.unwrap());
+        assert!(path.exists());
+        drop(super::open(url, false).await.unwrap());
+
+        // Relative names resolve against the working directory, like SQLite's own open.
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(super::db_file("./x.sqlite3").unwrap(), cwd.join("x.sqlite3"));
+        assert_eq!(super::db_file("sqlite://x.sqlite3").unwrap(), cwd.join("x.sqlite3"));
+        assert_eq!(super::db_file(url).unwrap(), path);
     }
 }

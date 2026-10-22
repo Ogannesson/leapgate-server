@@ -136,7 +136,7 @@ impl RendezvousServer {
         }
         let nat_port = port - 1;
         let ws_port = port + 2;
-        let db = crate::database::open(&crate::database::db_url()).await?;
+        let db = crate::database::open(&crate::database::db_url(), true).await?;
         let cfg = crate::config::Config::from_args()?;
         let api_listen = cfg.api.listen_addr(port)?;
         let state = AppState::new(

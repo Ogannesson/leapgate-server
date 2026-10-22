@@ -23,7 +23,7 @@ pub(crate) struct TestApp {
 pub(crate) async fn pool() -> (TempDir, SqlitePool) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db.sqlite3");
-    let pool = crate::database::open(path.to_str().unwrap()).await.unwrap();
+    let pool = crate::database::open(path.to_str().unwrap(), true).await.unwrap();
     (dir, pool)
 }
 
