@@ -253,11 +253,11 @@ pub(crate) async fn login(State(state): State<AppState>, body: Bytes) -> ApiResu
     // argon2 takes tens of milliseconds of CPU: keep it off the async workers, a few at a time.
     let password = std::mem::take(&mut req.password);
     let checked = stored.clone();
-    let (check, upgraded) = ARGON2
+    let (check, upgraded, password) = ARGON2
         .run(move || {
             let check = auth::verify_password(&password, &checked);
             let upgraded = (check == PasswordCheck::OkNeedsUpgrade).then(|| auth::hash_password(&password));
-            (check, upgraded)
+            (check, upgraded, password)
         })
         .await?;
     let matched = check != PasswordCheck::Mismatch;
@@ -287,8 +287,25 @@ pub(crate) async fn login(State(state): State<AppState>, body: Bytes) -> ApiResu
             .await?;
             if res.rows_affected() == 1 {
                 log::info!("Upgraded the password hash of user {} to argon2id", req.username);
+                hash
+            } else {
+                // Another login with the same legacy hash may have upgraded it first: its argon2
+                // hash is as good as ours. Anything else (a `user passwd`) refuses this login.
+                let now_stored: Option<String> = sqlx::query_scalar("select password_hash from user where id = ?")
+                    .bind(uid)
+                    .fetch_optional(&state.db)
+                    .await?;
+                let Some(now_stored) = now_stored.filter(|h| h.starts_with("$argon2id$")) else {
+                    return Err(ApiError::new(StatusCode::UNAUTHORIZED, "Wrong credentials"));
+                };
+                let (check, now_stored) = ARGON2
+                    .run(move || (auth::verify_password(&password, &now_stored), now_stored))
+                    .await?;
+                if check != PasswordCheck::Ok {
+                    return Err(ApiError::new(StatusCode::UNAUTHORIZED, "Wrong credentials"));
+                }
+                now_stored
             }
-            hash
         }
         None => stored,
     };
@@ -653,6 +670,48 @@ mod tests {
             let (status, _) = login_as(&t.app, name, "new", "", "").await;
             assert_eq!(status, StatusCode::OK, "{name}");
         }
+    }
+
+    /// Two first logins of an imported user: the one that finishes second finds the hash already
+    /// upgraded by the other, and still gets its token.
+    #[tokio::test]
+    async fn concurrent_legacy_upgrade_both_log_in() {
+        let t = testutil::app().await;
+        let db = &t.state.db;
+        let slots = std::thread::available_parallelism().map_or(1, |n| n.get()) as u32;
+        let (uid, _) = testutil::create_user(db, "cu-tina", "", false).await;
+        sqlx::query("update user set password_hash = ? where id = ?")
+            .bind(bcrypt::hash("pw", 4).unwrap())
+            .bind(uid)
+            .execute(db)
+            .await
+            .unwrap();
+        // Hold this login between reading the bcrypt hash and checking it.
+        let all = ARGON2.slots.clone().acquire_many_owned(slots).await.unwrap();
+        let app = t.app.clone();
+        let mut login = tokio::spawn(async move { login_as(&app, "cu-tina", "pw", "", "").await });
+        assert!(tokio::time::timeout(Duration::from_millis(300), &mut login).await.is_err());
+        // The other login's upgrade lands meanwhile.
+        let other = auth::hash_password("pw").unwrap();
+        sqlx::query("update user set password_hash = ? where id = ?")
+            .bind(&other)
+            .bind(uid)
+            .execute(db)
+            .await
+            .unwrap();
+        drop(all);
+
+        let (status, v) = login.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let token = v["access_token"].as_str().unwrap();
+        let (status, _, _) = send(&t.app, "POST", "/api/currentUser", Some(token), "").await;
+        assert_eq!(status, StatusCode::OK);
+        let stored: String = sqlx::query_scalar("select password_hash from user where id = ?")
+            .bind(uid)
+            .fetch_one(db)
+            .await
+            .unwrap();
+        assert_eq!(stored, other);
     }
 
     #[tokio::test]

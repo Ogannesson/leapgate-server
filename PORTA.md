@@ -351,7 +351,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 
 ## 11. 账号、令牌、密码（`auth.rs`、`account.rs`）
 
-- 密码：argon2id（`argon2` crate 默认参数）。校验时按前缀识别 `$argon2id$`、`$2a$/$2b$/$2y$`（bcrypt）、`md5:`（rustdesk-api 旧格式 `md5(明文+"rustdesk-api")`，笔记 05 §3）；旧格式校验通过后当场改存 argon2id。`password_hash = ''` 的账号不能密码登录。
+- 密码：argon2id（`argon2` crate 默认参数）。校验时按前缀识别 `$argon2id$`、`$2a$/$2b$/$2y$`（bcrypt）、`md5:`（rustdesk-api 旧格式 `md5(明文+"rustdesk-api")`，笔记 05 §3）；旧格式校验通过后当场改存 argon2id，只在库里仍是刚校验的旧哈希时才写（期间 `user passwd` 改过的不覆盖，这次登录回 401）；库里已被另一个并发登录升级成 argon2id、且本次明文能通过它时照常签令牌。`password_hash = ''` 的账号不能密码登录。
 - 令牌：32 字节随机数的 base64url（无填充），库里只存 sha256 hex。没有过期时间；登出、改密码、禁用账号时删掉该用户的令牌（登出只删当前这个）。每次使用更新 `last_used_at`。
 - 登录时把请求体里的设备 `id`/`uuid` 记进令牌行；再做 §9.3 同样的弱校验：`peer` 表里有这个 id、且 uuid 不符时，登录照常成功但不改 `device.user_id`（防止别人把你的设备挂到自己名下）；校验通过或 `peer` 表里没有这个 id 时，把 `device.user_id` 设成这个用户（设备行不存在就建）。登出时若 `device.user_id` 是本人则清空。
 - 账号可用的判定写死为 `status = 1`。
