@@ -32,6 +32,11 @@ const DIRECT_MARGIN_MS: i64 = 20_000;
 /// An attempt with `RequestRelay`s is finalized this long after the last one (A waits up to 18 s for
 /// each `RelayResponse`). 待实测.
 const RELAY_SETTLE_MS: i64 = 20_000;
+/// A falls back at most 3 times, each `RequestRelay` on a new connection up to 18 s after the last one.
+/// Later ones from the same (A IP, B id) start a new row, so a stream of `RequestRelay`s (unauthenticated)
+/// cannot keep one attempt in memory forever. 待实测.
+const RELAY_MAX_REQS: i64 = 3;
+const RELAY_MERGE_MS: i64 = RELAY_MAX_REQS * RELAY_SETTLE_MS;
 const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 
 /// `conn_attempt.signal`: what hbbs did with a `PunchHoleRequest`.
@@ -219,8 +224,9 @@ impl Attempt {
     /// Whether a `RequestRelay` at `now` belongs to this attempt (same (A IP, B id) already checked).
     fn takes_relay_request(&self, now: i64) -> bool {
         if self.relay_req_count > 0 {
-            // A retrying the fallback (or a `relay_only` row); still in memory = within RELAY_SETTLE_MS.
-            return true;
+            // A retrying the fallback (or a `relay_only` row), within its first request's merge window.
+            return self.relay_req_count < RELAY_MAX_REQS
+                && self.relay_req_at.is_some_and(|at| now <= at + RELAY_MERGE_MS);
         }
         match self.reply {
             Some((Answer::PunchHoleSent | Answer::LocalAddr, at)) => now <= at + self.direct_window(at),
@@ -1056,6 +1062,47 @@ mod tests {
         // A punch request never merges into a relay_only row.
         s.request_relay(relay_req(p3(40006), "r1:21117"), T0 + 200_000);
         s.punch_request(punch(a1(), Signal::PunchHole), T0 + 200_500);
+        assert_eq!(s.attempts.len(), 2);
+    }
+
+    #[test]
+    fn request_relay_merging_is_capped() {
+        // Review C-9: a RequestRelay every 15 s from new ports of one IP to an unknown id. Each row
+        // takes at most 3 of them within 60 s of its first, and is finalized; memory stays bounded.
+        let mut s = TrackerState::default();
+        let mut finalized = Vec::new();
+        for i in 0..2_000i64 {
+            let now = T0 + i * 15_000;
+            let mut rr = relay_req(p3(1_024 + i as u16), "r1:21117");
+            rr.b_id = "no-such-id".to_owned();
+            rr.found_in_memory = false;
+            s.request_relay(rr, now);
+            finalized.extend(s.sweep(now));
+            assert!(s.attempts.len() <= 2, "{}", s.attempts.len());
+            assert!(s.by_relay_addr.len() <= 6, "{}", s.by_relay_addr.len());
+            assert!(s.attempts.values().all(|a| a.relay_keys.len() <= 3 && a.relay_req_count <= 3));
+        }
+        assert!(finalized.len() >= 600, "{}", finalized.len());
+        assert!(finalized.iter().all(|f| f.outcome == "relay_failed" && f.attempt.relay_req_count == 3));
+
+        // A punch attempt also takes at most 3, then a new relay_only row starts.
+        let mut s = TrackerState::default();
+        s.punch_request(punch(a1(), Signal::PunchHole), T0);
+        s.reply(reply(a1(), ReplyKind::PunchHoleSent), T0 + 1_000);
+        for (i, port) in (40003..40007).enumerate() {
+            s.request_relay(relay_req(p3(port), "r1:21117"), T0 + 20_000 + i as i64 * 1_000);
+        }
+        let mut out: Vec<_> = s
+            .sweep(T0 + 100_000)
+            .into_iter()
+            .map(|f| (f.attempt.relay_only(), f.attempt.relay_req_count, f.outcome))
+            .collect();
+        out.sort();
+        assert_eq!(out, [(false, 3, "relay_failed"), (true, 1, "relay_failed")]);
+
+        // More than 60 s after the first RequestRelay: a new row, even below 3.
+        s.request_relay(relay_req(p3(40010), "r1:21117"), T0 + 200_000);
+        s.request_relay(relay_req(p3(40011), "r1:21117"), T0 + 260_001);
         assert_eq!(s.attempts.len(), 2);
     }
 
