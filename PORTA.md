@@ -55,8 +55,8 @@
 - 入口 `main.rs`：第一个参数是已知子命令（§14）时进入命令行模式，否则照原样解析 hbbs 参数、启动服务。
 - `RendezvousServer::start_with_bind` 自己建 tokio 运行时；API（axum）、路由健康检查、GeoIP 更新、结果记录的落库任务都在这个运行时里 `spawn`。
 - `AppState`（`Clone`，内部全是 `Arc`/池句柄），同一份交给 `RendezvousServer` 和 axum：
-  - `db: SqlitePool`（全进程一个池，§4.1）
-  - `pm: PeerMap`（原有，在线状态 = 内存里有且 `last_reg_time` 不到 30 秒，笔记 02 §2.5）
+  - `db: SqlitePool`（主池，§4.1）
+  - `pm: PeerMap`（原有，在线状态 = 内存里有且 `last_reg_time` 不到 30 秒，笔记 02 §2.5；查库写库用自己的会合池，§4.1）
   - `router: Arc<Router>`（替代原来每个 clone 一份的 `relay_servers`/`relay_servers0` 快照，笔记 02 §1.6、§3.5）
   - `tracker: Arc<ConnTracker>`
   - `secret: Arc<SecretBox>`（§13）
@@ -68,7 +68,8 @@
 ## 4. 存储
 
 ### 4.1 连接池与迁移
-- 一个 `sqlx::SqlitePool`：WAL、`busy_timeout` 5 秒、`foreign_keys` 打开，池大小 `MAX_DATABASE_CONNECTIONS`（默认改为 8）。路径仍是 `DB_URL`，默认 `./db_v2.sqlite3`。
+- 主池 `sqlx::SqlitePool`（API、命令行、后台任务用）：WAL、`synchronous=NORMAL`（提交不等 fsync，只有 checkpoint 才刷盘；不会损坏库，掉电最多丢最后几个事务）、`busy_timeout` 5 秒、`foreign_keys` 打开，池大小 `MAX_DATABASE_CONNECTIONS`（默认改为 8），取连接最多等 3 秒（sqlx 默认 30 秒；API 被灌时宁可几秒内失败，审查 C-21）。路径仍是 `DB_URL`，默认 `./db_v2.sqlite3`。
+- 会合池：`PeerMap` 单独一个池，连同一个库（`database::rendezvous_pool`，由 `AppState::new` 建）：2 个连接，取连接最多等 200 毫秒，`busy_timeout` 200 毫秒，其余设置同主池。`io_loop` 里查库、写库都走它，不和未认证的 API 请求排同一个公平队列（审查 C-21/C-11：API 被灌时，`io_loop` 每查一次库就要排几秒，UDP 收包和三个 TCP 端口的 accept 一起卡住）。等不到就放弃这次处理，客户端下一轮注册会重试；查库失败不能当成"没有这个 id"（§6 第 7 条）。
 - 迁移用 `sqlx::migrate!("./migrations")`（编译期嵌入文件，不需要数据库），服务和命令行启动时都执行。原来 `create_tables` 里的 `peer` 表 DDL 挪进 `0001`，保留 `if not exists`，这样能直接接管已有的 hbbs 数据库。
 - 全部用运行时 `sqlx::query()`，不用编译期宏。
 - 迁移文件必须是 LF（校验和按字节算）。已发布的迁移不再修改，第一期合并前可以直接改 `0001`。
@@ -279,9 +280,12 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
    - `IP_BLOCKER` 最多 65536 个条目（来源）。满了以后，没有条目的新来源不建条目、不受每来源限额，直接交给全局新 id 上限（有意 fail-open，库的增长由全局上限兜住），每分钟最多打一条 warn。
    - 全局新 id 上限：所有来源合计每分钟最多 20 个新 id，超出的丢弃、不回包，每分钟最多打一条 warn。个人部署一天新增的设备只有个位数，批量部署时客户端会在后续注册周期里重试。已知 id 不受影响。
    - 库里的 `peer` 行不做自动清理（表里没有最后在线时间）：持续被灌时每天最多新增约 2.9 万行（20 × 1440）。
-   - `io_loop` 里的 5 分钟定时器（和 `handle_udp` 串行，不会插进 `get_or` 和 `update_pk` 之间）：`IP_BLOCKER` 清空天窗口到期的集合，删掉分钟窗口已过且集合为空的条目；`IP_CHANGES` 删掉 360 秒前开始的记录；`PeerMap` 删掉 `last_reg_time` 超过 1 小时的条目。被删的条目下次 `get` 从库里重新加载；只存在内存里的 `socket_addr`、`last_reg_time`、`reg_pk`（6 秒内的注册计数）对闲置 1 小时的设备都没有意义，在线判断本来就要求 `last_reg_time` 在 30 秒内。
-   - 日志不打 uuid/pk 原文，只打 id、来源 IP 和长度；uuid 不匹配、ip/pk 不匹配两条 warn 每分钟最多各打一条（hbb_common `throttled_log!`）。
-   - 写库仍在 `io_loop` 里做：有了上面的上限，写库次数有界。
+   - `RegisterPk` 的 id 不在内存里时要查库：查库前先过一个全局令牌桶（每秒 200 次、突发 1000 次），超出的静默丢弃（不回包、每分钟最多一条 warn）。被丢的客户端下一轮 `RegisterPeer` 会再被要求 `RegisterPk`（审查 C-12）。
+   - 查库出错不等于"没有这个 id"（审查 C-22/U-1）：`PeerMap::get` 返回 `Result<Option<_>>`。`RegisterPk` 出错就丢包，不进新 id 检查、不建条目；TCP 打洞请求不回包；`get_pk` 返回空、不签名。确认库里没有才在内存里建空条目（`insert_new`），不再查第二次库。
+   - `update_pk` 先写库、成功后才改内存，写库失败时内存条目保持原样；`RegisterPk` 回真实结果，写库失败回 `SERVER_ERROR`（客户端只记一行日志，下一轮重试）。不能回 `UUID_MISMATCH`：客户端收到它会换一个新 id（rustdesk `rendezvous_mediator.rs` `handle_uuid_mismatch` → `Config::update_id`）。插入撞上 id 唯一索引（查库之后别处加了这个 id，比如命令行导入）时，从库加载这一行、回 `SERVER_ERROR`，客户端重试时按库里的 uuid 判断。
+   - `io_loop` 里的 5 分钟定时器（和 `handle_udp` 串行，不会插进 `RegisterPk` 的查找和 `update_pk` 之间）：`IP_BLOCKER` 清空天窗口到期的集合，删掉分钟窗口已过且集合为空的条目；`IP_CHANGES` 删掉 360 秒前开始的记录；`PeerMap` 删掉 `last_reg_time` 超过 1 小时的条目。被删的条目下次 `get` 从库里重新加载；只存在内存里的 `socket_addr`、`last_reg_time`、`reg_pk`（6 秒内的注册计数）对闲置 1 小时的设备都没有意义，在线判断本来就要求 `last_reg_time` 在 30 秒内。
+   - 日志不打 uuid/pk 原文，只打 id、来源 IP 和长度。未认证、每个包都能触发的日志（info 及以上）一律用 hbb_common `throttled_log!`，每分钟最多各打一条：uuid 不匹配、ip/pk 不匹配、许可证不符的 `PunchHoleRequest`、`RegisterPeer` 的 "IP change"、`update_pk` 的两行，以及会合模块查库、写库失败（审查 A-5、C-1/C-7/C-8/C-17）。攻击者给的 id 先截到 253 字节（按字符边界）再打：TCP 打洞请求的 id 不校验长度，最长一帧。以后在这类路径上加日志照此办理。
+   - 查库、写库仍在 `io_loop` 里做：有了上面的上限，写库次数有界；每次最多等会合池的 200 毫秒取连接加 200 毫秒写锁（§4.1），不再随 API 负载变长。
 8. 会合端口的资源上限（审查 A-2/A-3/A-4；常量写死，不做配置）：
    - 帧长：21116/TCP 单帧和 21118/WebSocket 单条消息、单帧最多 16 KB（最大的合法消息是带 WebRTC offer 的 `PunchHoleRequest`：新客户端不带候选，约 1 KB；老客户端带全部候选，几 KB）。21115 单帧最多 128 KB：`OnlineRequest` 客户端不分批，界面把当前标签页的全部 id 一次发出（`peers_view.dart` `_queryOnlines` → `client.rs` `query_online_states_`）；地址簿每本最多 5000 台，即使每个 id 16 个字符也只有约 90 KB。超过帧上限的连接直接断开。
    - `OnlineRequest.peers` 超过 16384 条（128 KB 按每个 id 至少 6 字节加 2 字节标签和长度能放下的条数）的整条丢弃，不回包。

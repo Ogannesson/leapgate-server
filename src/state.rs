@@ -41,7 +41,7 @@ impl AppState {
         }
         let cfg = Arc::new(cfg);
         Ok(Self {
-            pm: PeerMap::new(db.clone()),
+            pm: PeerMap::new(crate::database::rendezvous_pool(&db)),
             router: Arc::new(Router::new(db.clone(), cfg.clone())),
             tracker: Arc::new(ConnTracker::new(db.clone())),
             secret: Arc::new(SecretBox::load_or_create(secret_key_file)?),

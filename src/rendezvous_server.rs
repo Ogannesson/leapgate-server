@@ -95,6 +95,40 @@ const IP_NEW_IDS_PER_DAY: usize = 300;
 const IP_MAPS_PURGE_INTERVAL: Duration = Duration::from_secs(300);
 /// `PeerMap` entries without a registration for this long are dropped (`PeerMap::evict_idle`).
 const PEER_IDLE_EVICT: Duration = Duration::from_secs(3600);
+/// Database lookups of `RegisterPk`s for ids not in memory, from all sources together: a second's
+/// worth on average, a burst on top (review C-12). Each one is a query `io_loop` waits for, and
+/// the per-source limits do not hold for many sources or a full `IP_BLOCKER`. After a restart
+/// every device misses: 1,000 come back at once, more within seconds.
+const LOOKUPS_PER_SEC: f64 = 200.0;
+const LOOKUP_BURST: f64 = 1000.0;
+
+/// A token bucket of `LOOKUPS_PER_SEC`, holding at most `LOOKUP_BURST`.
+#[derive(Clone)]
+struct LookupBudget {
+    tokens: f64,
+    at: Instant,
+}
+
+impl LookupBudget {
+    fn new() -> Self {
+        Self {
+            tokens: LOOKUP_BURST,
+            at: Instant::now(),
+        }
+    }
+
+    fn take(&mut self) -> bool {
+        let now = Instant::now();
+        let earned = (now - self.at).as_secs_f64() * LOOKUPS_PER_SEC;
+        self.tokens = (self.tokens + earned).min(LOOKUP_BURST);
+        self.at = now;
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
+}
 
 /// Concurrent connections on one rendezvous port (review A-4): at most `total` in all and at most
 /// `MAX_CONNS_PER_SOURCE` per source (an IPv4 address or an IPv6 /64, `source_key`). A loopback
@@ -236,6 +270,8 @@ pub struct RendezvousServer {
     /// `(window start, new ids)`, one-minute windows (`NEW_IDS_PER_MIN`). Only the instance
     /// running `io_loop` handles `RegisterPk`, so a plain field is enough.
     new_ids: (Instant, u32),
+    /// `LOOKUPS_PER_SEC`, a plain field for the same reason.
+    lookups: LookupBudget,
 }
 
 enum LoopFailure {
@@ -306,6 +342,7 @@ impl RendezvousServer {
             state: state.clone(),
             conns: Default::default(),
             new_ids: (Instant::now(), 0),
+            lookups: LookupBudget::new(),
         };
         log::info!("mask: {:?}", rs.inner.mask);
         log::info!("local-ip: {:?}", rs.inner.local_ip);
@@ -419,7 +456,7 @@ impl RendezvousServer {
                 _ = purge_timer.tick() => {
                     purge_ip_maps().await;
                     // Here, not in a task of its own: serial with `handle_udp`, so it never runs
-                    // between a `RegisterPk`'s `get_or` and its `update_pk`.
+                    // between a `RegisterPk`'s lookup (`get`/`insert_new`) and its `update_pk`.
                     self.pm.evict_idle(PEER_IDLE_EVICT).await;
                 }
                 Some(data) = rx.recv() => {
@@ -539,24 +576,51 @@ impl RendezvousServer {
                     } else if !self.check_ip_rate(addr.ip()).await {
                         return send_rk_res(socket, addr, TOO_FREQUENT).await;
                     }
-                    let peer = match self.pm.get(&id).await {
+                    let peer = match self.pm.get_in_memory(&id).await {
                         Some(peer) => peer,
-                        None => match self.check_new_id(addr.ip(), &id).await {
-                            NewId::Allowed => self.pm.get_or(&id).await,
-                            NewId::SourceFull => {
-                                return send_rk_res(socket, addr, TOO_FREQUENT).await;
-                            }
-                            NewId::GlobalFull => {
+                        // Not in memory: costs a database lookup, within a global budget
+                        // (review C-12). A dropped client is asked for `RegisterPk` again by its
+                        // next `RegisterPeer`.
+                        None if !self.lookups.take() => {
+                            throttled_log!(
+                                Duration::from_secs(60),
+                                warn,
+                                "RegisterPk: over {} database lookups a second, dropped one from {}",
+                                LOOKUPS_PER_SEC,
+                                ip
+                            );
+                            return Ok(());
+                        }
+                        None => match self.pm.get(&id).await {
+                            Ok(Some(peer)) => peer,
+                            // Not "no such id" (review C-22/U-1): dropped, the client retries.
+                            Err(err) => {
                                 throttled_log!(
                                     Duration::from_secs(60),
                                     warn,
-                                    "RegisterPk: over {} new ids a minute, dropped {} from {}",
-                                    NEW_IDS_PER_MIN,
+                                    "RegisterPk: lookup of {:?} failed, dropped: {}",
                                     id,
-                                    ip
+                                    err
                                 );
                                 return Ok(());
                             }
+                            Ok(None) => match self.check_new_id(addr.ip(), &id).await {
+                                NewId::Allowed => self.pm.insert_new(&id).await,
+                                NewId::SourceFull => {
+                                    return send_rk_res(socket, addr, TOO_FREQUENT).await;
+                                }
+                                NewId::GlobalFull => {
+                                    throttled_log!(
+                                        Duration::from_secs(60),
+                                        warn,
+                                        "RegisterPk: over {} new ids a minute, dropped {:?} from {}",
+                                        NEW_IDS_PER_MIN,
+                                        id,
+                                        ip
+                                    );
+                                    return Ok(());
+                                }
+                            },
                         },
                     };
                     let (changed, ip_changed) = {
@@ -624,15 +688,12 @@ impl RendezvousServer {
                             );
                         }
                     }
-                    if changed {
-                        self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
-                    }
-                    let mut msg_out = RendezvousMessage::new();
-                    msg_out.set_register_pk_response(RegisterPkResponse {
-                        result: register_pk_response::Result::OK.into(),
-                        ..Default::default()
-                    });
-                    socket.send(&msg_out, addr).await?
+                    let res = if changed {
+                        self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await
+                    } else {
+                        register_pk_response::Result::OK
+                    };
+                    send_rk_res(socket, addr, res).await?
                 }
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
                     // UDP PunchHoleRequest is intentionally unsupported.
@@ -836,7 +897,16 @@ impl RendezvousServer {
             (true, None)
         };
         if let Some(old) = ip_change {
-            log::info!("IP change of {} from {} to {}", id, old, socket_addr);
+            // Throttled: anyone may send `RegisterPeer` for any id from another address, and every
+            // such packet would log a line (review C-8).
+            throttled_log!(
+                Duration::from_secs(60),
+                info,
+                "IP change of {:?} from {} to {}",
+                log_id(&id),
+                old,
+                socket_addr
+            );
         }
         let mut msg_out = RendezvousMessage::new();
         msg_out.set_register_peer_response(RegisterPeerResponse {
@@ -963,7 +1033,16 @@ impl RendezvousServer {
             route_reason: "",
         };
         if !key.is_empty() && ph.licence_key != key {
-            log::warn!("Authentication failed from {} for peer {} - invalid key", addr, ph.id);
+            // Throttled, the id cut: every frame of a connection may be such a request, with an
+            // id as long as the frame (review C-1/C-7).
+            throttled_log!(
+                Duration::from_secs(60),
+                warn,
+                "Authentication failed from {} for peer {:?} ({} bytes) - invalid key",
+                addr,
+                log_id(&ph.id),
+                ph.id.len()
+            );
             self.state.tracker.on_punch_request(track);
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
@@ -978,7 +1057,16 @@ impl RendezvousServer {
         // fetch local addrs if in same intranet.
         // because punch hole won't work if in the same intranet,
         // all routers will drop such self-connections.
-        if let Some(peer) = self.pm.get(&id).await {
+        // A failed lookup is not "no such id": no answer, the client times out and may retry.
+        if let Some(peer) = self.pm.get(&id).await.inspect_err(|err| {
+            throttled_log!(
+                Duration::from_secs(60),
+                warn,
+                "PunchHoleRequest: lookup of {:?} failed: {}",
+                log_id(&id),
+                err
+            );
+        })? {
             let (elapsed, peer_addr) = {
                 let r = peer.read().await;
                 (r.last_reg_time.elapsed().as_millis() as i64, r.socket_addr)
@@ -1559,8 +1647,9 @@ impl RendezvousServer {
         if version.is_empty() || self.inner.sk.is_none() {
             Bytes::new()
         } else {
+            // A failed lookup signs nothing (review C-22).
             match self.pm.get(&id).await {
-                Some(peer) => {
+                Ok(Some(peer)) => {
                     let pk = peer.read().await.pk.clone();
                     sign::sign(
                         &IdPk {
@@ -1883,6 +1972,7 @@ mod tests {
             state: app.state.clone(),
             conns,
             new_ids: (Instant::now(), 0),
+            lookups: LookupBudget::new(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2448,7 +2538,7 @@ mod tests {
         assert!(h.rs.pm.is_in_memory("evict1").await, "registered just now: kept");
         h.rs.pm.evict_idle(Duration::ZERO).await;
         assert!(!h.rs.pm.is_in_memory("evict1").await);
-        let peer = h.rs.pm.get("evict1").await.expect("reloaded from the database");
+        let peer = h.rs.pm.get("evict1").await.unwrap().expect("reloaded from the database");
         {
             let p = peer.read().await;
             assert_eq!((&p.uuid[..], &p.pk[..]), (&b"uuid-evict"[..], &pk[..]));
@@ -2465,6 +2555,114 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(register_reply(&mut client).await, Some(UUID_MISMATCH));
+    }
+
+    /// Review C-22/U-1: with the database failing (the rendezvous pool closed), `RegisterPk` takes
+    /// no id over and answers no OK, memory keeps what it had, and nothing is signed.
+    #[hbb_common::tokio::test]
+    async fn database_errors_change_nothing() {
+        let mut h = harness(true, None).await;
+        let mut server = FramedSocket::new("127.0.0.1:0").await.unwrap();
+        let mut client = FramedSocket::new("127.24.0.1:0").await.unwrap();
+        let from = client.local_addr().unwrap();
+        let (pk, pk2) = ([5u8; 32], [6u8; 32]);
+        // dbfail1 is only in the database (idle, evicted); dbfail2 is in memory too.
+        for id in ["dbfail1", "dbfail2"] {
+            h.rs.pm.evict_idle(Duration::ZERO).await;
+            h.rs.handle_udp(&register_pk(id, b"uuid-real", &pk), from, &mut server, "")
+                .await
+                .unwrap();
+            assert_eq!(register_reply(&mut client).await, Some(register_pk_response::Result::OK), "{id}");
+        }
+        assert!(!h.rs.pm.is_in_memory("dbfail1").await && h.rs.pm.is_in_memory("dbfail2").await);
+        h.rs.pm.db.close().await;
+
+        // A known id the lookup cannot confirm, and a new one: dropped, nothing added.
+        for (id, uuid) in [("dbfail1", &b"uuid-other"[..]), ("dbfail3", b"uuid-new")] {
+            h.rs.handle_udp(&register_pk(id, uuid, &pk2), from, &mut server, "")
+                .await
+                .unwrap();
+            assert_eq!(register_reply(&mut client).await, None, "{id}");
+            assert!(!h.rs.pm.is_in_memory(id).await, "{id}");
+        }
+        // A pk change the database does not take: SERVER_ERROR, memory unchanged.
+        h.rs.handle_udp(&register_pk("dbfail2", b"uuid-real", &pk2), from, &mut server, "")
+            .await
+            .unwrap();
+        assert_eq!(
+            register_reply(&mut client).await,
+            Some(register_pk_response::Result::SERVER_ERROR)
+        );
+        {
+            let p = h.rs.pm.get_in_memory("dbfail2").await.unwrap();
+            let p = p.read().await;
+            assert_eq!((&p.uuid[..], &p.pk[..]), (&b"uuid-real"[..], &pk[..]));
+        }
+        assert!(h.rs.get_pk("1.4.2", "dbfail1".to_owned()).await.is_empty());
+        // The rows are as registered (read through the API's pool, still open).
+        let rows: Vec<(String, Vec<u8>, Vec<u8>)> =
+            sqlx::query_as("select id, uuid, pk from peer where id like 'dbfail%' order by id")
+                .fetch_all(&h.rs.state.db)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            ["dbfail1", "dbfail2"].map(|id| (id.to_owned(), b"uuid-real".to_vec(), pk.to_vec()))
+        );
+    }
+
+    /// Review U-1: an id added to the database after the lookup found nothing (the command line, an
+    /// import) is not registered under another uuid: the row is loaded and decides the retry.
+    #[hbb_common::tokio::test]
+    async fn id_added_meanwhile_is_judged_by_its_row() {
+        let mut h = harness(true, None).await;
+        let mut server = FramedSocket::new("127.0.0.1:0").await.unwrap();
+        let mut client = FramedSocket::new("127.24.1.1:0").await.unwrap();
+        let from = client.local_addr().unwrap();
+        let (pk_row, pk_other) = ([7u8; 32], [8u8; 32]);
+        h.rs.pm.insert_new("dupid1").await;
+        let info = format!(r#"{{"ip":"{}"}}"#, from.ip());
+        h.rs.pm.db.insert_peer("dupid1", b"uuid-row", &pk_row, &info).await.unwrap();
+        let cases: [(&[u8], [u8; 32], _); 3] = [
+            (b"uuid-other", pk_other, register_pk_response::Result::SERVER_ERROR),
+            (b"uuid-other", pk_other, UUID_MISMATCH),
+            (b"uuid-row", pk_row, register_pk_response::Result::OK),
+        ];
+        for (uuid, pk, expected) in cases {
+            h.rs.handle_udp(&register_pk("dupid1", uuid, &pk), from, &mut server, "")
+                .await
+                .unwrap();
+            assert_eq!(register_reply(&mut client).await, Some(expected));
+        }
+    }
+
+    /// Review C-12: `RegisterPk`s for ids not in memory are looked up within a global budget; over
+    /// it they are dropped without a reply or a lookup.
+    #[hbb_common::tokio::test]
+    async fn register_pk_misses_within_the_lookup_budget() {
+        let mut h = harness(true, None).await;
+        let mut server = FramedSocket::new("127.0.0.1:0").await.unwrap();
+        let mut client = FramedSocket::new("127.25.0.1:0").await.unwrap();
+        let from = client.local_addr().unwrap();
+        let pk = [9u8; 32];
+        h.rs.pm.db.insert_peer("budget1", b"uuid", &pk, "{}").await.unwrap();
+        h.rs.lookups.tokens = 0.0;
+        h.rs.lookups.at = Instant::now();
+        h.rs.handle_udp(&register_pk("budget1", b"uuid", &pk), from, &mut server, "")
+            .await
+            .unwrap();
+        assert_eq!(register_reply(&mut client).await, None);
+        assert!(!h.rs.pm.is_in_memory("budget1").await);
+        h.rs.lookups = LookupBudget::new();
+        h.rs.handle_udp(&register_pk("budget1", b"uuid", &pk), from, &mut server, "")
+            .await
+            .unwrap();
+        assert_eq!(register_reply(&mut client).await, Some(register_pk_response::Result::OK));
+        // A burst, then `LOOKUPS_PER_SEC`.
+        let mut b = LookupBudget::new();
+        assert_eq!((0..2000).filter(|_| b.take()).count(), LOOKUP_BURST as usize);
+        b.at -= Duration::from_millis(100);
+        assert_eq!((0..2000).filter(|_| b.take()).count(), (LOOKUPS_PER_SEC / 10.0) as usize);
     }
 
     #[test]

@@ -1,10 +1,12 @@
 use crate::common::*;
 use crate::database;
 use hbb_common::{
+    anyhow,
     bytes::Bytes,
-    log,
     rendezvous_proto::*,
+    throttled_log,
     tokio::sync::{Mutex, RwLock},
+    ResultType,
 };
 use serde_derive::{Deserialize, Serialize};
 use std::{
@@ -12,7 +14,7 @@ use std::{
     collections::HashSet,
     net::{IpAddr, SocketAddr},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 /// Keyed by source (`conn_tracker::source_key`: an IPv4 address or an IPv6 /64).
@@ -36,6 +38,23 @@ pub const MAX_PEER_ID_LEN: usize = 253;
 /// clients send `hbb_common::get_uuid()`: the machine id (36 bytes on Windows/macOS, 32 on Linux)
 /// or, without one (Android/iOS), their 32-byte public key.
 pub const MAX_REG_UUID_LEN: usize = 96;
+
+/// `id` cut to `MAX_PEER_ID_LEN` bytes at a char boundary, for log lines: ids that reach a log
+/// unchecked (a TCP `PunchHoleRequest`'s) may be as long as a frame (review C-1/C-7).
+pub(crate) fn log_id(id: &str) -> &str {
+    let mut end = id.len().min(MAX_PEER_ID_LEN);
+    while !id.is_char_boundary(end) {
+        end -= 1;
+    }
+    &id[..end]
+}
+
+/// Whether `err` is SQLite refusing a duplicate key (for `peer`: an id already there).
+fn is_unique_violation(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<sqlx::Error>()
+        .and_then(|e| e.as_database_error())
+        .is_some_and(|e| e.is_unique_violation())
+}
 
 /// Empties the id sets whose day window is over, then drops the `IP_BLOCKER` entries with neither a
 /// live minute window nor any id (the console `ib` rule, which also kept an empty set's entry for a
@@ -109,9 +128,12 @@ impl PeerMap {
         }
     }
 
-    #[inline]
+    /// Writes a registration of `peer` (`id`): the database first, then memory, so a failed write
+    /// leaves the entry as it was (review U-1: an entry holding a uuid the database does not would
+    /// take the id over). The result is the `RegisterPk` answer: `SERVER_ERROR` when the write
+    /// failed, which the client only logs before retrying in its next round.
     pub(crate) async fn update_pk(
-        &mut self,
+        &self,
         id: String,
         peer: LockPeer,
         addr: SocketAddr,
@@ -119,94 +141,132 @@ impl PeerMap {
         pk: Bytes,
         ip: String,
     ) -> register_pk_response::Result {
-        // Lengths only: uuid and pk come from an unauthenticated packet (review A-5).
-        log::info!(
-            "update_pk {} {:?} uuid {} bytes, pk {} bytes",
+        // Lengths only: uuid and pk come from an unauthenticated packet (review A-5). Throttled:
+        // a source may change its own peer's pk about 30 times a minute (review C-17).
+        throttled_log!(
+            Duration::from_secs(60),
+            info,
+            "update_pk {:?} {:?} uuid {} bytes, pk {} bytes",
             id,
             addr,
             uuid.len(),
             pk.len()
         );
-        let (info_str, guid) = {
-            let mut w = peer.write().await;
-            w.socket_addr = addr;
-            w.uuid = uuid.clone();
-            w.pk = pk.clone();
-            w.last_reg_time = Instant::now();
-            w.info.ip = ip;
-            (
-                serde_json::to_string(&w.info).unwrap_or_default(),
-                w.guid.clone(),
-            )
+        let (mut guid, info) = {
+            let r = peer.read().await;
+            let mut info = r.info.clone();
+            info.ip = ip;
+            (r.guid.clone(), info)
         };
+        let info_str = serde_json::to_string(&info).unwrap_or_default();
         if guid.is_empty() {
             match self.db.insert_peer(&id, &uuid, &pk, &info_str).await {
+                Ok(g) => guid = g,
                 Err(err) => {
-                    log::error!("db.insert_peer failed: {}", err);
+                    if is_unique_violation(&err) {
+                        // The id was added after `get` found nothing (the command line, an import):
+                        // take its row, so the client's retry is judged against the row's uuid.
+                        self.reload(&id, &peer).await;
+                    }
+                    throttled_log!(Duration::from_secs(60), error, "db.insert_peer failed: {}", err);
                     return register_pk_response::Result::SERVER_ERROR;
-                }
-                Ok(guid) => {
-                    peer.write().await.guid = guid;
                 }
             }
         } else {
             if let Err(err) = self.db.update_pk(&guid, &id, &pk, &info_str).await {
-                log::error!("db.update_pk failed: {}", err);
+                throttled_log!(Duration::from_secs(60), error, "db.update_pk failed: {}", err);
                 return register_pk_response::Result::SERVER_ERROR;
             }
-            log::info!("pk updated instead of insert");
+            throttled_log!(Duration::from_secs(60), info, "pk updated instead of insert");
         }
+        let mut w = peer.write().await;
+        w.guid = guid;
+        w.socket_addr = addr;
+        w.uuid = uuid;
+        w.pk = pk;
+        w.last_reg_time = Instant::now();
+        w.info = info;
         register_pk_response::Result::OK
     }
 
-    #[inline]
-    pub(crate) async fn get(&self, id: &str) -> Option<LockPeer> {
-        let p = self.map.read().await.get(id).cloned();
-        if p.is_some() {
-            return p;
-        } else if let Ok(Some(v)) = self.db.get_peer(id).await {
-            let peer = Peer {
-                guid: v.guid,
-                uuid: v.uuid.into(),
-                pk: v.pk.into(),
-                // user: v.user,
-                info: serde_json::from_str::<PeerInfo>(&v.info).unwrap_or_default(),
-                // disabled: v.status == Some(0),
-                ..Default::default()
-            };
-            let peer = Arc::new(RwLock::new(peer));
-            self.map.write().await.insert(id.to_owned(), peer.clone());
-            return Some(peer);
+    /// Replaces `peer`'s stored fields (guid, uuid, pk, info) with the database row of `id`, if
+    /// one can be read.
+    async fn reload(&self, id: &str, peer: &LockPeer) {
+        if let Ok(Some(v)) = self.db.get_peer(id).await {
+            let mut w = peer.write().await;
+            w.guid = v.guid;
+            w.uuid = v.uuid.into();
+            w.pk = v.pk.into();
+            w.info = serde_json::from_str::<PeerInfo>(&v.info).unwrap_or_default();
         }
-        None
     }
 
+    /// The entry of `id`, from memory or else loaded from the database. `Ok(None)`: the database
+    /// has no such id; `Err`: the lookup failed, which callers must not take for "no such id"
+    /// (review C-22/U-1: `RegisterPk` would register it as new under another uuid).
     #[inline]
+    pub(crate) async fn get(&self, id: &str) -> ResultType<Option<LockPeer>> {
+        if let Some(p) = self.map.read().await.get(id).cloned() {
+            return Ok(Some(p));
+        }
+        let Some(v) = self.db.get_peer(id).await? else {
+            return Ok(None);
+        };
+        let peer = Peer {
+            guid: v.guid,
+            uuid: v.uuid.into(),
+            pk: v.pk.into(),
+            // user: v.user,
+            info: serde_json::from_str::<PeerInfo>(&v.info).unwrap_or_default(),
+            // disabled: v.status == Some(0),
+            ..Default::default()
+        };
+        // An entry added while the database was read (a registration in `io_loop`) is newer than
+        // the row: keep it (review C-25).
+        let peer = Arc::new(RwLock::new(peer));
+        Ok(Some(
+            self.map
+                .write()
+                .await
+                .entry(id.to_owned())
+                .or_insert(peer)
+                .clone(),
+        ))
+    }
+
+    /// An empty entry for `id`, which `get` just found in neither memory nor the database.
+    #[inline]
+    pub(crate) async fn insert_new(&self, id: &str) -> LockPeer {
+        self.map
+            .write()
+            .await
+            .entry(id.to_owned())
+            .or_default()
+            .clone()
+    }
+
+    #[cfg(test)]
     pub(crate) async fn get_or(&self, id: &str) -> LockPeer {
-        if let Some(p) = self.get(id).await {
-            return p;
+        match self.get(id).await.unwrap() {
+            Some(p) => p,
+            None => self.insert_new(id).await,
         }
-        let mut w = self.map.write().await;
-        if let Some(p) = w.get(id) {
-            return p.clone();
-        }
-        let tmp = LockPeer::default();
-        w.insert(id.to_owned(), tmp.clone());
-        tmp
     }
 
     /// Drops the entries without a registration (`last_reg_time`) for `idle` or longer.
-    /// Unregistered lookups (`get` of an offline peer, `get_or` of a new id) leave entries
+    /// Unregistered lookups (`get` of an offline peer, `insert_new` of a new id) leave entries
     /// too, so without this the map only grows (review A-1). Nothing is lost:
-    /// - `guid`, `uuid`, `pk` and `info` (its IP) are in the database, and `get` loads them back;
+    /// - `guid`, `uuid`, `pk` and `info` (its IP) are in the database, and `get` loads them back
+    ///   (a failed lookup is not "no such id": nothing is rebuilt from it);
     /// - `last_reg_time` comes back expired, which an idle peer is anyway (online needs it within
     ///   `REG_TIMEOUT`);
     /// - `socket_addr` only matters while online; `update_addr` compares `info.ip` instead when
-    ///   the port is 0, as after a restart;
+    ///   the port is 0, as after a restart. It does not load: a peer back from eviction is asked
+    ///   for `RegisterPk` again, which loads it;
     /// - `reg_pk` counts `RegisterPk`s within 6 seconds, long over after an hour.
     ///
-    /// Callers holding a dropped entry's `Arc` keep a detached copy; only the UDP path writes peers,
-    /// and it runs serially with this.
+    /// Callers holding a dropped entry's `Arc` keep a detached copy. Only the UDP path changes
+    /// entries, and it runs serially with this; the TCP side's `get` may add one, never replace one.
     pub(crate) async fn evict_idle(&self, idle: std::time::Duration) {
         self.map.write().await.retain(|_, p| match p.try_read() {
             Ok(p) => p.last_reg_time.elapsed() < idle,

@@ -700,3 +700,213 @@ async fn ws_without_handshake_times_out() {
     assert!(waited >= Duration::from_secs(8), "握手超时应约 10 秒，实际 {waited:?}");
     assert!(buf.is_empty(), "服务端不该发任何数据：{buf:?}");
 }
+
+/// 审查 C-1/C-7/C-8：未认证、每个包都能触发的日志每分钟最多一行，攻击者给的 id 截断后才进日志
+/// （PORTA.md §6 第 7 条）。
+/// - 21116 上许可证不符的 `PunchHoleRequest`：一条连接连发 300 条，每条 id 约 16 KB；
+/// - 别的地址替一台在线设备发 `RegisterPeer`（"IP change"）：连发 2000 个。回环来源不算换 IP，
+///   要用本机的非回环地址；没有时注明跳过这一半。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unauthenticated_floods_log_once_a_minute() {
+    let server = Server::start(GEO_OFF, &[]).await;
+    let mut a = server.connect_a(A_IP, Kx::Plain).await;
+    for _ in 0..300 {
+        let mut ph = server.punch_request(&"x".repeat(16_000));
+        ph.licence_key = String::new();
+        send(&mut a, &msg_punch_request(ph)).await;
+    }
+
+    let local = match local_ip_address::local_ip() {
+        Ok(addr) if !addr.is_loopback() => Some(addr),
+        other => {
+            eprintln!("跳过 IP change 的一半：本机没有非回环地址（{other:?}）");
+            None
+        }
+    };
+    if let Some(local) = local {
+        let b = PeerB::register(&server, &unique_id(""), B_IP).await;
+        let mut sock = hbb_common::udp::FramedSocket::new(format!("{local}:0")).await.unwrap();
+        let mut m = RendezvousMessage::new();
+        m.set_register_peer(RegisterPeer {
+            id: b.id.clone(),
+            ..Default::default()
+        });
+        for i in 0..2000 {
+            sock.send(&m, std::net::SocketAddr::new(local, server.port)).await.unwrap();
+            if i % 100 == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let log = server.log();
+    let auth: Vec<&str> = log.lines().filter(|l| l.contains("Authentication failed")).collect();
+    assert_eq!(auth.len(), 1, "{auth:?}");
+    assert!(auth[0].len() < 1024 && auth[0].contains("(16000 bytes)"), "{}", auth[0]);
+    if local.is_some() {
+        let n = log.lines().filter(|l| l.contains("IP change of")).count();
+        assert_eq!(n, 1, "IP change 行数");
+    }
+}
+
+// ---------------------------------------------------------------- 会合不等 API（PORTA.md §4.1）
+
+/// UDP 发一条 `RegisterPk`，返回结果（`timeout_ms` 内没回包为 None）和耗时。
+async fn register_pk_from(
+    server: &Server,
+    from: &str,
+    id: &str,
+    uuid: &[u8],
+    timeout_ms: u64,
+) -> (Option<register_pk_response::Result>, Duration) {
+    let mut sock = hbb_common::udp::FramedSocket::new(format!("{from}:0")).await.unwrap();
+    let mut m = RendezvousMessage::new();
+    m.set_register_pk(RegisterPk {
+        id: id.to_owned(),
+        uuid: uuid.to_vec().into(),
+        pk: sign::gen_keypair().0 .0.to_vec().into(),
+        ..Default::default()
+    });
+    let t = Instant::now();
+    sock.send(&m, server.addr()).await.unwrap();
+    while let Some(Ok((bytes, _))) = sock.next_timeout(timeout_ms).await {
+        if let Ok(RendezvousMessage {
+            union: Some(rendezvous_message::Union::RegisterPkResponse(r)),
+            ..
+        }) = RendezvousMessage::parse_from_bytes(&bytes)
+        {
+            return (r.result.enum_value().ok(), t.elapsed());
+        }
+    }
+    (None, t.elapsed())
+}
+
+/// 在线设备 L 的一次 `RegisterPeer` 往返；`timeout_ms` 内没回包为 None。
+async fn register_peer_rtt(sock: &mut hbb_common::udp::FramedSocket, server: &Server, id: &str, timeout_ms: u64) -> Option<Duration> {
+    let mut m = RendezvousMessage::new();
+    m.set_register_peer(RegisterPeer {
+        id: id.to_owned(),
+        ..Default::default()
+    });
+    let t = Instant::now();
+    sock.send(&m, server.addr()).await.unwrap();
+    while let Some(Ok((bytes, _))) = sock.next_timeout(timeout_ms).await {
+        if let Ok(RendezvousMessage {
+            union: Some(rendezvous_message::Union::RegisterPeerResponse(_)),
+            ..
+        }) = RendezvousMessage::parse_from_bytes(&bytes)
+        {
+            return Some(t.elapsed());
+        }
+    }
+    None
+}
+
+/// 21116 新连接收到第一个字节（KeyExchange offer）要多久；`timeout_ms` 内没收到为 None。
+async fn first_byte(server: &Server, timeout_ms: u64) -> Option<Duration> {
+    use tokio::io::AsyncReadExt;
+    let t = Instant::now();
+    let mut s = tokio::net::TcpStream::connect(server.addr()).await.ok()?;
+    let mut b = [0u8; 1];
+    match tokio::time::timeout(Duration::from_millis(timeout_ms), s.read_exact(&mut b)).await {
+        Ok(Ok(_)) => Some(t.elapsed()),
+        _ => None,
+    }
+}
+
+/// 审查 C-21：未认证的 `/api/audit/alarm` 被几百个并发连接灌着（每条两次写库）时，新 id 的
+/// `RegisterPk` 不能让会合主循环跟着等库：同时到的 `RegisterPeer` 回包、21116 新连接的首字节
+/// 都要在几十毫秒内。会合用自己的小连接池，不和 API 排同一个队（PORTA.md §4.1）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn api_write_flood_does_not_stall_rendezvous() {
+    const FLOODERS: usize = 400;
+    // 库放在磁盘上（target/tmp）：/tmp 常是 tmpfs，提交不落盘，等库的时间看不出来。
+    let disk = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let db_url = disk.path().join("db_v2.sqlite3");
+    let server = std::sync::Arc::new(
+        Server::start(GEO_OFF, &[("DB_URL", db_url.to_str().unwrap())]).await,
+    );
+    // 攻击者先免认证注册一台假设备 X，uuid 就对得上；L 是一台正常在线的设备。
+    let x = PeerB::register(&server, &unique_id(""), B_IP).await;
+    let l_id = unique_id("");
+    let l = PeerB::register(&server, &l_id, "127.0.0.4").await;
+    let mut l_sock = hbb_common::udp::FramedSocket::new("127.0.0.4:0").await.unwrap();
+    drop(l);
+    // 换了端口、IP 不变：照常刷新在线。
+    register_peer_rtt(&mut l_sock, &server, &l_id, 5000).await.expect("L 的心跳没有回包");
+
+    let body = format!(
+        r#"{{"id":"{}","uuid":"{}","typ":0,"info":"x"}}"#,
+        x.id,
+        base64::encode(&x.uuid)
+    );
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let http = reqwest::Client::builder()
+        .pool_max_idle_per_host(FLOODERS)
+        .timeout(Duration::from_secs(60))
+        .build()
+        .unwrap();
+    let mut flood = Vec::new();
+    for _ in 0..FLOODERS {
+        let (http, url, body, stop, sent) = (
+            http.clone(),
+            server.api_url("/api/audit/alarm"),
+            body.clone(),
+            stop.clone(),
+            sent.clone(),
+        );
+        flood.push(tokio::spawn(async move {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = http
+                    .post(&url)
+                    .header("Content-Type", "application/json")
+                    .body(body.clone())
+                    .send()
+                    .await;
+                sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }));
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let flood_start = (Instant::now(), sent.load(std::sync::atomic::Ordering::Relaxed));
+
+    let mut worst = Duration::ZERO;
+    let mut lines = Vec::new();
+    for i in 0..10 {
+        // 新 id 的 RegisterPk（每次换来源，远低于每来源限额），20 ms 后测 L 的心跳和 21116。
+        let pk_task = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                register_pk_from(&server, &format!("127.0.1.{}", i + 1), &unique_id(""), b"uuid-c21", 40_000).await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let (peer, fb) = tokio::join!(
+            register_peer_rtt(&mut l_sock, &server, &l_id, 40_000),
+            first_byte(&server, 40_000)
+        );
+        let (res, pk_rtt) = pk_task.await.unwrap();
+        let line = format!(
+            "#{i}: RegisterPk {res:?} {pk_rtt:?}, RegisterPeer {peer:?}, 21116 首字节 {fb:?}"
+        );
+        eprintln!("{line}");
+        lines.push(line);
+        worst = worst
+            .max(peer.unwrap_or(Duration::MAX))
+            .max(fb.unwrap_or(Duration::MAX));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let (t0, n0) = flood_start;
+    let rate = (sent.load(std::sync::atomic::Ordering::Relaxed) - n0) as f64 / t0.elapsed().as_secs_f64();
+    eprintln!("alarm 洪水约 {rate:.0} req/s；RegisterPeer / 21116 最坏 {worst:?}");
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for f in flood {
+        f.abort();
+    }
+    assert!(
+        worst < Duration::from_millis(100),
+        "API 洪水拖住了会合主循环：最坏 {worst:?}\n{}",
+        lines.join("\n")
+    );
+}

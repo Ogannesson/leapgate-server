@@ -116,6 +116,11 @@ impl Server {
         sign::PublicKey(raw.try_into().expect("服务端公钥不是 32 字节"))
     }
 
+    /// 服务到目前为止的日志（stdout 和 stderr）。
+    pub fn log(&self) -> String {
+        std::fs::read_to_string(self.dir.path().join("server.log")).unwrap_or_default()
+    }
+
     pub fn db_path(&self) -> PathBuf {
         self.dir.path().join("db_v2.sqlite3")
     }

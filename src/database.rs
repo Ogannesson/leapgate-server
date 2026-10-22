@@ -1,9 +1,23 @@
 use hbb_common::{bail, log, ResultType};
 use sqlx::{
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions},
+    sqlite::{
+        SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
+    },
     ConnectOptions,
 };
 use std::{path::PathBuf, str::FromStr, time::Duration};
+
+/// How long a query of the main pool (API, command line, background tasks) waits for a connection
+/// (sqlx's default is 30 s): an API flood queues behind the pool, and a request is better failed
+/// in seconds than answered after its client gave up (review C-21).
+const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(3);
+/// The rendezvous pool (`rendezvous_pool`): connections, and how long its queries wait for a
+/// connection and for SQLite's write lock. `io_loop` awaits them, so every wait stalls UDP and the
+/// rendezvous ports' accepts; a lookup or write that does not fit is given up, and the client
+/// retries in its next registration round (review C-21/C-11).
+const RENDEZVOUS_CONNECTIONS: u32 = 2;
+const RENDEZVOUS_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(200);
+const RENDEZVOUS_BUSY_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// `DB_URL`, or `db_v2.sqlite3` next to the executable's data (same default as upstream hbbs).
 pub(crate) fn db_url() -> String {
@@ -49,18 +63,36 @@ pub(crate) async fn open(url: &str, create: bool) -> ResultType<SqlitePool> {
             Err(e) => bail!("cannot access {}: {e}", db_file(url)?.display()),
         }
     }
+    // NORMAL in WAL mode: a commit no longer waits for an fsync (only checkpoints do), so the write
+    // lock is held for microseconds instead of a disk flush. The database cannot be corrupted; a
+    // power loss may drop the last commits.
     let opt = opt
         .create_if_missing(create)
         .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
         .busy_timeout(Duration::from_secs(5))
         .foreign_keys(true)
         .log_statements(log::LevelFilter::Debug);
     let pool = SqlitePoolOptions::new()
         .max_connections(n)
+        .acquire_timeout(ACQUIRE_TIMEOUT)
         .connect_with(opt)
         .await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
     Ok(pool)
+}
+
+/// The rendezvous module's own pool on the database of `main` (PORTA.md §4.1): `PeerMap` looks up
+/// and writes peers from `io_loop`, which must not queue behind unauthenticated API requests in
+/// `main`'s fair queue (review C-21). Short waits (`RENDEZVOUS_*`); connections open on first use.
+pub(crate) fn rendezvous_pool(main: &SqlitePool) -> SqlitePool {
+    let opt = (*main.connect_options())
+        .clone()
+        .busy_timeout(RENDEZVOUS_BUSY_TIMEOUT);
+    SqlitePoolOptions::new()
+        .max_connections(RENDEZVOUS_CONNECTIONS)
+        .acquire_timeout(RENDEZVOUS_ACQUIRE_TIMEOUT)
+        .connect_lazy_with(opt)
 }
 
 #[derive(Clone)]
@@ -82,6 +114,12 @@ pub struct Peer {
 impl Database {
     pub fn new(pool: SqlitePool) -> Database {
         Database { pool }
+    }
+
+    /// Closes the pool: every query fails from then on (tests of database errors).
+    #[cfg(test)]
+    pub async fn close(&self) {
+        self.pool.close().await
     }
 
     pub async fn get_peer(&self, id: &str) -> ResultType<Option<Peer>> {
