@@ -182,7 +182,10 @@ pub(crate) fn parse_json<T: DeserializeOwned>(body: &[u8]) -> Result<T, ApiError
 }
 
 /// Largest page: one `/api/ab/peers` page is parsed into memory whole. The client always asks for
-/// 100 (`pageSize = 100` in flutter/lib/models/ab_model.dart and group_model.dart, note 04 §1.1).
+/// 100 (`pageSize = 100` in flutter/lib/models/ab_model.dart and group_model.dart, note 04 §1.1)
+/// and pages with its own value (`while (current * pageSize < total)`): a cap below what any client
+/// asks would make it stop early and silently drop entries, so this stays well above 100 and the
+/// memory of a page is bounded per row instead (`ab::MAX_DATA_NODES`).
 const MAX_PAGE_SIZE: i64 = 1000;
 
 /// `current`, `pageSize`, `status` (the group panel's user filter) and `ab` (`/api/ab/peers`);

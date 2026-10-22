@@ -786,6 +786,64 @@ async fn write_limits_exact_ok_one_byte_over_400() {
     assert_eq!(s.tag_rows(&personal).await, vec![(new, RED)]);
 }
 
+/// §12.1：标签名（tag/add、tag/rename、设备的 tags 元素）含控制字符回 400；设备 data 的 JSON 节点（键和值都算，
+/// 嵌套的数组、对象递归计数）最多 64 个，刚好 64 通过、65 回 400，peer/update 按合并后的结果算。
+/// 客户端自己的条目（笔记 04 引用的 `Peer.toJson`，11 个 data 键）远在上限以内。
+#[tokio::test]
+async fn tag_control_chars_and_data_node_limit() {
+    let s = Server::start().await;
+    let alice = s.user("alice", false).await;
+    let book = s.personal_book(alice.id).await;
+    let add = format!("/api/ab/peer/add/{book}");
+    let update = format!("/api/ab/peer/update/{book}");
+    s.insert_peer(&book, "p1", json!({}), json!(["t1"]), "", "").await;
+    s.insert_tag(&book, "t1", RED).await;
+
+    for name in ["a\u{0}", "tab\there", "line\n", "\u{7f}", "c1\u{85}"] {
+        let ctx = format!("控制字符 {name:?}");
+        let r = s.call("POST", &add, &alice.token, &json!({"id": "c", "tags": [name]}).to_string()).await;
+        assert_error(&r, 400, &format!("add {ctx}"));
+        let r = s.call("PUT", &update, &alice.token, &json!({"id": "p1", "tags": ["t1", name]}).to_string()).await;
+        assert_error(&r, 400, &format!("update {ctx}"));
+        let r = s.call("POST", &format!("/api/ab/tag/add/{book}"), &alice.token, &json!({"name": name, "color": RED}).to_string()).await;
+        assert_error(&r, 400, &format!("tag/add {ctx}"));
+        let r = s.call("PUT", &format!("/api/ab/tag/rename/{book}"), &alice.token, &json!({"old": "t1", "new": name}).to_string()).await;
+        assert_error(&r, 400, &format!("tag/rename {ctx}"));
+    }
+    assert_eq!(s.peer_ids(&book).await, vec!["p1".to_owned()]);
+    assert_eq!(s.peer_row(&book, "p1").await.unwrap().tags, json!(["t1"]));
+    assert_eq!(s.tag_rows(&book).await, vec![("t1".to_owned(), RED)]);
+    // 引号、反斜杠、空格、中文、emoji 不是控制字符。
+    let fine = "a \"b\" \\ 标签 😀";
+    put_ok(&s, &alice.token, format!("/api/ab/tag/rename/{book}"), json!({"old": "t1", "new": fine}).to_string()).await;
+    assert_eq!(s.peer_row(&book, "p1").await.unwrap().tags, json!([fine]));
+
+    // 照客户端 Peer.toJson 发的完整条目。
+    let client = json!({"id": "c", "hash": "", "password": "", "username": "u", "hostname": "h", "platform": "Windows",
+        "alias": "a", "tags": [], "forceAlwaysRelay": "false", "rdpPort": "", "rdpUsername": "", "loginName": "",
+        "device_group_name": "", "note": "", "same_server": false});
+    assert_action_ok(&s.call("POST", &add, &alice.token, &client.to_string()).await, "客户端条目");
+
+    let mut exact = json!({"id": "n64"});
+    for i in 0..32 {
+        exact[format!("k{i}")] = json!("v");
+    }
+    assert_action_ok(&s.call("POST", &add, &alice.token, &exact.to_string()).await, "刚好 64 个节点");
+    let mut over = json!({"id": "n65"});
+    for i in 0..31 {
+        over[format!("k{i}")] = json!("v");
+    }
+    // 31 × 2 + 键 nested + 数组 + 元素 = 65。
+    over["nested"] = json!([1]);
+    assert_error(&s.call("POST", &add, &alice.token, &over.to_string()).await, 400, "65 个节点");
+    assert!(s.peer_row(&book, "n65").await.is_none());
+    let before = s.peer_row(&book, "n64").await.unwrap();
+    let r = s.call("PUT", &update, &alice.token, r#"{"id":"n64","extra":"v"}"#).await;
+    assert_error(&r, 400, "合并后 66 个节点");
+    assert_eq!(s.peer_row(&book, "n64").await.unwrap().data, before.data);
+    put_ok(&s, &alice.token, update.clone(), r#"{"id":"n64","k0":"changed"}"#.to_owned()).await;
+}
+
 /// §12.1：每本簿最多 1 万个设备、1000 个标签。簿满后 peer/add 新 id、tag/add 新名字回 400 + error；
 /// 已有的 id/名字照旧 200 空 body、不改；别的簿各算各的；删掉一个就又能加。
 #[tokio::test]

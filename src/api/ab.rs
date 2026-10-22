@@ -32,12 +32,21 @@ const WRITE: i64 = 2;
 const MAX_PEERS: i64 = 10_000;
 /// Tags per book (`ab_tag` rows).
 const MAX_TAGS: i64 = 1000;
-/// A tag name, in bytes (`tag/add`, `tag/rename`, a peer's `tags`).
+/// A tag name, in bytes (`tag/add`, `tag/rename`, a peer's `tags`). Control characters are refused
+/// too: serde_json writes each as a 6-byte `\u00XX`, which would make the tags `cascade_tags` reads
+/// in one go (up to MAX_PEERS rows) six times their byte length.
 const MAX_TAG_LEN: usize = 64;
 /// Tags on one peer.
 const MAX_PEER_TAGS: usize = 64;
 /// A peer's `data` column as stored (serialized JSON, after `peer/update` merges into it).
 const MAX_DATA_LEN: usize = 8 << 10;
+/// JSON nodes in a peer's `data` (every key and every value, nested arrays and objects counted
+/// through). `/api/ab/peers` parses a whole page (up to `MAX_PAGE_SIZE` = 1000 rows) into
+/// `serde_json::Value`s, about ten times the bytes for tiny keys and values, so this bounds the page
+/// rather than lowering the page size: the client pages with its own `pageSize` (`while (current *
+/// pageSize < total)`), so a cap below what it asks would silently drop peers. The client's own
+/// peer (`Peer.toJson`, flutter/lib/models/peer_model.dart) has 11 data keys, i.e. 22 nodes.
+const MAX_DATA_NODES: usize = 64;
 /// The `hash`/`password` the client uploads, before encryption.
 const MAX_SECRET_LEN: usize = 1 << 10;
 
@@ -258,7 +267,7 @@ fn split_peer(body: &[u8], personal: bool) -> Result<PeerFields, ApiError> {
                     return Err(ApiError::bad_request("Too many tags on one peer"));
                 }
                 for tag in &tags {
-                    check_tag_len(tag).map_err(ApiError::bad_request)?;
+                    check_tag(tag).map_err(ApiError::bad_request)?;
                 }
                 fields.tags = Some(tags);
             }
@@ -289,16 +298,33 @@ fn split_peer(body: &[u8], personal: bool) -> Result<PeerFields, ApiError> {
 }
 
 /// The error is the 400 message (`.map_err(ApiError::bad_request)`).
-fn check_tag_len(name: &str) -> Result<(), &'static str> {
+fn check_tag(name: &str) -> Result<(), &'static str> {
     if name.len() > MAX_TAG_LEN {
         return Err("Tag name too long");
+    }
+    if name.chars().any(char::is_control) {
+        return Err("Tag name contains control characters");
     }
     Ok(())
 }
 
-/// The `data` column as stored, refused over `MAX_DATA_LEN`; the error is the 400 message.
+/// JSON nodes under `v`, `v` itself not counted: each element, or each key and value.
+fn child_nodes(v: &Value) -> usize {
+    match v {
+        Value::Array(a) => a.iter().map(|v| 1 + child_nodes(v)).sum(),
+        Value::Object(m) => m.values().map(|v| 2 + child_nodes(v)).sum(),
+        _ => 0,
+    }
+}
+
+/// The `data` column as stored, refused over `MAX_DATA_NODES` or `MAX_DATA_LEN`; the error is the
+/// 400 message.
 fn encode_data(data: Map<String, Value>) -> Result<String, &'static str> {
-    let data = Value::Object(data).to_string();
+    let data = Value::Object(data);
+    if child_nodes(&data) > MAX_DATA_NODES {
+        return Err("Peer data has too many fields");
+    }
+    let data = data.to_string();
     if data.len() > MAX_DATA_LEN {
         return Err("Peer data too large");
     }
@@ -425,7 +451,7 @@ pub(crate) async fn tag_add(
 ) -> ApiResult {
     check(&state.db, &user, &guid, WRITE).await?;
     let tag: Tag = parse_json(&body)?;
-    check_tag_len(&tag.name).map_err(ApiError::bad_request)?;
+    check_tag(&tag.name).map_err(ApiError::bad_request)?;
     // Same pattern as `peer_add`: count and insert in one statement; nothing inserted and the name
     // not there means the book has MAX_TAGS tags.
     let inserted = sqlx::query(
@@ -467,7 +493,7 @@ pub(crate) async fn tag_rename(
 ) -> ApiResult {
     check(&state.db, &user, &guid, WRITE).await?;
     let Rename { old, new } = parse_json(&body)?;
-    check_tag_len(&new).map_err(ApiError::bad_request)?;
+    check_tag(&new).map_err(ApiError::bad_request)?;
     let mut tx = state.db.begin().await?;
     let renamed = sqlx::query("update ab_tag set name = ? where ab_guid = ? and name = ?")
         .bind(&new)
@@ -766,7 +792,87 @@ mod tests {
         let body = serde_json::json!({"old": "a", "new": "b".repeat(MAX_TAG_LEN)}).to_string();
         write_ok(&t.app, "PUT", &rename, &token, &body).await;
         let names: Vec<String> = sqlx::query_scalar("select name from ab_tag order by name").fetch_all(db).await.unwrap();
-        assert_eq!(names, ["b".repeat(MAX_TAG_LEN), tag]);
+        assert_eq!(names, ["b".repeat(MAX_TAG_LEN), tag.clone()]);
+
+        // Control characters in a tag name, wherever it comes from.
+        for name in ["a\u{0}", "a\nb", "\u{7f}", "x\u{9f}"] {
+            let body = serde_json::json!({"id": "c", "tags": ["ok", name]}).to_string();
+            write_err(&t.app, "POST", &add, &token, &body, StatusCode::BAD_REQUEST).await;
+            let body = serde_json::json!({"id": "m", "tags": [name]}).to_string();
+            write_err(&t.app, "PUT", &update, &token, &body, StatusCode::BAD_REQUEST).await;
+            let body = serde_json::json!({"name": name, "color": 1}).to_string();
+            write_err(&t.app, "POST", &tag_add, &token, &body, StatusCode::BAD_REQUEST).await;
+            let body = serde_json::json!({"old": tag, "new": name}).to_string();
+            write_err(&t.app, "PUT", &rename, &token, &body, StatusCode::BAD_REQUEST).await;
+        }
+        // Not control characters: quotes, backslash, spaces, CJK, emoji.
+        let fine = "\"\\ 标签 \u{1f600}";
+        write_ok(&t.app, "POST", &tag_add, &token, &serde_json::json!({"name": fine, "color": 1}).to_string()).await;
+        write_ok(&t.app, "PUT", &update, &token, &serde_json::json!({"id": "m", "tags": [fine]}).to_string()).await;
+        assert_eq!(stored(db, &personal, "m").await.1, [fine]);
+        let found: bool = sqlx::query_scalar("select exists(select 1 from ab_tag where name = ?)")
+            .bind(fine)
+            .fetch_one(db)
+            .await
+            .unwrap();
+        let refused: i64 = sqlx::query_scalar("select count(*) from ab_peer where id = 'c'").fetch_one(db).await.unwrap();
+        assert_eq!((found, refused), (true, 0));
+        assert_eq!(stored(db, &personal, &id).await, before);
+    }
+
+    #[test]
+    fn data_node_count() {
+        let n = |v: Value| child_nodes(&v);
+        assert_eq!(n(serde_json::json!({})), 0);
+        assert_eq!(n(serde_json::json!({"a": 1, "b": "x", "c": null, "d": true})), 8);
+        assert_eq!(n(serde_json::json!({"a": [1, 2]})), 4);
+        assert_eq!(n(serde_json::json!({"a": {"b": {"c": []}}})), 6);
+        assert_eq!(n(serde_json::json!({"a": [[], {}, [{"x": 1}]]})), 8);
+    }
+
+    #[tokio::test]
+    async fn data_node_limit() {
+        let t = testutil::app().await;
+        let (_, token) = testutil::create_user(&t.state.db, "alice", "", false).await;
+        let book = personal_guid(&t.app, &token).await;
+        let add = format!("/api/ab/peer/add/{book}");
+        let update = format!("/api/ab/peer/update/{book}");
+        // `keys` string keys = 2 × keys nodes.
+        let flat = |id: &str, keys: usize, prefix: &str| {
+            let mut m = Map::new();
+            m.insert("id".into(), id.into());
+            for i in 0..keys {
+                m.insert(format!("{prefix}{i}"), "v".into());
+            }
+            m
+        };
+
+        // The client's own peer is well under the limit.
+        let client = r#"{"id":"c","hash":"","password":"","username":"u","hostname":"h","platform":"Windows",
+            "alias":"a","tags":["t"],"forceAlwaysRelay":"false","rdpPort":"","rdpUsername":"","loginName":"",
+            "device_group_name":"","note":"","same_server":false}"#;
+        write_ok(&t.app, "POST", &add, &token, client).await;
+
+        write_ok(&t.app, "POST", &add, &token, &Value::Object(flat("64", MAX_DATA_NODES / 2, "k")).to_string()).await;
+        let mut over = flat("65", MAX_DATA_NODES / 2 - 1, "k");
+        over.insert("nested".into(), serde_json::json!([1]));
+        write_err(&t.app, "POST", &add, &token, &Value::Object(over).to_string(), StatusCode::BAD_REQUEST).await;
+        // Nesting counts through: one key holding 70 nested arrays.
+        let mut deep = serde_json::json!(1);
+        for _ in 0..70 {
+            deep = serde_json::json!([deep]);
+        }
+        let deep = serde_json::json!({"id": "deep", "a": deep});
+        write_err(&t.app, "POST", &add, &token, &deep.to_string(), StatusCode::BAD_REQUEST).await;
+
+        // peer/update counts the merged row: 32 + 1 new keys are 66 nodes.
+        let body = Value::Object(flat("64", 1, "new")).to_string();
+        write_err(&t.app, "PUT", &update, &token, &body, StatusCode::BAD_REQUEST).await;
+        // Overwriting existing keys keeps the count.
+        let body = Value::Object(flat("64", MAX_DATA_NODES / 2, "k")).to_string();
+        write_ok(&t.app, "PUT", &update, &token, &body).await;
+        let ids: Vec<String> = sqlx::query_scalar("select id from ab_peer order by id").fetch_all(&t.state.db).await.unwrap();
+        assert_eq!(ids, ["64", "c"]);
     }
 
     /// Fills a book with `n` peers (ids `f0`, `f1`, …) or tags straight in the database.
