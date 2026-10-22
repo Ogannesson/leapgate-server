@@ -194,9 +194,10 @@ pub(crate) async fn login(State(state): State<AppState>, body: Bytes) -> ApiResu
     // The permit moves into the task, so a client that goes away does not free it early.
     let permit = ARGON2_SLOTS.clone().acquire_owned().await.map_err(ApiError::internal)?;
     let password = req.password.clone();
+    let checked = stored.clone();
     let (check, upgraded) = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let check = auth::verify_password(&password, &stored);
+        let check = auth::verify_password(&password, &checked);
         let upgraded = (check == PasswordCheck::OkNeedsUpgrade).then(|| auth::hash_password(&password));
         (check, upgraded)
     })
@@ -213,29 +214,46 @@ pub(crate) async fn login(State(state): State<AppState>, body: Bytes) -> ApiResu
         return Err(ApiError::forbidden("Account disabled"));
     }
     let now = crate::common::now() as i64;
-    if let Some(hash) = upgraded {
-        sqlx::query("update user set password_hash = ?, updated_at = ? where id = ?")
-            .bind(hash?)
+    // Both writes below only apply while the hash is still the one just checked: a `user passwd`
+    // in between has already signed out every token, so neither may undo it.
+    let current = match upgraded {
+        Some(hash) => {
+            let hash = hash?;
+            let res = sqlx::query(
+                "update user set password_hash = ?, updated_at = ? where id = ? and password_hash = ?",
+            )
+            .bind(&hash)
             .bind(now)
             .bind(uid)
+            .bind(&stored)
             .execute(&state.db)
             .await?;
-        log::info!("Upgraded the password hash of user {} to argon2id", req.username);
-    }
+            if res.rows_affected() == 1 {
+                log::info!("Upgraded the password hash of user {} to argon2id", req.username);
+            }
+            hash
+        }
+        None => stored,
+    };
 
     let token = auth::new_token();
-    sqlx::query(
+    let issued = sqlx::query(
         "insert into token(token_hash, user_id, device_id, device_uuid, created_at, last_used_at)
-         values(?, ?, ?, ?, ?, ?)",
+         select ?, id, ?, ?, ?, ? from user where id = ? and password_hash = ? and status = 1",
     )
     .bind(auth::token_hash(&token))
-    .bind(uid)
     .bind(&req.id)
     .bind(&req.uuid)
     .bind(now)
     .bind(now)
+    .bind(uid)
+    .bind(&current)
     .execute(&state.db)
-    .await?;
+    .await?
+    .rows_affected();
+    if issued == 0 {
+        return Err(ApiError::new(StatusCode::UNAUTHORIZED, "Wrong credentials"));
+    }
 
     if !req.id.is_empty() && uuid_matches(&state.db, &req.id, Some(&req.uuid)).await? {
         sqlx::query(
@@ -489,6 +507,55 @@ mod tests {
         assert!(waited.is_err(), "login finished while every slot was taken");
         drop(all);
         assert_eq!(login.await.unwrap(), StatusCode::OK);
+    }
+
+    /// `user passwd` lands while a login with the old password is past the lookup: the login gets
+    /// no token, and a legacy hash upgrade does not write the old password back.
+    #[tokio::test]
+    async fn password_change_during_login_wins() {
+        let t = testutil::app().await;
+        let db = &t.state.db;
+        let slots = std::thread::available_parallelism().map_or(1, |n| n.get()) as u32;
+        let (aid, _) = testutil::create_user(db, "pc-rita", "old", false).await;
+        let (bid, _) = testutil::create_user(db, "pc-sam", "", false).await;
+        sqlx::query("update user set password_hash = ? where id = ?")
+            .bind(bcrypt::hash("old", 4).unwrap())
+            .bind(bid)
+            .execute(db)
+            .await
+            .unwrap();
+        for (uid, name) in [(aid, "pc-rita"), (bid, "pc-sam")] {
+            // Hold the login between reading the stored hash and checking it.
+            let all = ARGON2_SLOTS.clone().acquire_many_owned(slots).await.unwrap();
+            let app = t.app.clone();
+            let mut login = tokio::spawn(async move { login_as(&app, name, "old", "", "").await.0 });
+            assert!(tokio::time::timeout(Duration::from_millis(300), &mut login).await.is_err());
+            let new_hash = auth::hash_password("new").unwrap();
+            sqlx::query("update user set password_hash = ? where id = ?")
+                .bind(&new_hash)
+                .bind(uid)
+                .execute(db)
+                .await
+                .unwrap();
+            sqlx::query("delete from token where user_id = ?").bind(uid).execute(db).await.unwrap();
+            drop(all);
+
+            assert_eq!(login.await.unwrap(), StatusCode::UNAUTHORIZED, "{name}");
+            let tokens: i64 = sqlx::query_scalar("select count(*) from token where user_id = ?")
+                .bind(uid)
+                .fetch_one(db)
+                .await
+                .unwrap();
+            assert_eq!(tokens, 0, "{name}");
+            let stored: String = sqlx::query_scalar("select password_hash from user where id = ?")
+                .bind(uid)
+                .fetch_one(db)
+                .await
+                .unwrap();
+            assert_eq!(stored, new_hash, "{name}");
+            let (status, _) = login_as(&t.app, name, "new", "", "").await;
+            assert_eq!(status, StatusCode::OK, "{name}");
+        }
     }
 
     #[tokio::test]
