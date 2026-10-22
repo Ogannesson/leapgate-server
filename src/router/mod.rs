@@ -484,11 +484,11 @@ fn describe(l: &Loc) -> String {
 }
 
 /// `porta-server geo lookup <ip>`: reads the local mmdb files (same loader as the server) and
-/// describes country, coordinates, ASN and carrier group. Only the built-in carrier table applies here
-/// (`[routing.carriers]` is not part of `GeoConfig`).
-pub fn geo_lookup(cfg: &GeoConfig, ip: IpAddr) -> ResultType<String> {
+/// describes country, coordinates, ASN and carrier group (built-in table plus `[routing.carriers]`,
+/// as in route decisions).
+pub fn geo_lookup(cfg: &Config, ip: IpAddr) -> ResultType<String> {
     let ip = ip.to_canonical();
-    let (db, info) = geo::load(cfg)?;
+    let (db, info) = geo::load(&cfg.geo)?;
     let mut out = format!("database: {info}\n");
     let Some(rec) = db.locate(ip) else {
         let _ = writeln!(out, "{ip}: not in the database");
@@ -498,7 +498,7 @@ pub fn geo_lookup(cfg: &GeoConfig, ip: IpAddr) -> ResultType<String> {
     let _ = writeln!(out, "{ip}: country {} position {pos}", rec.country.as_deref().unwrap_or("?"));
     match rec.asn {
         Some(asn) => {
-            let group = Carriers::new(&Default::default()).group(asn);
+            let group = Carriers::new(&cfg.routing.carriers).group(asn);
             let org = db.asn_org(ip).unwrap_or_default();
             let _ = writeln!(out, "AS{asn} {org}, carrier group {group}");
         }

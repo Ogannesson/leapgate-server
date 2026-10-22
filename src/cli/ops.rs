@@ -123,7 +123,7 @@ pub(super) async fn exec(ctx: &Ctx, cmd: &str, mut args: Args) -> ResultType<Str
             let ip = parse_ip(&args.next("ip")?)?;
             args.finish()?;
             let cfg = crate::config::Config::load(&ctx.porta_config, "")?;
-            Ok(crate::router::geo_lookup(&cfg.geo, ip)? + "\n")
+            Ok(crate::router::geo_lookup(&cfg, ip)? + "\n")
         }
         ("geo", "update") => {
             args.finish()?;

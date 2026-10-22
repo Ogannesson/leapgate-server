@@ -294,8 +294,12 @@ async fn real_dbip_download() {
     assert!(!std::fs::read_dir(tmp.path())
         .unwrap()
         .any(|e| e.unwrap().file_name().to_string_lossy().ends_with(".part")));
+    let full = Config {
+        geo: cfg.clone(),
+        ..Default::default()
+    };
     for addr in ["8.8.8.8", "1.1.1.1", "202.96.128.86", "221.5.88.88", "211.136.192.6", "2408:8000::1", "23.95.2.214"] {
-        print!("{}", geo_lookup(&cfg, ip(addr)).unwrap());
+        print!("{}", geo_lookup(&full, ip(addr)).unwrap());
     }
     // The server path: load, then select with the real files.
     let (db, info) = geo::load(&cfg).unwrap();
