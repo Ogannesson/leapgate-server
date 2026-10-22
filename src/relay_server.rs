@@ -670,9 +670,7 @@ impl StreamTrait for tokio_tungstenite::WebSocketStream<TcpStream> {
     }
 
     async fn send_raw(&mut self, bytes: Bytes) -> ResultType<()> {
-        Ok(self
-            .send(tungstenite::Message::Binary(bytes.to_vec()))
-            .await?) // to-do: poor performance
+        Ok(self.send(tungstenite::Message::Binary(bytes)).await?)
     }
 
     fn is_ws(&self) -> bool {
