@@ -11,7 +11,7 @@ use serde_derive::Deserialize;
 use serde_json::{Map, Value};
 use sqlx::SqlitePool;
 use std::{
-    collections::HashMap,
+    collections::HashSet,
     future::Future,
     sync::Mutex,
     time::{Duration, Instant},
@@ -19,21 +19,61 @@ use std::{
 
 /// Retries carry the same nonce for up to 120 s (note 03 §5.1); remember them for 5 minutes.
 const NONCE_TTL: Duration = Duration::from_secs(300);
+/// Real clients send a uuid v4 (36 bytes); longer nonces are treated as absent.
+const MAX_NONCE_LEN: usize = 64;
+/// Nonces held at most; once full, new ones are not registered and their reports just lose dedupe.
+const MAX_NONCES: usize = 100_000;
 
-/// Nonces of records already written, with the time they were registered.
-static NONCES: Lazy<Mutex<HashMap<String, Instant>>> = Lazy::new(Default::default);
+/// Nonces of records already written, in two generations of `NONCE_TTL`: each is kept for 5 to 10
+/// minutes, and old ones go a whole generation at a time instead of by scanning.
+struct Nonces {
+    current: HashSet<String>,
+    previous: HashSet<String>,
+    since: Instant,
+}
+
+impl Nonces {
+    fn new() -> Self {
+        Self {
+            current: HashSet::new(),
+            previous: HashSet::new(),
+            since: Instant::now(),
+        }
+    }
+
+    fn rotate(&mut self) {
+        let age = self.since.elapsed();
+        if age < NONCE_TTL {
+            return;
+        }
+        if age >= 2 * NONCE_TTL {
+            self.current.clear();
+        }
+        self.previous = std::mem::take(&mut self.current);
+        self.since = Instant::now();
+    }
+
+    fn seen(&mut self, nonce: &str) -> bool {
+        self.rotate();
+        self.current.contains(nonce) || self.previous.contains(nonce)
+    }
+
+    fn remember(&mut self, nonce: &str) {
+        self.rotate();
+        if self.current.len() + self.previous.len() < MAX_NONCES {
+            self.current.insert(nonce.to_owned());
+        }
+    }
+}
+
+static NONCES: Lazy<Mutex<Nonces>> = Lazy::new(|| Mutex::new(Nonces::new()));
 
 fn nonce_seen(nonce: &str) -> bool {
-    let mut map = NONCES.lock().unwrap_or_else(|e| e.into_inner());
-    map.retain(|_, at| at.elapsed() < NONCE_TTL);
-    map.contains_key(nonce)
+    NONCES.lock().unwrap_or_else(|e| e.into_inner()).seen(nonce)
 }
 
 fn remember_nonce(nonce: &str) {
-    NONCES
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(nonce.to_owned(), Instant::now());
+    NONCES.lock().unwrap_or_else(|e| e.into_inner()).remember(nonce);
 }
 
 fn parse<T: DeserializeOwned>(body: &[u8]) -> Result<T, Response> {
@@ -42,7 +82,8 @@ fn parse<T: DeserializeOwned>(body: &[u8]) -> Result<T, Response> {
 
 /// Shared by the device-side audits: a repeated nonce is a success without writing; a failed weak
 /// check answers success without writing; the nonce is registered only after `write` succeeded, so
-/// the client's retry of a failed write gets stored. No nonce (1.4.x) or `""`: no dedupe.
+/// the client's retry of a failed write gets stored. No nonce (1.4.x), `""` or one longer than
+/// `MAX_NONCE_LEN`: no dedupe.
 async fn report(
     db: &SqlitePool,
     id: &str,
@@ -50,7 +91,7 @@ async fn report(
     nonce: Option<&str>,
     write: impl Future<Output = Result<(), sqlx::Error>>,
 ) -> Response {
-    let nonce = nonce.filter(|n| !n.is_empty());
+    let nonce = nonce.filter(|n| !n.is_empty() && n.len() <= MAX_NONCE_LEN);
     if nonce.is_some_and(nonce_seen) {
         return ok_empty();
     }
@@ -388,15 +429,49 @@ mod tests {
         assert_eq!(count(db, "audit_file").await, 6);
     }
 
+    #[tokio::test]
+    async fn long_nonce_is_no_nonce() {
+        let t = testutil::app().await;
+        let db = &t.state.db;
+        // 64 bytes still deduplicates; 65 is treated as absent: stored every time, never registered.
+        let (fits, long) = ("n".repeat(MAX_NONCE_LEN), "l".repeat(MAX_NONCE_LEN + 1));
+        for _ in 0..2 {
+            ok(&t.app, "/api/audit/file", file_body("1", None, Some(&fits))).await;
+            ok(&t.app, "/api/audit/file", file_body("1", None, Some(&long))).await;
+        }
+        assert_eq!(count(db, "audit_file").await, 3);
+        assert!(!nonce_seen(&long));
+    }
+
+    /// Driven by moving `since` back, on a private table so other tests' nonces are not affected.
     #[test]
-    fn nonce_expires() {
+    fn nonce_generations() {
+        let age = |nonces: &mut Nonces| nonces.since = nonces.since.checked_sub(NONCE_TTL).unwrap();
+        let mut nonces = Nonces::new();
         let n = nonce();
-        remember_nonce(&n);
-        assert!(nonce_seen(&n));
-        let old = Instant::now().checked_sub(NONCE_TTL).unwrap();
-        NONCES.lock().unwrap().insert(n.clone(), old);
-        assert!(!nonce_seen(&n));
-        assert!(!NONCES.lock().unwrap().contains_key(&n));
+        nonces.remember(&n);
+        assert!(nonces.seen(&n));
+        // One generation later it is still known; after the next one it is gone.
+        age(&mut nonces);
+        assert!(nonces.seen(&n));
+        assert!(nonces.previous.contains(&n) && nonces.current.is_empty());
+        age(&mut nonces);
+        assert!(!nonces.seen(&n));
+        assert!(nonces.previous.is_empty());
+
+        // Idle for two generations or more: both go at once.
+        nonces.remember(&n);
+        age(&mut nonces);
+        age(&mut nonces);
+        assert!(!nonces.seen(&n));
+
+        // Full: new nonces are not registered, the ones held still are.
+        for i in 0..MAX_NONCES {
+            nonces.remember(&i.to_string());
+        }
+        nonces.remember(&n);
+        assert!(!nonces.seen(&n));
+        assert!(nonces.seen("0"));
     }
 
     #[tokio::test]
