@@ -15,6 +15,15 @@ const GREEN: i64 = 0xFF00_FF00;
 const BLUE: i64 = 0xFF00_00FF;
 const WHITE: i64 = 0xFFFF_FFFF;
 
+/// §12.1 的写入上限。
+const MAX_PEERS: i64 = 10_000;
+const MAX_TAGS: i64 = 1000;
+const MAX_ID: usize = 253;
+const MAX_DATA: usize = 8 << 10;
+const MAX_PEER_TAGS: usize = 64;
+const MAX_TAG: usize = 64;
+const MAX_SECRET: usize = 1 << 10;
+
 fn peers_path(guid: &str) -> String {
     format!("/api/ab/peers?current=1&pageSize=100&ab={guid}")
 }
@@ -134,15 +143,15 @@ async fn personal_always_returns_guid_and_creates_book_once() {
     assert_eq!(s.personal_guid(&carol.token).await, existing);
 }
 
-/// 笔记 04 §3.2：settings 回 `{"max_peer_one_ab": 0}`（整数，0 = 不限）；§12.1：`max_peer_one_ab` 回 0。
+/// 笔记 04 §3.2：settings 回 `{"max_peer_one_ab": N}`（整数）；§12.1：`max_peer_one_ab` 回 10000，和每本簿的设备上限一致。
 /// §9.1 第 9 条：settings 正常实现，不回 404。
 #[tokio::test]
-async fn settings_returns_unlimited() {
+async fn settings_returns_peer_limit() {
     let s = Server::start().await;
     let u = s.user("u", false).await;
     let obj = assert_object(&s.read("/api/ab/settings", &u.token).await, "settings");
     let v = obj.get("max_peer_one_ab").unwrap_or_else(|| panic!("缺 max_peer_one_ab：{obj:?}"));
-    assert!(is_int(v) && v.as_i64() == Some(0), "max_peer_one_ab 必须是整数 0：{v}");
+    assert!(is_int(v) && v.as_i64() == Some(MAX_PEERS), "max_peer_one_ab 必须是整数 {MAX_PEERS}：{v}");
 }
 
 /// §9.1 第 3 条：令牌无效、过期、账号禁用 → 401（笔记 04 §0 第 12 条）。12 个接口都查：
@@ -683,6 +692,158 @@ async fn invalid_bodies_are_400_with_json_error() {
     assert_eq!(s.peer_ids(&guid).await, vec!["p1".to_owned()]);
     assert_eq!(s.peer_row(&guid, "p1").await, before);
     assert_eq!(s.tag_rows(&guid).await, vec![("t1".to_owned(), RED)]);
+}
+
+/// 直接往库里给一本簿灌 n 个设备（id `f0`…）或 n 个标签（名字 `f0`…），不必真发上万次请求。
+async fn fill(s: &Server, guid: &str, peers: bool, n: i64) {
+    let sql = if peers {
+        "with recursive c(i) as (select 0 union all select i + 1 from c where i + 1 < ?2)
+         insert into ab_peer(ab_guid, id, created_at, updated_at) select ?1, 'f' || i, 1, 1 from c"
+    } else {
+        "with recursive c(i) as (select 0 union all select i + 1 from c where i + 1 < ?2)
+         insert into ab_tag(ab_guid, name, color) select ?1, 'f' || i, 1 from c"
+    };
+    sqlx::query(sql).bind(guid).bind(n).execute(&s.db).await.unwrap();
+}
+
+/// §12.1 写入上限：设备 id ≤ 253 字节；data 按落盘的 JSON 序列化后 ≤ 8 KB（peer/update 合并后再查）；tags ≤ 64 个、
+/// 每个 ≤ 64 字节；本簿要存的 hash/password ≤ 1 KB；tag/add、tag/rename 的新名字 ≤ 64 字节。刚好等于上限通过，
+/// 超 1 字节回 400 + error，库里不建、不改。长度按 UTF-8 字节算（中文一个字 3 字节）。
+#[tokio::test]
+async fn write_limits_exact_ok_one_byte_over_400() {
+    let s = Server::start().await;
+    let alice = s.user("alice", false).await;
+    let personal = s.personal_book(alice.id).await;
+    let shared = s.book("Shared", alice.id, false).await;
+    let add = format!("/api/ab/peer/add/{personal}");
+    let update = format!("/api/ab/peer/update/{personal}");
+    // 21 个汉字 + 1 个 ASCII = 64 字节。
+    let tag = format!("{}a", "标".repeat(21));
+    let tag_over = "标".repeat(22);
+    let secret = "h".repeat(MAX_SECRET);
+    let id = "1".repeat(MAX_ID);
+    // `{"note":"…"}` 序列化后比 note 本身多 11 字节。
+    let note = |extra: usize| "n".repeat(MAX_DATA - 11 + extra);
+
+    let body = json!({"id": id, "tags": vec![tag.clone(); MAX_PEER_TAGS], "hash": secret, "note": note(0)});
+    assert_action_ok(&s.call("POST", &add, &alice.token, &body.to_string()).await, "全部刚好等于上限");
+    let row = s.peer_row(&personal, &id).await.expect("应已建记录");
+    assert_eq!(row.data.to_string().len(), MAX_DATA);
+    assert_eq!(row.tags.as_array().unwrap().len(), MAX_PEER_TAGS);
+    assert_eq!(s.decrypt(&row.hash_enc), secret);
+    let listed = &s.peers(&alice.token, &personal).await[&id];
+    assert_eq!((listed["note"].as_str().unwrap().len(), listed["hash"].as_str()), (MAX_DATA - 11, Some(secret.as_str())));
+
+    let over_id = json!({"id": "1".repeat(MAX_ID + 1)}).to_string();
+    assert_error(&s.call("POST", &add, &alice.token, &over_id).await, 400, "add id 超长");
+    assert_error(&s.call("PUT", &update, &alice.token, &over_id).await, 400, "update id 超长");
+    for (what, bad) in [
+        ("tags 个数", json!({"tags": vec!["t"; MAX_PEER_TAGS + 1]})),
+        ("tag 名字", json!({"tags": ["ok", tag_over]})),
+        ("hash", json!({"hash": format!("{secret}h")})),
+        ("data", json!({"note": note(1)})),
+    ] {
+        let mut body = bad;
+        body["id"] = json!("new");
+        assert_error(&s.call("POST", &add, &alice.token, &body.to_string()).await, 400, &format!("add {what}超限"));
+        body["id"] = json!(id);
+        assert_error(&s.call("PUT", &update, &alice.token, &body.to_string()).await, 400, &format!("update {what}超限"));
+    }
+    assert_eq!(s.peer_ids(&personal).await, vec![id.clone()], "被拒的 add 不能建记录");
+    assert_eq!(s.peer_row(&personal, &id).await.unwrap(), row, "被拒的 update 不能改记录");
+
+    // 共享簿存 password，同样 ≤ 1 KB。
+    let shared_add = format!("/api/ab/peer/add/{shared}");
+    let r = s.call("POST", &shared_add, &alice.token, &json!({"id": "1", "password": secret}).to_string()).await;
+    assert_action_ok(&r, "共享簿 password 刚好 1 KB");
+    let r = s.call("POST", &shared_add, &alice.token, &json!({"id": "2", "password": format!("{secret}p")}).to_string()).await;
+    assert_error(&r, 400, "共享簿 password 超长");
+    assert_eq!(s.peer_ids(&shared).await, vec!["1".to_owned()]);
+
+    // peer/update 合并后超限：两次各自不超，合起来超，第二次被拒且整行不变；换成更短的值照常成功。
+    s.insert_peer(&personal, "m", json!({}), json!([]), "", "").await;
+    let half = "a".repeat(MAX_DATA / 2);
+    put_ok(&s, &alice.token, update.clone(), json!({"id": "m", "alias": half}).to_string()).await;
+    let before = s.peer_row(&personal, "m").await.unwrap();
+    let r = s.call("PUT", &update, &alice.token, &json!({"id": "m", "note": half}).to_string()).await;
+    assert_error(&r, 400, "合并后超 8 KB");
+    assert_eq!(s.peer_row(&personal, "m").await.unwrap(), before);
+    put_ok(&s, &alice.token, update.clone(), json!({"id": "m", "alias": "short", "note": half}).to_string()).await;
+    assert_eq!(s.peer_row(&personal, "m").await.unwrap().data, json!({"alias": "short", "note": half}));
+
+    // 标签名字。
+    let tag_add = format!("/api/ab/tag/add/{personal}");
+    let rename = format!("/api/ab/tag/rename/{personal}");
+    let r = s.call("POST", &tag_add, &alice.token, &json!({"name": tag, "color": RED}).to_string()).await;
+    assert_action_ok(&r, "标签名刚好 64 字节");
+    let r = s.call("POST", &tag_add, &alice.token, &json!({"name": tag_over, "color": RED}).to_string()).await;
+    assert_error(&r, 400, "标签名超长");
+    let r = s.call("PUT", &rename, &alice.token, &json!({"old": tag, "new": format!("{tag}b")}).to_string()).await;
+    assert_error(&r, 400, "改名超长");
+    assert_eq!(s.tag_rows(&personal).await, vec![(tag.clone(), RED)]);
+    let new = "b".repeat(MAX_TAG);
+    put_ok(&s, &alice.token, rename, json!({"old": tag, "new": new}).to_string()).await;
+    assert_eq!(s.tag_rows(&personal).await, vec![(new, RED)]);
+}
+
+/// §12.1：每本簿最多 1 万个设备、1000 个标签。簿满后 peer/add 新 id、tag/add 新名字回 400 + error；
+/// 已有的 id/名字照旧 200 空 body、不改；别的簿各算各的；删掉一个就又能加。
+#[tokio::test]
+async fn full_book_refuses_new_peers_and_tags() {
+    let s = Server::start().await;
+    let alice = s.user("alice", false).await;
+    let book = s.personal_book(alice.id).await;
+    let other = s.book("Other", alice.id, false).await;
+    let add = format!("/api/ab/peer/add/{book}");
+    let tag_add = format!("/api/ab/tag/add/{book}");
+    fill(&s, &book, true, MAX_PEERS - 1).await;
+    fill(&s, &book, false, MAX_TAGS - 1).await;
+
+    assert_action_ok(&s.call("POST", &add, &alice.token, r#"{"id":"last","alias":"A"}"#).await, "第 1 万个设备");
+    let r = s.call("POST", &tag_add, &alice.token, &format!(r#"{{"name":"last","color":{RED}}}"#)).await;
+    assert_action_ok(&r, "第 1000 个标签");
+
+    assert_error(&s.call("POST", &add, &alice.token, r#"{"id":"new"}"#).await, 400, "簿满后加新设备");
+    assert_action_ok(&s.call("POST", &add, &alice.token, r#"{"id":"last","alias":"B"}"#).await, "簿满后重复添加");
+    let r = s.call("POST", &tag_add, &alice.token, &format!(r#"{{"name":"new","color":{RED}}}"#)).await;
+    assert_error(&r, 400, "标签满后加新标签");
+    let r = s.call("POST", &tag_add, &alice.token, &format!(r#"{{"name":"last","color":{BLUE}}}"#)).await;
+    assert_action_ok(&r, "标签满后重复添加");
+    assert_eq!(s.peer_ids(&book).await.len() as i64, MAX_PEERS);
+    assert!(s.peer_row(&book, "new").await.is_none());
+    assert_eq!(s.peer_row(&book, "last").await.unwrap().data, json!({"alias": "A"}));
+    let tags = s.tag_rows(&book).await;
+    assert_eq!(tags.len() as i64, MAX_TAGS);
+    assert!(tags.contains(&("last".to_owned(), RED)) && !tags.iter().any(|t| t.0 == "new"));
+
+    assert_action_ok(&s.call("POST", &format!("/api/ab/peer/add/{other}"), &alice.token, r#"{"id":"new"}"#).await, "别的簿");
+    let r = s.call("POST", &format!("/api/ab/tag/add/{other}"), &alice.token, r#"{"name":"new","color":1}"#).await;
+    assert_action_ok(&r, "别的簿的标签");
+
+    assert_action_ok(&s.call("DELETE", &format!("/api/ab/peer/{book}"), &alice.token, r#"["f0"]"#).await, "删设备");
+    assert_action_ok(&s.call("POST", &add, &alice.token, r#"{"id":"new"}"#).await, "删掉一个后再加");
+    assert_action_ok(&s.call("DELETE", &format!("/api/ab/tag/{book}"), &alice.token, r#"["f0"]"#).await, "删标签");
+    let r = s.call("POST", &tag_add, &alice.token, r#"{"name":"new","color":1}"#).await;
+    assert_action_ok(&r, "删掉一个标签后再加");
+}
+
+/// §12.1：pageSize 最大 1000，超过按 1000 截断，total 照样是全部条数，按截断后的页大小翻页不重不漏。
+#[tokio::test]
+async fn page_size_capped_at_1000_total_unchanged() {
+    let s = Server::start().await;
+    let alice = s.user("alice", false).await;
+    let book = s.personal_book(alice.id).await;
+    fill(&s, &book, true, 1500).await;
+    let mut got = Vec::new();
+    for (current, want) in [(1, 1000), (2, 500)] {
+        let r = s.read(&format!("/api/ab/peers?current={current}&pageSize=5000&ab={book}"), &alice.token).await;
+        let obj = assert_object(&r, "peers");
+        assert!(is_int(&obj["total"]) && obj["total"].as_i64() == Some(1500), "total：{}", obj["total"]);
+        let data = obj["data"].as_array().unwrap();
+        assert_eq!(data.len(), want, "第 {current} 页");
+        got.extend(data.iter().map(|p| p["id"].as_str().unwrap().to_owned()));
+    }
+    assert_eq!(got, s.peer_ids(&book).await);
 }
 
 /// §12.1：peer/update 只合并请求里出现的字段；id 不在簿里回 404 + error、不新建；`hash:""`/`password:""` 存 ''、回包省略；

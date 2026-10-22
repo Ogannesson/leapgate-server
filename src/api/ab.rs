@@ -2,7 +2,7 @@
 //! Writes succeed with 200 + empty body only; `personal`, `settings`, `shared/profiles` never 404.
 
 use super::{ok_empty, ok_json, parse_json, ApiError, ApiResult, CurrentUser, PageQuery};
-use crate::state::AppState;
+use crate::{peer::MAX_PEER_ID_LEN, state::AppState};
 use axum::{
     body::Bytes,
     extract::{Path, Query, State},
@@ -24,6 +24,22 @@ const RULE_SQL: &str = "case when a.owner_id = ?1 then 3 when a.personal = 0 the
 const READ: i64 = 1;
 /// Rules 2 and 3 both allow every write of the 12 endpoints (§12.1).
 const WRITE: i64 = 2;
+
+// Write limits (§12.1): any logged-in user can write their own personal book, so without them one
+// account fills the disk. Over a limit → 400 + `{"error"}`, which the client shows as a failure.
+/// Peers per book. Also sent as `max_peer_one_ab`: the client stops adding at this count itself
+/// (`Ab.isFull`, note 04 §3.2).
+const MAX_PEERS: i64 = 10_000;
+/// Tags per book (`ab_tag` rows).
+const MAX_TAGS: i64 = 1000;
+/// A tag name, in bytes (`tag/add`, `tag/rename`, a peer's `tags`).
+const MAX_TAG_LEN: usize = 64;
+/// Tags on one peer.
+const MAX_PEER_TAGS: usize = 64;
+/// A peer's `data` column as stored (serialized JSON, after `peer/update` merges into it).
+const MAX_DATA_LEN: usize = 8 << 10;
+/// The `hash`/`password` the client uploads, before encryption.
+const MAX_SECRET_LEN: usize = 1 << 10;
 
 /// Must be strings when given (§12.1); `same_server` must be a bool.
 const STRING_FIELDS: [&str; 10] = [
@@ -89,9 +105,9 @@ pub(crate) async fn personal(State(state): State<AppState>, user: CurrentUser) -
     Ok(ok_json(&serde_json::json!({ "guid": guid })))
 }
 
-/// `POST /api/ab/settings`: `{"max_peer_one_ab": 0}`.
+/// `POST /api/ab/settings`: `{"max_peer_one_ab": MAX_PEERS}`.
 pub(crate) async fn settings(State(_state): State<AppState>, _user: CurrentUser) -> ApiResult {
-    Ok(ok_json(&serde_json::json!({ "max_peer_one_ab": 0 })))
+    Ok(ok_json(&serde_json::json!({ "max_peer_one_ab": MAX_PEERS })))
 }
 
 #[derive(Serialize)]
@@ -236,10 +252,23 @@ fn split_peer(body: &[u8], personal: bool) -> Result<PeerFields, ApiError> {
         let bad = || ApiError::bad_request(&format!("Invalid type of field '{key}'"));
         match key.as_str() {
             "id" => id = Some(value.as_str().ok_or_else(bad)?.to_owned()),
-            "tags" => fields.tags = Some(serde_json::from_value(value).map_err(|_| bad())?),
+            "tags" => {
+                let tags: Vec<String> = serde_json::from_value(value).map_err(|_| bad())?;
+                if tags.len() > MAX_PEER_TAGS {
+                    return Err(ApiError::bad_request("Too many tags on one peer"));
+                }
+                for tag in &tags {
+                    check_tag_len(tag).map_err(ApiError::bad_request)?;
+                }
+                fields.tags = Some(tags);
+            }
             "hash" | "password" => {
                 if key == secret_key {
-                    fields.secret = Some(value.as_str().ok_or_else(bad)?.to_owned());
+                    let secret = value.as_str().ok_or_else(bad)?;
+                    if secret.len() > MAX_SECRET_LEN {
+                        return Err(ApiError::bad_request(&format!("Field '{key}' too long")));
+                    }
+                    fields.secret = Some(secret.to_owned());
                 }
             }
             _ => {
@@ -253,7 +282,27 @@ fn split_peer(body: &[u8], personal: bool) -> Result<PeerFields, ApiError> {
         }
     }
     fields.id = id.filter(|id| !id.is_empty()).ok_or_else(|| ApiError::bad_request("Missing id"))?;
+    if fields.id.len() > MAX_PEER_ID_LEN {
+        return Err(ApiError::bad_request("Peer id too long"));
+    }
     Ok(fields)
+}
+
+/// The error is the 400 message (`.map_err(ApiError::bad_request)`).
+fn check_tag_len(name: &str) -> Result<(), &'static str> {
+    if name.len() > MAX_TAG_LEN {
+        return Err("Tag name too long");
+    }
+    Ok(())
+}
+
+/// The `data` column as stored, refused over `MAX_DATA_LEN`; the error is the 400 message.
+fn encode_data(data: Map<String, Value>) -> Result<String, &'static str> {
+    let data = Value::Object(data).to_string();
+    if data.len() > MAX_DATA_LEN {
+        return Err("Peer data too large");
+    }
+    Ok(data)
 }
 
 /// `POST /api/ab/peer/add/<guid>`: an id already in the book is left untouched (§12.1: a client
@@ -266,23 +315,37 @@ pub(crate) async fn peer_add(
 ) -> ApiResult {
     let personal = check(&state.db, &user, &guid, WRITE).await?;
     let fields = split_peer(&body, personal)?;
+    let data = encode_data(fields.data).map_err(ApiError::bad_request)?;
     let secret = state.secret.encrypt(fields.secret.as_deref().unwrap_or_default());
     let (hash, password) = if personal { (secret, String::new()) } else { (String::new(), secret) };
-    let now = crate::common::now() as i64;
-    sqlx::query(
+    // The count and the insert in one statement, so concurrent adds cannot overshoot MAX_PEERS.
+    let inserted = sqlx::query(
         "insert into ab_peer(ab_guid, id, data, tags, hash_enc, password_enc, created_at, updated_at)
-         values(?, ?, ?, ?, ?, ?, ?, ?) on conflict do nothing",
+         select ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7 where (select count(*) from ab_peer where ab_guid = ?1) < ?8
+         on conflict do nothing",
     )
     .bind(&guid)
     .bind(&fields.id)
-    .bind(Value::Object(fields.data).to_string())
+    .bind(data)
     .bind(serde_json::json!(fields.tags.unwrap_or_default()).to_string())
     .bind(hash)
     .bind(password)
-    .bind(now)
-    .bind(now)
+    .bind(crate::common::now() as i64)
+    .bind(MAX_PEERS)
     .execute(&state.db)
-    .await?;
+    .await?
+    .rows_affected();
+    // Nothing inserted: either the id is already there (success, §12.1) or the book is full.
+    if inserted == 0 {
+        let exists: bool = sqlx::query_scalar("select exists(select 1 from ab_peer where ab_guid = ? and id = ?)")
+            .bind(&guid)
+            .bind(&fields.id)
+            .fetch_one(&state.db)
+            .await?;
+        if !exists {
+            return Err(ApiError::bad_request("Address book is full"));
+        }
+    }
     Ok(ok_empty())
 }
 
@@ -315,13 +378,15 @@ pub(crate) async fn peer_update(
         .await?;
     let mut data: Map<String, Value> = serde_json::from_str(&stored).map_err(ApiError::internal)?;
     data.extend(fields.data);
+    // Checked after merging: each update may add keys to the same row. Dropping `tx` rolls back.
+    let data = encode_data(data).map_err(ApiError::bad_request)?;
     let secret = fields.secret.map(|s| state.secret.encrypt(&s));
     let (hash, password) = if personal { (secret, None) } else { (None, secret) };
     sqlx::query(
         "update ab_peer set data = ?, tags = coalesce(?, tags), hash_enc = coalesce(?, hash_enc),
          password_enc = coalesce(?, password_enc) where ab_guid = ? and id = ?",
     )
-    .bind(Value::Object(data).to_string())
+    .bind(data)
     .bind(fields.tags.map(|t| serde_json::json!(t).to_string()))
     .bind(hash)
     .bind(password)
@@ -360,12 +425,30 @@ pub(crate) async fn tag_add(
 ) -> ApiResult {
     check(&state.db, &user, &guid, WRITE).await?;
     let tag: Tag = parse_json(&body)?;
-    sqlx::query("insert into ab_tag(ab_guid, name, color) values(?, ?, ?) on conflict do nothing")
-        .bind(&guid)
-        .bind(&tag.name)
-        .bind(tag.color)
-        .execute(&state.db)
-        .await?;
+    check_tag_len(&tag.name).map_err(ApiError::bad_request)?;
+    // Same pattern as `peer_add`: count and insert in one statement; nothing inserted and the name
+    // not there means the book has MAX_TAGS tags.
+    let inserted = sqlx::query(
+        "insert into ab_tag(ab_guid, name, color)
+         select ?1, ?2, ?3 where (select count(*) from ab_tag where ab_guid = ?1) < ?4 on conflict do nothing",
+    )
+    .bind(&guid)
+    .bind(&tag.name)
+    .bind(tag.color)
+    .bind(MAX_TAGS)
+    .execute(&state.db)
+    .await?
+    .rows_affected();
+    if inserted == 0 {
+        let exists: bool = sqlx::query_scalar("select exists(select 1 from ab_tag where ab_guid = ? and name = ?)")
+            .bind(&guid)
+            .bind(&tag.name)
+            .fetch_one(&state.db)
+            .await?;
+        if !exists {
+            return Err(ApiError::bad_request("Too many tags in this address book"));
+        }
+    }
     Ok(ok_empty())
 }
 
@@ -384,6 +467,7 @@ pub(crate) async fn tag_rename(
 ) -> ApiResult {
     check(&state.db, &user, &guid, WRITE).await?;
     let Rename { old, new } = parse_json(&body)?;
+    check_tag_len(&new).map_err(ApiError::bad_request)?;
     let mut tx = state.db.begin().await?;
     let renamed = sqlx::query("update ab_tag set name = ? where ab_guid = ? and name = ?")
         .bind(&new)
@@ -607,7 +691,148 @@ mod tests {
 
         let (status, ct, body) = send(&t.app, "POST", "/api/ab/settings", Some(&token), "").await;
         assert_eq!((status, ct.as_str()), (StatusCode::OK, JSON));
-        assert_eq!(&body[..], br#"{"max_peer_one_ab":0}"#);
+        assert_eq!(&body[..], br#"{"max_peer_one_ab":10000}"#);
+    }
+
+    #[tokio::test]
+    async fn write_size_limits() {
+        let t = testutil::app().await;
+        let db = &t.state.db;
+        let (uid, token) = testutil::create_user(db, "alice", "", false).await;
+        let personal = personal_guid(&t.app, &token).await;
+        let shared = shared_book(db, "S", uid).await;
+        let add = format!("/api/ab/peer/add/{personal}");
+        let update = format!("/api/ab/peer/update/{personal}");
+        let tag = "t".repeat(MAX_TAG_LEN);
+        let secret = "s".repeat(MAX_SECRET_LEN);
+        // `{"note":"…"}` serialized is the note plus 11 bytes.
+        let note = |extra: usize| "n".repeat(MAX_DATA_LEN - 11 + extra);
+
+        // At each limit: accepted.
+        let id = "i".repeat(MAX_PEER_ID_LEN);
+        let tags = vec![tag.clone(); MAX_PEER_TAGS];
+        let body = serde_json::json!({"id": id, "tags": tags, "hash": secret, "note": note(0)}).to_string();
+        write_ok(&t.app, "POST", &add, &token, &body).await;
+        let (data, stored_tags, hash, _) = stored(db, &personal, &id).await;
+        assert_eq!((data.to_string().len(), stored_tags.len()), (MAX_DATA_LEN, MAX_PEER_TAGS));
+        assert_eq!(t.state.secret.decrypt(&hash).unwrap(), secret);
+        let body = serde_json::json!({"id": "1", "password": secret}).to_string();
+        write_ok(&t.app, "POST", &format!("/api/ab/peer/add/{shared}"), &token, &body).await;
+
+        // One over: 400 + error, nothing stored or changed (updates go to the peer just added).
+        let long_id = serde_json::json!({"id": "i".repeat(MAX_PEER_ID_LEN + 1)}).to_string();
+        write_err(&t.app, "POST", &add, &token, &long_id, StatusCode::BAD_REQUEST).await;
+        write_err(&t.app, "PUT", &update, &token, &long_id, StatusCode::BAD_REQUEST).await;
+        let before = stored(db, &personal, &id).await;
+        for bad in [
+            serde_json::json!({"id": "2", "tags": vec!["t"; MAX_PEER_TAGS + 1]}),
+            serde_json::json!({"id": "2", "tags": ["a", format!("{tag}x")]}),
+            serde_json::json!({"id": "2", "hash": format!("{secret}x")}),
+            serde_json::json!({"id": "2", "note": note(1)}),
+        ] {
+            write_err(&t.app, "POST", &add, &token, &bad.to_string(), StatusCode::BAD_REQUEST).await;
+            let mut bad = bad;
+            bad["id"] = Value::String(id.clone());
+            write_err(&t.app, "PUT", &update, &token, &bad.to_string(), StatusCode::BAD_REQUEST).await;
+        }
+        assert_eq!(stored(db, &personal, &id).await, before);
+        let body = serde_json::json!({"id": "2", "password": format!("{secret}x")}).to_string();
+        write_err(&t.app, "POST", &format!("/api/ab/peer/add/{shared}"), &token, &body, StatusCode::BAD_REQUEST).await;
+        // The other book's secret key is ignored, so not limited either.
+        let body = serde_json::json!({"id": "2", "password": format!("{secret}x")}).to_string();
+        write_ok(&t.app, "POST", &add, &token, &body).await;
+        let count: i64 = sqlx::query_scalar("select count(*) from ab_peer").fetch_one(db).await.unwrap();
+        assert_eq!(count, 3);
+
+        // peer/update checks the merged row: each half fits, together they do not.
+        write_ok(&t.app, "POST", &add, &token, r#"{"id":"m"}"#).await;
+        let half = "a".repeat(MAX_DATA_LEN / 2);
+        write_ok(&t.app, "PUT", &update, &token, &serde_json::json!({"id": "m", "alias": half}).to_string()).await;
+        let body = serde_json::json!({"id": "m", "note": half}).to_string();
+        write_err(&t.app, "PUT", &update, &token, &body, StatusCode::BAD_REQUEST).await;
+        assert_eq!(stored(db, &personal, "m").await.0, serde_json::json!({"alias": half}), "rolled back");
+        // Replacing a value with a shorter one is fine.
+        write_ok(&t.app, "PUT", &update, &token, r#"{"id":"m","alias":"short","note":"n"}"#).await;
+
+        // Tag names.
+        let tag_add = format!("/api/ab/tag/add/{personal}");
+        let rename = format!("/api/ab/tag/rename/{personal}");
+        write_ok(&t.app, "POST", &tag_add, &token, &serde_json::json!({"name": tag, "color": 1}).to_string()).await;
+        let body = serde_json::json!({"name": format!("{tag}x"), "color": 1}).to_string();
+        write_err(&t.app, "POST", &tag_add, &token, &body, StatusCode::BAD_REQUEST).await;
+        write_ok(&t.app, "POST", &tag_add, &token, r#"{"name":"a","color":1}"#).await;
+        let body = serde_json::json!({"old": "a", "new": format!("{tag}y")}).to_string();
+        write_err(&t.app, "PUT", &rename, &token, &body, StatusCode::BAD_REQUEST).await;
+        let body = serde_json::json!({"old": "a", "new": "b".repeat(MAX_TAG_LEN)}).to_string();
+        write_ok(&t.app, "PUT", &rename, &token, &body).await;
+        let names: Vec<String> = sqlx::query_scalar("select name from ab_tag order by name").fetch_all(db).await.unwrap();
+        assert_eq!(names, ["b".repeat(MAX_TAG_LEN), tag]);
+    }
+
+    /// Fills a book with `n` peers (ids `f0`, `f1`, …) or tags straight in the database.
+    async fn fill(db: &SqlitePool, guid: &str, table: &str, n: i64) {
+        let sql = match table {
+            "ab_peer" => "with recursive c(i) as (select 0 union all select i + 1 from c where i + 1 < ?2)
+                 insert into ab_peer(ab_guid, id, created_at, updated_at) select ?1, 'f' || i, 1, 1 from c",
+            _ => "with recursive c(i) as (select 0 union all select i + 1 from c where i + 1 < ?2)
+                 insert into ab_tag(ab_guid, name, color) select ?1, 'f' || i, 1 from c",
+        };
+        sqlx::query(sql).bind(guid).bind(n).execute(db).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn book_peer_and_tag_count_limits() {
+        let t = testutil::app().await;
+        let db = &t.state.db;
+        let (uid, token) = testutil::create_user(db, "alice", "", false).await;
+        let book = personal_guid(&t.app, &token).await;
+        let other = shared_book(db, "S", uid).await;
+        let add = format!("/api/ab/peer/add/{book}");
+        let tag_add = format!("/api/ab/tag/add/{book}");
+
+        fill(db, &book, "ab_peer", MAX_PEERS - 1).await;
+        fill(db, &book, "ab_tag", MAX_TAGS - 1).await;
+        // The last one fits.
+        write_ok(&t.app, "POST", &add, &token, r#"{"id":"last"}"#).await;
+        write_ok(&t.app, "POST", &tag_add, &token, r#"{"name":"last","color":1}"#).await;
+        // Full: a new one is refused; an existing one still succeeds without changes (§12.1).
+        write_err(&t.app, "POST", &add, &token, r#"{"id":"new"}"#, StatusCode::BAD_REQUEST).await;
+        write_ok(&t.app, "POST", &add, &token, r#"{"id":"last","alias":"x"}"#).await;
+        write_err(&t.app, "POST", &tag_add, &token, r#"{"name":"new","color":1}"#, StatusCode::BAD_REQUEST).await;
+        write_ok(&t.app, "POST", &tag_add, &token, r#"{"name":"last","color":2}"#).await;
+        let peers: i64 = sqlx::query_scalar("select count(*) from ab_peer where ab_guid = ?")
+            .bind(&book)
+            .fetch_one(db)
+            .await
+            .unwrap();
+        let tags: Vec<(String, i64)> = sqlx::query_as("select name, color from ab_tag where ab_guid = ? and name = 'last'")
+            .bind(&book)
+            .fetch_all(db)
+            .await
+            .unwrap();
+        assert_eq!((peers, tags), (MAX_PEERS, vec![("last".to_owned(), 1)]));
+        assert_eq!(stored(db, &book, "last").await.0, serde_json::json!({}));
+        // Other books are counted on their own.
+        write_ok(&t.app, "POST", &format!("/api/ab/peer/add/{other}"), &token, r#"{"id":"new"}"#).await;
+        write_ok(&t.app, "POST", &format!("/api/ab/tag/add/{other}"), &token, r#"{"name":"new","color":1}"#).await;
+        // Room again after a delete.
+        write_ok(&t.app, "DELETE", &format!("/api/ab/peer/{book}"), &token, r#"["f0"]"#).await;
+        write_ok(&t.app, "POST", &add, &token, r#"{"id":"new"}"#).await;
+        write_ok(&t.app, "DELETE", &format!("/api/ab/tag/{book}"), &token, r#"["f0"]"#).await;
+        write_ok(&t.app, "POST", &tag_add, &token, r#"{"name":"new","color":1}"#).await;
+
+        // A page never holds more than 1000 peers; total stays the full count.
+        let (status, _, body) =
+            send(&t.app, "POST", &format!("/api/ab/peers?current=2&pageSize=5000&ab={book}"), Some(&token), "").await;
+        assert_eq!(status, StatusCode::OK);
+        let v = js(&body);
+        assert_eq!((v["total"].as_i64(), v["data"].as_array().unwrap().len()), (Some(MAX_PEERS), 1000));
+        let id_1000: String = sqlx::query_scalar("select id from ab_peer where ab_guid = ? order by id limit 1 offset 1000")
+            .bind(&book)
+            .fetch_one(db)
+            .await
+            .unwrap();
+        assert_eq!(v["data"][0]["id"], id_1000, "page 2 starts at offset 1000");
     }
 
     #[tokio::test]

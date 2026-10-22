@@ -32,6 +32,8 @@ pub(crate) const MAX_NAME_LEN: usize = 128;
 /// check times (tens of milliseconds each); beyond it, unauthenticated requests (unknown names are
 /// not rate limited, §11) would only queue up ahead of real logins, each holding its password.
 const QUEUE_PER_SLOT: usize = 4;
+/// Tokens kept per user; each login evicts the least recently used beyond this (§11).
+const MAX_TOKENS: i64 = 50;
 
 #[derive(Default)]
 struct FailState {
@@ -320,6 +322,7 @@ pub(crate) async fn login(State(state): State<AppState>, body: Bytes) -> ApiResu
     };
 
     let token = auth::new_token();
+    let mut tx = state.db.begin().await?;
     let issued = sqlx::query(
         "insert into token(token_hash, user_id, device_id, device_uuid, created_at, last_used_at)
          select ?, id, ?, ?, ?, ? from user where id = ? and password_hash = ? and status = 1",
@@ -331,12 +334,23 @@ pub(crate) async fn login(State(state): State<AppState>, body: Bytes) -> ApiResu
     .bind(now)
     .bind(uid)
     .bind(&current)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
     if issued == 0 {
         return Err(ApiError::new(StatusCode::UNAUTHORIZED, "Wrong credentials"));
     }
+    // Tokens never expire (§11): keep only the user's MAX_TOKENS most recently used, the new one
+    // included, so logging in again and again cannot pile up rows.
+    sqlx::query(
+        "delete from token where user_id = ?1 and rowid not in
+         (select rowid from token where user_id = ?1 order by last_used_at desc, rowid desc limit ?2)",
+    )
+    .bind(uid)
+    .bind(MAX_TOKENS)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
 
     // Only a device registered with hbbs, with a matching uuid, is bound: someone else's device is
     // not taken over, and made-up ids add no device rows (§11).
@@ -481,6 +495,60 @@ mod tests {
         let (status, _, body) = send(&t.app, "POST", "/api/currentUser", Some(&token), "").await;
         assert_eq!(status, StatusCode::OK);
         assert_user_payload(&serde_json::from_slice(&body).unwrap(), "10086", true);
+    }
+
+    #[tokio::test]
+    async fn login_keeps_the_most_recently_used_tokens() {
+        let t = testutil::app().await;
+        let db = &t.state.db;
+        let (uid, first) = testutil::create_user(db, "alice", "pw", false).await;
+        let (_, other_user) = testutil::create_user(db, "bob", "", false).await;
+        // 49 more, inserted in order but used longer ago the later they were made: eviction goes
+        // by last use, not by creation.
+        let now = crate::common::now() as i64;
+        let mut old = Vec::new();
+        for i in 0..MAX_TOKENS - 1 {
+            let token = auth::new_token();
+            sqlx::query("insert into token(token_hash, user_id, created_at, last_used_at) values(?, ?, ?, ?)")
+                .bind(auth::token_hash(&token))
+                .bind(uid)
+                .bind(now - 5000)
+                .bind(now - 1000 - i)
+                .execute(db)
+                .await
+                .unwrap();
+            old.push(token);
+        }
+        let works = |token: String| {
+            let app = t.app.clone();
+            async move { send(&app, "POST", "/api/currentUser", Some(&token), "").await.0 }
+        };
+        let count = || async {
+            let n: i64 = sqlx::query_scalar("select count(*) from token where user_id = ?")
+                .bind(uid)
+                .fetch_one(db)
+                .await
+                .unwrap();
+            n
+        };
+        assert_eq!(count().await, MAX_TOKENS);
+
+        // The 51st token evicts the least recently used one; the 52nd the next.
+        let (status, v) = login_as(&t.app, "alice", "pw", "", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(count().await, MAX_TOKENS);
+        assert_eq!(works(old[48].clone()).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(works(old[47].clone()).await, StatusCode::OK);
+        let (status, _) = login_as(&t.app, "alice", "pw", "", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(count().await, MAX_TOKENS);
+        // old[47] was just used, so old[46] goes.
+        assert_eq!(works(old[46].clone()).await, StatusCode::UNAUTHORIZED);
+        for token in [first, old[0].clone(), old[47].clone(), v["access_token"].as_str().unwrap().to_owned()] {
+            assert_eq!(works(token).await, StatusCode::OK);
+        }
+        // Other users' tokens are not touched.
+        assert_eq!(works(other_user).await, StatusCode::OK);
     }
 
     #[tokio::test]

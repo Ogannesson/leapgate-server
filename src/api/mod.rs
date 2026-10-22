@@ -181,6 +181,10 @@ pub(crate) fn parse_json<T: DeserializeOwned>(body: &[u8]) -> Result<T, ApiError
     serde_json::from_slice(body).map_err(|err| ApiError::bad_request(&format!("Invalid request body: {err}")))
 }
 
+/// Largest page: one `/api/ab/peers` page is parsed into memory whole. The client always asks for
+/// 100 (`pageSize = 100` in flutter/lib/models/ab_model.dart and group_model.dart, note 04 §1.1).
+const MAX_PAGE_SIZE: i64 = 1000;
+
 /// `current`, `pageSize`, `status` (the group panel's user filter) and `ab` (`/api/ab/peers`);
 /// unknown parameters (`accessible`) are ignored.
 #[derive(Debug, Default, Deserialize)]
@@ -198,7 +202,9 @@ impl PageQuery {
         self.status.as_deref().and_then(|s| s.trim().parse().ok())
     }
 
-    /// `(offset, limit)` for SQL; `current` starts at 1, `pageSize` defaults to 100 and is never lowered.
+    /// `(offset, limit)` for SQL; `current` starts at 1, `pageSize` defaults to 100 and is capped at
+    /// `MAX_PAGE_SIZE` (never below what the client asks: it always sends 100). Callers report the
+    /// full `total`, and the client keeps paging by it.
     pub fn offset_limit(&self) -> (i64, i64) {
         let parse = |v: &Option<String>, default: i64| {
             v.as_deref()
@@ -207,7 +213,7 @@ impl PageQuery {
                 .unwrap_or(default)
         };
         let current = parse(&self.current, 1);
-        let size = parse(&self.page_size, 100);
+        let size = parse(&self.page_size, 100).min(MAX_PAGE_SIZE);
         (current.saturating_sub(1).saturating_mul(size), size)
     }
 }
@@ -467,6 +473,9 @@ mod tests {
         assert_eq!(q(Some("3"), Some("100")).offset_limit(), (200, 100));
         assert_eq!(q(Some("0"), Some("x")).offset_limit(), (0, 100));
         assert_eq!(q(Some("2"), Some("500")).offset_limit(), (500, 500));
+        assert_eq!(q(Some("1"), Some("1000")).offset_limit(), (0, 1000));
+        assert_eq!(q(Some("3"), Some("1001")).offset_limit(), (2000, 1000));
+        assert_eq!(q(None, Some("99999999999")).offset_limit(), (0, 1000));
     }
 
     #[test]
