@@ -1,6 +1,6 @@
 //! Account endpoints (PORTA.md §9.2, §11; note 03 §2).
 
-use super::{ok_json, parse_json, ApiError, ApiResult, CurrentUser};
+use super::{device::uuid_matches, ok_json, parse_json, ApiError, ApiResult, CurrentUser};
 use crate::{
     auth::{self, PasswordCheck},
     state::AppState,
@@ -191,7 +191,7 @@ pub(crate) async fn login(State(state): State<AppState>, body: Bytes) -> ApiResu
     .execute(&state.db)
     .await?;
 
-    if !req.id.is_empty() && uuid_matches(&state, &req.id, &req.uuid).await? {
+    if !req.id.is_empty() && uuid_matches(&state.db, &req.id, Some(&req.uuid)).await? {
         sqlx::query(
             "insert into device(id, uuid, user_id, first_seen_at, last_seen_at) values(?, ?, ?, ?, ?)
              on conflict(id) do update set user_id = excluded.user_id",
@@ -213,14 +213,6 @@ pub(crate) async fn login(State(state): State<AppState>, body: Bytes) -> ApiResu
         access_token: token,
         user,
     }))
-}
-
-/// The weak check of §9.3: when hbbs' `peer` table knows `id`, `uuid` must base64-decode to its uuid.
-async fn uuid_matches(state: &AppState, id: &str, uuid: &str) -> Result<bool, ApiError> {
-    let Some(peer) = state.pm.db.get_peer(id).await? else {
-        return Ok(true);
-    };
-    Ok(base64::decode(uuid).is_ok_and(|b| b == peer.uuid))
 }
 
 /// `POST /api/currentUser`: ignores the body; internal errors answer 200 + `{"error"}` (`ApiError::ok_internal`).
