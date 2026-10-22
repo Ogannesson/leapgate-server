@@ -4,7 +4,7 @@
 //! timer; checked: a connection that sends half a head stays open), and it has no connection cap.
 //! The request timeout and the body limits live in the router (`super::router`).
 
-use crate::conn_tracker::source_key;
+use crate::conn_limit::{ConnLimiter, ConnPermit};
 use axum::{extract::ConnectInfo, http::Request, Router};
 use hbb_common::{
     log, throttled_log,
@@ -12,7 +12,6 @@ use hbb_common::{
         self,
         io::{AsyncRead, AsyncWrite, ReadBuf},
         net::{TcpListener, TcpStream},
-        sync::{OwnedSemaphorePermit, Semaphore},
         time::{Instant, Sleep},
     },
 };
@@ -22,26 +21,21 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use std::{
-    collections::HashMap,
     future::Future,
     io,
-    net::IpAddr,
     pin::Pin,
-    sync::{Arc, Mutex},
     task::{Context, Poll},
     time::Duration,
 };
 use tower::ServiceExt as _;
 
 // Fixed, not configurable. Sized for a personal deployment (tens of devices).
-/// Concurrent connections in all. A client holds one or two at a time (reports and the address
-/// book go through its HTTP client's pool), so this covers a few hundred devices. Behind a reverse
-/// proxy on this host (the recommended setup) every client arrives from loopback and counts only
-/// here. Worst case held: 512 × (`MAX_BUF` + socket and task) ≈ 15 MB.
+/// Concurrent connections in all, besides `conn_limit::MAX_CONNS_PER_SOURCE` per source (loopback
+/// excepted) as on the rendezvous ports. A client holds one or two at a time (reports and the
+/// address book go through its HTTP client's pool), so this covers a few hundred devices. Behind a
+/// reverse proxy on this host (the recommended setup) every client arrives from loopback and counts
+/// only here. Worst case held: 512 × (`MAX_BUF` + socket and task) ≈ 15 MB.
 const MAX_CONNS: usize = 512;
-/// Concurrent connections per source (an IPv4 address or an IPv6 /64), loopback excepted: a
-/// company NAT with a dozen machines fits. Same as on the rendezvous ports.
-const MAX_CONNS_PER_SOURCE: usize = 32;
 /// Time to receive a request head, from the start of the connection or the end of the previous
 /// response (hyper restarts it for every head, so it is also the keep-alive idle timeout). A real
 /// head is a single packet.
@@ -62,7 +56,7 @@ const MAX_BUF: usize = 16 * 1024;
 
 /// Serves `app` on `listener`; returns only if the runtime goes away.
 pub(super) async fn serve(listener: TcpListener, app: Router) {
-    let limiter = Limiter::new(MAX_CONNS);
+    let limiter = ConnLimiter::new(MAX_CONNS);
     loop {
         let (stream, addr) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -101,77 +95,16 @@ pub(super) async fn serve(listener: TcpListener, app: Router) {
     }
 }
 
-/// Open connections: at most `total` in all and `MAX_CONNS_PER_SOURCE` per source. A loopback peer
-/// only counts toward the total (a reverse proxy on this host carries every client).
-struct Limiter {
-    total: Arc<Semaphore>,
-    sources: SourceCounts,
-}
-
-/// Open connections per source; a source's key goes with its last connection.
-type SourceCounts = Arc<Mutex<HashMap<IpAddr, usize>>>;
-
-/// Held for the life of one connection; gives its slots back when dropped.
-struct Permit {
-    _total: OwnedSemaphorePermit,
-    source: Option<(IpAddr, SourceCounts)>,
-}
-
-impl Limiter {
-    fn new(total: usize) -> Self {
-        Self {
-            total: Arc::new(Semaphore::new(total)),
-            sources: Default::default(),
-        }
-    }
-
-    fn try_acquire(&self, ip: IpAddr) -> Option<Permit> {
-        let total = self.total.clone().try_acquire_owned().ok()?;
-        let ip = ip.to_canonical();
-        if ip.is_loopback() {
-            return Some(Permit {
-                _total: total,
-                source: None,
-            });
-        }
-        let key = source_key(ip);
-        let mut sources = self.sources.lock().unwrap();
-        let n = sources.entry(key).or_insert(0);
-        if *n >= MAX_CONNS_PER_SOURCE {
-            return None;
-        }
-        *n += 1;
-        Some(Permit {
-            _total: total,
-            source: Some((key, self.sources.clone())),
-        })
-    }
-}
-
-impl Drop for Permit {
-    fn drop(&mut self) {
-        if let Some((key, sources)) = &self.source {
-            let mut sources = sources.lock().unwrap();
-            if let Some(n) = sources.get_mut(key) {
-                *n -= 1;
-                if *n == 0 {
-                    sources.remove(key);
-                }
-            }
-        }
-    }
-}
-
 /// The accepted socket with its connection slot and the `IO_IDLE_TIMEOUT` deadline, pushed back
 /// whenever a byte moves; an operation still pending past it fails with `TimedOut`.
 struct Guarded {
     io: TcpStream,
     idle: Pin<Box<Sleep>>,
-    _permit: Permit,
+    _permit: ConnPermit,
 }
 
 impl Guarded {
-    fn new(io: TcpStream, permit: Permit) -> Self {
+    fn new(io: TcpStream, permit: ConnPermit) -> Self {
         Self {
             io,
             idle: Box::pin(tokio::time::sleep(IO_IDLE_TIMEOUT)),
@@ -246,27 +179,5 @@ impl AsyncWrite for Guarded {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn limiter_counts_per_source_and_total() {
-        let l = Limiter::new(MAX_CONNS_PER_SOURCE + 2);
-        let a: [IpAddr; 2] = ["2001:db8:c::1".parse().unwrap(), "2001:db8:c:0:1::1".parse().unwrap()];
-        let mut held: Vec<_> = (0..MAX_CONNS_PER_SOURCE).map(|i| l.try_acquire(a[i % 2]).unwrap()).collect();
-        assert!(l.try_acquire(a[0]).is_none(), "connection N+1 from one /64");
-        // Other sources fit up to the total; loopback only counts toward the total.
-        let b = l.try_acquire("::ffff:198.51.100.1".parse().unwrap()).unwrap();
-        let lo = l.try_acquire("127.0.0.1".parse().unwrap()).unwrap();
-        assert!(l.try_acquire("::1".parse().unwrap()).is_none(), "total reached");
-        drop((b, lo));
-        held.pop();
-        assert!(l.try_acquire(a[1]).is_some(), "a slot freed by the source");
-        drop(held);
-        assert!(l.sources.lock().unwrap().is_empty(), "keys go with their last connection");
     }
 }

@@ -1,17 +1,25 @@
 //! Address book, the 12 endpoints of the new protocol (PORTA.md §12; note 04).
 //! Writes succeed with 200 + empty body only; `personal`, `settings`, `shared/profiles` never 404.
 
-use super::{ok_empty, ok_json, ok_json_bytes, parse_json, ApiError, ApiResult, CurrentUser, PageQuery};
+use super::{ok_empty, ok_json, parse_json, ApiError, ApiResult, CurrentUser, PageQuery, JSON};
 use crate::{peer::MAX_PEER_ID_LEN, state::AppState};
 use axum::{
     body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{header, StatusCode},
+    response::IntoResponse,
 };
+use hbb_common::tokio::sync::OwnedSemaphorePermit;
+use hyper::body::{Body as HttpBody, Frame, SizeHint};
 use serde_derive::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sqlx::{SqliteConnection, SqlitePool};
-use std::io::Write as _;
+use std::{
+    convert::Infallible,
+    io::Write as _,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 /// The client recognizes the personal book by this name (note 04 §6).
 const PERSONAL_NAME: &str = "My address book";
@@ -174,6 +182,8 @@ pub(crate) async fn peers(
 ) -> ApiResult {
     let guid = page.ab.as_deref().unwrap_or_default();
     let personal = check(&state.db, &user, guid, READ).await?;
+    // Waits in line; the request timeout (20 s, §9.4) bounds the wait.
+    let slot = state.ab_pages.clone().acquire_owned().await.map_err(ApiError::internal)?;
     let total: i64 = sqlx::query_scalar("select count(*) from ab_peer where ab_guid = ?")
         .bind(guid)
         .fetch_one(&state.db)
@@ -218,7 +228,51 @@ pub(crate) async fn peers(
         serde_json::to_writer(&mut out, &peer).map_err(ApiError::internal)?;
     }
     out.extend_from_slice(b"]}");
-    Ok(ok_json_bytes(out))
+    let body = PageBody {
+        rest: Bytes::from(out),
+        _slot: slot,
+    };
+    Ok(([(header::CONTENT_TYPE, JSON)], axum::body::Body::new(body)).into_response())
+}
+
+/// `/api/ab/peers` pages built or being sent at once, from all users (review C-14); more wait in
+/// line. A page of 1000 of the largest rows peaks at ~36 MB while built (rows read + response) and
+/// holds ~18 MB until sent, so at most ~8 × 36 MB; the client asks for 100 rows, a tenth of that.
+/// The slot goes with the response body: a client that stops reading keeps it until the socket
+/// timeout drops the connection (§9.4), so a per-handler limit would not bound this memory.
+pub(crate) const MAX_PAGES: usize = 8;
+/// A page goes to hyper in frames of this size: it asks for the next one when the previous is
+/// written out, so the body (and its slot) ends with the last frame instead of when it is queued.
+const PAGE_FRAME: usize = 64 * 1024;
+
+/// A page's response body, holding its `MAX_PAGES` slot until the last frame is taken or the
+/// connection drops. Frames share one allocation, freed with the last.
+struct PageBody {
+    rest: Bytes,
+    _slot: OwnedSemaphorePermit,
+}
+
+impl HttpBody for PageBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+        let rest = &mut self.get_mut().rest;
+        if rest.is_empty() {
+            return Poll::Ready(None);
+        }
+        let frame = rest.split_to(rest.len().min(PAGE_FRAME));
+        Poll::Ready(Some(Ok(Frame::data(frame))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.rest.is_empty()
+    }
+
+    /// Exact, so the response carries a `Content-Length` as before.
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(self.rest.len() as u64)
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1316,6 +1370,45 @@ mod tests {
         let (_, _, body) =
             send(&t.app, "POST", &format!("/api/ab/peers?current=2&pageSize=2&ab={book}"), Some(&token), "").await;
         assert_eq!(&body[..], br#"{"total":5,"data":[{"id":"p2","tags":[]},{"id":"p3","tags":[]}]}"#);
+    }
+
+    /// At most `MAX_PAGES` pages at once, counted until their response bodies are gone: the next
+    /// request waits for one to be read out or dropped (a client that stops reading).
+    #[tokio::test]
+    async fn pages_in_flight_are_capped() {
+        use tower::ServiceExt as _;
+        let t = testutil::app().await;
+        let (_, token) = testutil::create_user(&t.state.db, "alice", "", false).await;
+        let book = personal_guid(&t.app, &token).await;
+        write_ok(&t.app, "POST", &format!("/api/ab/peer/add/{book}"), &token, r#"{"id":"p0"}"#).await;
+        let request = || {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/api/ab/peers?ab={book}"))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        // Answered, bodies not read: every slot held.
+        let mut held = Vec::new();
+        for _ in 0..MAX_PAGES {
+            let resp = t.app.clone().oneshot(request()).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            held.push(resp);
+        }
+        assert_eq!(t.state.ab_pages.available_permits(), 0);
+        let ninth = tokio::spawn(t.app.clone().oneshot(request()));
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(!ninth.is_finished(), "the ninth page waits for a slot");
+        // One body read to the end gives its slot back, and the ninth goes ahead.
+        let body = axum::body::to_bytes(held.pop().unwrap().into_body(), usize::MAX).await.unwrap();
+        assert_eq!(js(&body)["total"], 1);
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), ninth).await.unwrap().unwrap().unwrap();
+        // An exact length, so hyper sends a Content-Length (not chunked) as before.
+        assert_eq!(resp.body().size_hint().exact(), Some(body.len() as u64));
+        // Bodies dropped unread (the connection gone) give theirs back too.
+        drop((resp, held));
+        assert_eq!(t.state.ab_pages.available_permits(), MAX_PAGES);
     }
 
     #[tokio::test]

@@ -9,6 +9,7 @@ mod api;
 mod auth;
 pub mod cli;
 mod config;
+mod conn_limit;
 mod conn_tracker;
 mod crypto;
 mod import;

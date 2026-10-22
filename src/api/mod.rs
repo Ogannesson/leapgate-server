@@ -117,11 +117,6 @@ pub(crate) fn ok_json<T: Serialize + ?Sized>(value: &T) -> Response {
     json(StatusCode::OK, value)
 }
 
-/// 200 + JSON serialized by the caller.
-pub(crate) fn ok_json_bytes(body: Vec<u8>) -> Response {
-    (StatusCode::OK, [(header::CONTENT_TYPE, JSON)], body).into_response()
-}
-
 /// 200 + empty body (address book writes, audit success).
 pub(crate) fn ok_empty() -> Response {
     StatusCode::OK.into_response()
@@ -387,12 +382,17 @@ async fn json_rejections(req: Request<Body>, next: Next) -> Response {
     json
 }
 
+/// Whether an internal error on `path` answers 200 + `{"error"}` (§9.1 item 1): the audit
+/// endpoints (the client retries) and `/api/currentUser` (a 400 would log the user out); the
+/// others answer 400 + `{"error"}`.
+fn internal_error_is_200(path: &str) -> bool {
+    path.starts_with("/api/audit/") || path == "/api/currentUser"
+}
+
 /// A request not answered within `listen::REQUEST_TIMEOUT` (receiving its body included) gets an
-/// internal-error answer (§9.1): 200 + `{"error"}` from the audit endpoints (the client retries)
-/// and `/api/currentUser` (a 400 would log the user out), 400 + `{"error"}` from the others.
+/// internal-error answer (`internal_error_is_200`).
 async fn request_timeout(req: Request<Body>, next: Next) -> Response {
-    let path = req.uri().path();
-    let ok_status = path.starts_with("/api/audit/") || path == "/api/currentUser";
+    let ok_status = internal_error_is_200(req.uri().path());
     match tokio::time::timeout(listen::REQUEST_TIMEOUT, next.run(req)).await {
         Ok(resp) => resp,
         Err(_) if ok_status => ok_error("Request timeout"),
@@ -400,13 +400,14 @@ async fn request_timeout(req: Request<Body>, next: Next) -> Response {
     }
 }
 
-/// A panicking handler answers like any other internal error instead of dropping the connection
-/// (needs `panic = "unwind"`, the default; the release profile no longer aborts).
+/// A panicking handler answers like any other internal error (`internal_error_is_200`) instead of
+/// dropping the connection (needs `panic = "unwind"`, the default; the release profile no longer
+/// aborts).
 async fn catch_panic(req: Request<Body>, next: Next) -> Response {
-    let audit = req.uri().path().starts_with("/api/audit/");
+    let ok_status = internal_error_is_200(req.uri().path());
     match AssertUnwindSafe(next.run(req)).catch_unwind().await {
         Ok(resp) => resp,
-        Err(_) if audit => ok_internal("handler panicked"),
+        Err(_) if ok_status => ok_internal("handler panicked"),
         Err(_) => ApiError::internal("handler panicked").0,
     }
 }
@@ -541,14 +542,18 @@ mod tests {
         let app = axum::Router::new()
             .route("/x", get(boom))
             .route("/api/audit/x", get(boom))
+            .route("/api/currentUser", post(boom))
             .layer(middleware::from_fn(catch_panic));
         let (status, ct, body) = send(&app, "GET", "/x", None, "").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(ct, JSON);
         assert_eq!(&body[..], br#"{"error":"Server error"}"#);
-        let (status, _, body) = send(&app, "GET", "/api/audit/x", None, "").await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(&body[..], br#"{"error":"Server error"}"#);
+        // A 400 from currentUser would log the user out (§9.1 item 1).
+        for (method, path) in [("GET", "/api/audit/x"), ("POST", "/api/currentUser")] {
+            let (status, ct, body) = send(&app, method, path, None, "").await;
+            assert_eq!((status, ct.as_str()), (StatusCode::OK, JSON), "{path}");
+            assert_eq!(&body[..], br#"{"error":"Server error"}"#, "{path}");
+        }
     }
 
     #[test]

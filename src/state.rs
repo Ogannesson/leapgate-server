@@ -3,7 +3,7 @@
 use crate::{
     config::Config, conn_tracker::ConnTracker, crypto::SecretBox, peer::PeerMap, router::Router,
 };
-use hbb_common::{bail, ResultType};
+use hbb_common::{bail, tokio::sync::Semaphore, ResultType};
 use sqlx::SqlitePool;
 use std::{path::Path, sync::Arc};
 
@@ -16,6 +16,9 @@ pub(crate) struct AppState {
     pub tracker: Arc<ConnTracker>,
     pub secret: Arc<SecretBox>,
     pub cfg: Arc<Config>,
+    /// `/api/ab/peers` pages being built or sent (`api::ab::MAX_PAGES`); a slot goes with the
+    /// response body.
+    pub ab_pages: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -46,6 +49,7 @@ impl AppState {
             tracker: Arc::new(ConnTracker::new(db.clone())),
             secret: Arc::new(SecretBox::load_or_create(secret_key_file)?),
             cfg,
+            ab_pages: Arc::new(Semaphore::new(crate::api::ab::MAX_PAGES)),
             db,
         })
     }

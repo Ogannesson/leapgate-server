@@ -1,4 +1,5 @@
 use crate::common::*;
+use crate::conn_limit::ConnLimiter;
 use crate::conn_tracker::{
     clip, source_key, PunchRequest, RelayRequest, RelayResponseInfo, Reply, ReplyKind, Signal,
 };
@@ -26,7 +27,7 @@ use hbb_common::{
         self,
         io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
         net::{TcpListener, TcpStream},
-        sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore},
+        sync::{mpsc, Mutex},
         time::{interval, Duration},
     },
     tokio_util::codec::Framed,
@@ -83,8 +84,6 @@ const MAX_CONNS: usize = 2048;
 /// Concurrent connections on 21115. One serves a single request and closes, but may hold a
 /// 128 KB frame: ~136 KB a connection, ~35 MB at worst.
 const MAX_ONLINE_CONNS: usize = 256;
-/// Concurrent connections per source and port; tens, so a company NAT with many machines fits.
-const MAX_CONNS_PER_SOURCE: usize = 32;
 /// New ids registered per minute from all sources together (new: neither in `PeerMap` nor in the
 /// database), a backstop for `RegisterPk`s spread over many sources; each one is a `peer` row that
 /// is never deleted, so at most ~29,000 a day under a sustained flood. A personal deployment adds a
@@ -139,69 +138,7 @@ impl LookupBudget {
     }
 }
 
-/// Concurrent connections on one rendezvous port (review A-4): at most `total` in all and at most
-/// `MAX_CONNS_PER_SOURCE` per source (an IPv4 address or an IPv6 /64, `source_key`). A loopback
-/// peer only counts toward the total: a reverse proxy on the same host carries every WSS client.
-#[derive(Clone)]
-struct ConnLimiter {
-    total: Arc<Semaphore>,
-    sources: SourceCounts,
-}
-
-/// Open connections per source; a source's key goes with its last connection.
-type SourceCounts = Arc<std::sync::Mutex<HashMap<IpAddr, usize>>>;
-
-/// Held for the life of one connection; gives its slots back when dropped.
-struct ConnPermit {
-    _total: OwnedSemaphorePermit,
-    source: Option<(IpAddr, SourceCounts)>,
-}
-
-impl ConnLimiter {
-    fn new(total: usize) -> Self {
-        Self {
-            total: Arc::new(Semaphore::new(total)),
-            sources: Default::default(),
-        }
-    }
-
-    fn try_acquire(&self, ip: IpAddr) -> Option<ConnPermit> {
-        let total = self.total.clone().try_acquire_owned().ok()?;
-        let ip = ip.to_canonical();
-        if ip.is_loopback() {
-            return Some(ConnPermit {
-                _total: total,
-                source: None,
-            });
-        }
-        let key = source_key(ip);
-        let mut sources = self.sources.lock().unwrap();
-        let n = sources.entry(key).or_insert(0);
-        if *n >= MAX_CONNS_PER_SOURCE {
-            return None;
-        }
-        *n += 1;
-        Some(ConnPermit {
-            _total: total,
-            source: Some((key, self.sources.clone())),
-        })
-    }
-}
-
-impl Drop for ConnPermit {
-    fn drop(&mut self) {
-        if let Some((key, sources)) = &self.source {
-            let mut sources = sources.lock().unwrap();
-            if let Some(n) = sources.get_mut(key) {
-                *n -= 1;
-                if *n == 0 {
-                    sources.remove(key);
-                }
-            }
-        }
-    }
-}
-
+/// Concurrent connections per rendezvous port (review A-4, `ConnLimiter`).
 #[derive(Clone)]
 struct ConnLimits {
     tcp: ConnLimiter,
@@ -2027,6 +1964,7 @@ async fn create_tcp_listener(bind_addr: Option<IpAddr>, port: i32) -> ResultType
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conn_limit::MAX_CONNS_PER_SOURCE;
 
     #[hbb_common::tokio::test]
     async fn udp_listener_uses_bind_address() {
@@ -2932,10 +2870,7 @@ mod tests {
     /// closed without an answer.
     #[hbb_common::tokio::test]
     async fn online_port_connection_limit() {
-        assert_eq!(
-            ConnLimits::default().online.total.available_permits(),
-            MAX_ONLINE_CONNS
-        );
+        assert_eq!(ConnLimits::default().online.available(), MAX_ONLINE_CONNS);
         let conns = ConnLimits {
             online: ConnLimiter::new(1),
             ..Default::default()
@@ -3002,25 +2937,6 @@ mod tests {
         changes.insert("over".to_owned(), (change_over, Default::default()));
         retain_live_ip_changes(&mut changes);
         assert_eq!(changes.keys().collect::<Vec<_>>(), ["live"]);
-    }
-
-    #[test]
-    fn conn_limiter_per_source_and_total() {
-        let l = ConnLimiter::new(MAX_CONNS_PER_SOURCE + 2);
-        let a: [IpAddr; 2] = ["2001:db8:c::1".parse().unwrap(), "2001:db8:c:0:1::1".parse().unwrap()];
-        let mut held: Vec<_> = (0..MAX_CONNS_PER_SOURCE)
-            .map(|i| l.try_acquire(a[i % 2]).unwrap())
-            .collect();
-        assert!(l.try_acquire(a[0]).is_none(), "connection N+1 from one /64");
-        // Other sources fit up to the total; loopback only counts toward the total.
-        let b = l.try_acquire("::ffff:198.51.100.1".parse().unwrap()).unwrap();
-        let lo = l.try_acquire("127.0.0.1".parse().unwrap()).unwrap();
-        assert!(l.try_acquire("198.51.100.2".parse().unwrap()).is_none(), "total");
-        drop((b, lo));
-        held.pop();
-        assert!(l.try_acquire(a[1]).is_some(), "a slot comes back when its connection ends");
-        drop(held);
-        assert!(l.sources.lock().unwrap().is_empty(), "a source's key goes with its last connection");
     }
 
     #[hbb_common::tokio::test]
