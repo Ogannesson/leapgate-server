@@ -11,7 +11,10 @@ use serde_derive::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::Semaphore;
@@ -21,6 +24,10 @@ const FAIL_WINDOW: Duration = Duration::from_secs(15 * 60);
 const MAX_FAILS: usize = 5;
 /// Longer names are refused before the lookup, so request bodies cannot make big keys.
 pub(crate) const MAX_NAME_LEN: usize = 128;
+/// Password checks that may wait per argon2 slot. A burst of real logins then waits at most a few
+/// check times (tens of milliseconds each); beyond it, unauthenticated requests (unknown names are
+/// not rate limited, §11) would only queue up ahead of real logins, each holding its password.
+const QUEUE_PER_SLOT: usize = 4;
 
 #[derive(Default)]
 struct FailState {
@@ -35,11 +42,58 @@ lazy_static::lazy_static! {
     /// Only names of existing users, so at most one entry per user; a name's stale failures are
     /// dropped when it is next used, never by scanning the whole map.
     static ref LOGIN_FAILS: Mutex<HashMap<String, FailState>> = Default::default();
-    /// Password checks running at once: each argon2 check takes ~19 MiB and a core for tens of
-    /// milliseconds, so more than one per core only adds memory. The rest wait their turn.
-    static ref ARGON2_SLOTS: Arc<Semaphore> = Arc::new(Semaphore::new(
-        std::thread::available_parallelism().map_or(1, |n| n.get())
-    ));
+    static ref ARGON2: Argon2Slots =
+        Argon2Slots::new(std::thread::available_parallelism().map_or(1, |n| n.get()));
+}
+
+/// Password checks running at once: each argon2 check takes ~19 MiB and a core for tens of
+/// milliseconds, so more than one per core only adds memory. The rest wait their turn, up to
+/// `QUEUE_PER_SLOT` per slot; past that new checks are refused with 429.
+struct Argon2Slots {
+    slots: Arc<Semaphore>,
+    waiting: AtomicUsize,
+    max_waiting: usize,
+}
+
+impl Argon2Slots {
+    fn new(slots: usize) -> Self {
+        Self {
+            slots: Arc::new(Semaphore::new(slots)),
+            waiting: AtomicUsize::new(0),
+            max_waiting: QUEUE_PER_SLOT * slots,
+        }
+    }
+
+    /// Runs `f` on the blocking pool once a slot is free. The permit moves into the task, so a
+    /// client that goes away does not free it early; one that goes away while waiting leaves the queue.
+    async fn run<T: Send + 'static>(&self, f: impl FnOnce() -> T + Send + 'static) -> Result<T, ApiError> {
+        let max = self.max_waiting;
+        if self
+            .waiting
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < max).then_some(n + 1))
+            .is_err()
+        {
+            return Err(ApiError::new(StatusCode::TOO_MANY_REQUESTS, "Too many login attempts, try again later"));
+        }
+        let waiting = Waiting(&self.waiting);
+        let permit = self.slots.clone().acquire_owned().await.map_err(ApiError::internal)?;
+        drop(waiting);
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            f()
+        })
+        .await
+        .map_err(ApiError::internal)
+    }
+}
+
+/// One place in [`Argon2Slots`]' queue, given back when dropped.
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// A login attempt on an existing user, counted from the limit check on, so concurrent attempts
@@ -170,7 +224,9 @@ struct LoginResponse {
 
 /// `POST /api/login`, `type=account` only.
 pub(crate) async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult {
-    let req: LoginRequest = parse_json(&body)?;
+    let mut req: LoginRequest = parse_json(&body)?;
+    // Waiting for a password check holds only what the login still needs (`QUEUE_PER_SLOT`).
+    drop(body);
     if req.typ.as_deref().is_some_and(|t| t != "account") {
         return Err(ApiError::bad_request("Unsupported login type"));
     }
@@ -187,22 +243,23 @@ pub(crate) async fn login(State(state): State<AppState>, body: Bytes) -> ApiResu
         Some(_) => Some(Attempt::begin(&req.username).ok_or_else(|| {
             ApiError::new(StatusCode::TOO_MANY_REQUESTS, "Too many failed attempts, try again later")
         })?),
-        None => None,
+        None => {
+            // An unknown name never gets past the check: its device fields are not needed.
+            (req.id, req.uuid) = Default::default();
+            None
+        }
     };
     let (uid, stored, status) = row.unwrap_or_default();
     // argon2 takes tens of milliseconds of CPU: keep it off the async workers, a few at a time.
-    // The permit moves into the task, so a client that goes away does not free it early.
-    let permit = ARGON2_SLOTS.clone().acquire_owned().await.map_err(ApiError::internal)?;
-    let password = req.password.clone();
+    let password = std::mem::take(&mut req.password);
     let checked = stored.clone();
-    let (check, upgraded) = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        let check = auth::verify_password(&password, &checked);
-        let upgraded = (check == PasswordCheck::OkNeedsUpgrade).then(|| auth::hash_password(&password));
-        (check, upgraded)
-    })
-    .await
-    .map_err(ApiError::internal)?;
+    let (check, upgraded) = ARGON2
+        .run(move || {
+            let check = auth::verify_password(&password, &checked);
+            let upgraded = (check == PasswordCheck::OkNeedsUpgrade).then(|| auth::hash_password(&password));
+            (check, upgraded)
+        })
+        .await?;
     let matched = check != PasswordCheck::Mismatch;
     if let Some(attempt) = attempt {
         attempt.finish(matched);
@@ -500,13 +557,53 @@ mod tests {
         let t = testutil::app().await;
         testutil::create_user(&t.state.db, "ps-paul", "pw", false).await;
         let slots = std::thread::available_parallelism().map_or(1, |n| n.get()) as u32;
-        let all = ARGON2_SLOTS.clone().acquire_many_owned(slots).await.unwrap();
+        let all = ARGON2.slots.clone().acquire_many_owned(slots).await.unwrap();
         let app = t.app.clone();
         let mut login = tokio::spawn(async move { login_as(&app, "ps-paul", "pw", "", "").await.0 });
         let waited = tokio::time::timeout(Duration::from_millis(300), &mut login).await;
         assert!(waited.is_err(), "login finished while every slot was taken");
         drop(all);
         assert_eq!(login.await.unwrap(), StatusCode::OK);
+    }
+
+    /// A pool of its own: filling the global queue would refuse the other tests' logins.
+    #[tokio::test]
+    async fn password_check_queue_is_bounded() {
+        let pool = Arc::new(Argon2Slots::new(1));
+        let held = pool.slots.clone().acquire_owned().await.unwrap();
+        let waiters: Vec<_> = (0..QUEUE_PER_SLOT)
+            .map(|i| {
+                let pool = pool.clone();
+                tokio::spawn(async move { pool.run(move || i).await.ok() })
+            })
+            .collect();
+        while pool.waiting.load(Ordering::SeqCst) < QUEUE_PER_SLOT {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let Err(ApiError(resp)) = pool.run(|| ()).await else {
+            panic!("a full queue took another check");
+        };
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], br#"{"error":"Too many login attempts, try again later"}"#);
+
+        // A waiter whose client went away gives its place back.
+        let mut waiters = waiters.into_iter();
+        let gone = waiters.next().unwrap();
+        gone.abort();
+        assert!(gone.await.is_err());
+        assert_eq!(pool.waiting.load(Ordering::SeqCst), QUEUE_PER_SLOT - 1);
+        let late = {
+            let pool = pool.clone();
+            tokio::spawn(async move { pool.run(|| QUEUE_PER_SLOT).await.ok() })
+        };
+
+        drop(held);
+        for (i, w) in waiters.enumerate() {
+            assert_eq!(w.await.unwrap(), Some(i + 1));
+        }
+        assert_eq!(late.await.unwrap(), Some(QUEUE_PER_SLOT));
+        assert_eq!(pool.waiting.load(Ordering::SeqCst), 0);
     }
 
     /// `user passwd` lands while a login with the old password is past the lookup: the login gets
@@ -526,7 +623,7 @@ mod tests {
             .unwrap();
         for (uid, name) in [(aid, "pc-rita"), (bid, "pc-sam")] {
             // Hold the login between reading the stored hash and checking it.
-            let all = ARGON2_SLOTS.clone().acquire_many_owned(slots).await.unwrap();
+            let all = ARGON2.slots.clone().acquire_many_owned(slots).await.unwrap();
             let app = t.app.clone();
             let mut login = tokio::spawn(async move { login_as(&app, name, "old", "", "").await.0 });
             assert!(tokio::time::timeout(Duration::from_millis(300), &mut login).await.is_err());
