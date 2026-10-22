@@ -20,7 +20,7 @@ use std::{
 /// Keyed by source (`conn_tracker::source_key`: an IPv4 address or an IPv6 /64).
 pub(crate) type IpBlockMap = HashMap<IpAddr, ((u32, Instant), (HashSet<String>, Instant))>;
 type UserStatusMap = HashMap<Vec<u8>, Arc<(Option<Vec<u8>>, bool)>>;
-type IpChangesMap = HashMap<String, (Instant, HashMap<String, i32>)>;
+pub(crate) type IpChangesMap = HashMap<String, (Instant, HashMap<String, i32>)>;
 lazy_static::lazy_static! {
     pub(crate) static ref IP_BLOCKER: Mutex<IpBlockMap> = Default::default();
     pub(crate) static ref USER_STATUS: RwLock<UserStatusMap> = Default::default();
@@ -72,10 +72,12 @@ pub(crate) fn retain_live_ip_blocks(map: &mut IpBlockMap) {
 /// rules of the console `ib`/`ic`, without `ic`'s display filter (more than one IP).
 pub(crate) async fn purge_ip_maps() {
     retain_live_ip_blocks(&mut *IP_BLOCKER.lock().await);
-    IP_CHANGES
-        .lock()
-        .await
-        .retain(|_, v| v.0.elapsed().as_secs() < IP_CHANGE_DUR_X2);
+    retain_live_ip_changes(&mut *IP_CHANGES.lock().await);
+}
+
+/// Drops the `IP_CHANGES` records started `IP_CHANGE_DUR_X2` seconds ago or earlier.
+pub(crate) fn retain_live_ip_changes(map: &mut IpChangesMap) {
+    map.retain(|_, v| v.0.elapsed().as_secs() < IP_CHANGE_DUR_X2);
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
@@ -263,7 +265,7 @@ impl PeerMap {
     /// - `socket_addr` only matters while online; `update_addr` compares `info.ip` instead when
     ///   the port is 0, as after a restart. It does not load: a peer back from eviction is asked
     ///   for `RegisterPk` again, which loads it;
-    /// - `reg_pk` counts `RegisterPk`s within 6 seconds, long over after an hour.
+    /// - `reg_pk` counts `RegisterPk`s within 6 seconds, long over by then.
     ///
     /// Callers holding a dropped entry's `Arc` keep a detached copy. Only the UDP path changes
     /// entries, and it runs serially with this; the TCP side's `get` may add one, never replace one.
