@@ -1,8 +1,12 @@
 //! Account endpoints (PORTA.md §9.2, §11; note 03 §2).
 
-use super::{device::uuid_matches, ok_json, parse_json, ApiError, ApiResult, CurrentUser};
+use super::{
+    device::{uuid_matches, MAX_UUID_LEN},
+    ok_json, parse_json, ApiError, ApiResult, CurrentUser,
+};
 use crate::{
     auth::{self, PasswordCheck},
+    peer::MAX_PEER_ID_LEN,
     state::AppState,
 };
 use axum::{body::Bytes, extract::State, http::StatusCode};
@@ -232,6 +236,11 @@ pub(crate) async fn login(State(state): State<AppState>, body: Bytes) -> ApiResu
     }
     if req.username.len() > MAX_NAME_LEN {
         return Err(ApiError::bad_request("User name too long"));
+    }
+    // Both go into the token row, and the device id from there into every `conn_attempt` row of
+    // this token's connections (§8): refused up front, like the device reports would (§9.3).
+    if req.id.len() > MAX_PEER_ID_LEN || req.uuid.len() > MAX_UUID_LEN {
+        return Err(ApiError::bad_request("Device id or uuid too long"));
     }
     let row = sqlx::query_as::<_, (i64, String, i64)>(
         "select id, password_hash, status from user where name = ?",
@@ -811,6 +820,31 @@ mod tests {
         let (status, _) = login_as(&t.app, "wc-frank", "pw", "111", &good).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(device_owner(db, "111").await, Some(uid));
+    }
+
+    #[tokio::test]
+    async fn login_refuses_overlong_device_fields() {
+        let t = testutil::app().await;
+        let db = &t.state.db;
+        testutil::create_user(db, "ol-mia", "pw", false).await;
+        let tokens = || async { sqlx::query_scalar::<_, i64>("select count(*) from token").fetch_one(db).await.unwrap() };
+        let before = tokens().await;
+        let (id, uuid) = ("i".repeat(MAX_PEER_ID_LEN), "u".repeat(MAX_UUID_LEN));
+        for (id, uuid) in [(format!("{id}i"), uuid.clone()), (id.clone(), format!("{uuid}u"))] {
+            let (status, v) = login_as(&t.app, "ol-mia", "pw", &id, &uuid).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(v, json!({"error": "Device id or uuid too long"}));
+        }
+        assert_eq!(tokens().await, before);
+        // At the limits: a normal login, recorded in the token row.
+        let (status, v) = login_as(&t.app, "ol-mia", "pw", &id, &uuid).await;
+        assert_eq!(status, StatusCode::OK);
+        let row: (String, String) = sqlx::query_as("select device_id, device_uuid from token where token_hash = ?")
+            .bind(auth::token_hash(v["access_token"].as_str().unwrap()))
+            .fetch_one(db)
+            .await
+            .unwrap();
+        assert_eq!(row, (id, uuid));
     }
 
     #[tokio::test]

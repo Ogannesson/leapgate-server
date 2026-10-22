@@ -336,6 +336,23 @@ async fn login_failures() {
     assert_eq!(s.count("token").await, 0);
 }
 
+/// §11：登录请求里设备 id 超过 253 字节或 uuid 超过 128 字节 → 400 + `{"error"}`，不发令牌、不写令牌行；
+/// 正好在上限上的照常登录。
+#[tokio::test]
+async fn login_refuses_overlong_device_fields() {
+    let s = Server::start().await;
+    s.create_user("alice", "pw", false).await;
+    let (id, uuid) = ("1".repeat(253), "u".repeat(128));
+    for (id, uuid) in [(format!("{id}1"), uuid.clone()), (id.clone(), format!("{uuid}u"))] {
+        let r = s.login("alice", "pw", &id, &uuid).await;
+        assert_eq!(r.status, 400, "{:?}", r.text());
+        r.assert_error_body();
+    }
+    assert_eq!(s.count("token").await, 0);
+    s.login_ok("alice", "pw", &id, &uuid).await;
+    assert_eq!(s.count("token").await, 1);
+}
+
 /// §11：rustdesk-api 导入的 bcrypt（`$2a$/$2b$/$2y$`）和 `md5:<hex>`（md5(明文+"rustdesk-api")）能登录，
 /// 校验通过后当场改存 argon2id；错误密码不改存。
 #[tokio::test]
