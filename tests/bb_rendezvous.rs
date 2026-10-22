@@ -651,3 +651,52 @@ async fn ws_x_real_ip_trusted_only_from_loopback() {
     let seen = ws_punch_seen_by_b(&server, &mut b, &local.to_string(), spoofed).await;
     assert_eq!(seen, local, "直连 21118 时伪造的 X-Real-IP 不能被信任，应使用 TCP 对端地址");
 }
+
+// ---------------------------------------------------------------- 资源上限（PORTA.md §6 第 8 条）
+
+/// 21116 的帧上限 16 KB：带 8 KB WebRTC offer 的 `PunchHoleRequest` 照常应答；
+/// 帧头声明 20 KB 的帧一到，连接就被断开。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_frame_is_disconnected() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let server = Server::start(GEO_OFF, &[]).await;
+    let mut a = server.connect_a(A_IP, Kx::Plain).await;
+    let mut ph = server.punch_request(&unique_id(""));
+    ph.webrtc_sdp_offer = "o".repeat(8 * 1024);
+    send(&mut a, &msg_punch_request(ph)).await;
+    let Some(rendezvous_message::Union::PunchHoleResponse(resp)) = recv(&mut a, 5000).await.union
+    else {
+        panic!("期待 PunchHoleResponse");
+    };
+    assert_eq!(
+        resp.failure.enum_value(),
+        Ok(punch_hole_response::Failure::ID_NOT_EXIST)
+    );
+
+    let mut s = tokio::net::TcpStream::connect(server.addr()).await.unwrap();
+    // 20 KB 要 3 字节帧头：长度左移 2 位，低 2 位是帧头字节数 - 1（客户端 `BytesCodec`）。
+    let n: u32 = 20 * 1024;
+    s.write_all(&((n << 2) | 2).to_le_bytes()[..3]).await.unwrap();
+    // 服务端可能已经断开，后面的数据写不进去也没关系。
+    let _ = s.write_all(&[0u8; 1024]).await;
+    let mut buf = Vec::new();
+    let res = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut buf)).await;
+    assert!(res.is_ok(), "超过帧上限的连接 5 秒内没有被断开");
+}
+
+/// 21118 连上后不做 WebSocket 握手：约 10 秒后被服务端关掉（握手超时），不会一直占着连接。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_without_handshake_times_out() {
+    use tokio::io::AsyncReadExt;
+    let server = Server::start(GEO_OFF, &[]).await;
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", server.port + 2))
+        .await
+        .unwrap();
+    let started = Instant::now();
+    let mut buf = Vec::new();
+    let res = tokio::time::timeout(Duration::from_secs(20), s.read_to_end(&mut buf)).await;
+    assert!(res.is_ok(), "不握手的 WebSocket 连接 20 秒后还没被断开");
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_secs(8), "握手超时应约 10 秒，实际 {waited:?}");
+    assert!(buf.is_empty(), "服务端不该发任何数据：{buf:?}");
+}

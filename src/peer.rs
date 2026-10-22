@@ -7,9 +7,16 @@ use hbb_common::{
     tokio::sync::{Mutex, RwLock},
 };
 use serde_derive::{Deserialize, Serialize};
-use std::{collections::HashMap, collections::HashSet, net::SocketAddr, sync::Arc, time::Instant};
+use std::{
+    collections::HashMap,
+    collections::HashSet,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Instant,
+};
 
-type IpBlockMap = HashMap<String, ((u32, Instant), (HashSet<String>, Instant))>;
+/// Keyed by source (`conn_tracker::source_key`: an IPv4 address or an IPv6 /64).
+pub(crate) type IpBlockMap = HashMap<IpAddr, ((u32, Instant), (HashSet<String>, Instant))>;
 type UserStatusMap = HashMap<Vec<u8>, Arc<(Option<Vec<u8>>, bool)>>;
 type IpChangesMap = HashMap<String, (Instant, HashMap<String, i32>)>;
 lazy_static::lazy_static! {
@@ -24,6 +31,33 @@ pub const IP_BLOCK_DUR: u64 = 60;
 // Same bound as the Pro server: a longer id is not a normal RustDesk id or hostname,
 // and every peer entry and punch-request record keeps its own copy.
 pub const MAX_PEER_ID_LEN: usize = 253;
+/// Longest `RegisterPk.uuid` (raw bytes) accepted (review A-1): the raw length of the API's
+/// `MAX_UUID_LEN` (128 bytes of base64), so every registered device can pass `uuid_matches`. Real
+/// clients send `hbb_common::get_uuid()`: the machine id (36 bytes on Windows/macOS, 32 on Linux)
+/// or, without one (Android/iOS), their 32-byte public key.
+pub const MAX_REG_UUID_LEN: usize = 96;
+
+/// Empties the id sets whose day window is over, then drops the `IP_BLOCKER` entries with neither a
+/// live minute window nor any id (the console `ib` rule, which also kept an empty set's entry for a
+/// day; nothing is lost dropping it, the next request starts a fresh one).
+pub(crate) fn retain_live_ip_blocks(map: &mut IpBlockMap) {
+    map.retain(|_, (a, b)| {
+        if b.1.elapsed().as_secs() > DAY_SECONDS {
+            b.0 = Default::default();
+        }
+        a.1.elapsed().as_secs() <= IP_BLOCK_DUR || !b.0.is_empty()
+    });
+}
+
+/// Periodic cleanup of the two maps unauthenticated `RegisterPk`s add to (review A-1): the expiry
+/// rules of the console `ib`/`ic`, without `ic`'s display filter (more than one IP).
+pub(crate) async fn purge_ip_maps() {
+    retain_live_ip_blocks(&mut *IP_BLOCKER.lock().await);
+    IP_CHANGES
+        .lock()
+        .await
+        .retain(|_, v| v.0.elapsed().as_secs() < IP_CHANGE_DUR_X2);
+}
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub(crate) struct PeerInfo {
@@ -85,7 +119,14 @@ impl PeerMap {
         pk: Bytes,
         ip: String,
     ) -> register_pk_response::Result {
-        log::info!("update_pk {} {:?} {:?} {:?}", id, addr, uuid, pk);
+        // Lengths only: uuid and pk come from an unauthenticated packet (review A-5).
+        log::info!(
+            "update_pk {} {:?} uuid {} bytes, pk {} bytes",
+            id,
+            addr,
+            uuid.len(),
+            pk.len()
+        );
         let (info_str, guid) = {
             let mut w = peer.write().await;
             w.socket_addr = addr;
@@ -152,6 +193,26 @@ impl PeerMap {
         let tmp = LockPeer::default();
         w.insert(id.to_owned(), tmp.clone());
         tmp
+    }
+
+    /// Drops the entries without a registration (`last_reg_time`) for `idle` or longer.
+    /// Unregistered lookups (`get` of an offline peer, `get_or` of a new id) leave entries
+    /// too, so without this the map only grows (review A-1). Nothing is lost:
+    /// - `guid`, `uuid`, `pk` and `info` (its IP) are in the database, and `get` loads them back;
+    /// - `last_reg_time` comes back expired, which an idle peer is anyway (online needs it within
+    ///   `REG_TIMEOUT`);
+    /// - `socket_addr` only matters while online; `update_addr` compares `info.ip` instead when
+    ///   the port is 0, as after a restart;
+    /// - `reg_pk` counts `RegisterPk`s within 6 seconds, long over after an hour.
+    ///
+    /// Callers holding a dropped entry's `Arc` keep a detached copy; only the UDP path writes peers,
+    /// and it runs serially with this.
+    pub(crate) async fn evict_idle(&self, idle: std::time::Duration) {
+        self.map.write().await.retain(|_, p| match p.try_read() {
+            Ok(p) => p.last_reg_time.elapsed() < idle,
+            // Locked for writing: being registered right now.
+            Err(_) => true,
+        });
     }
 
     #[inline]
