@@ -372,6 +372,42 @@ async fn start_removes_old_months() {
     assert_eq!(names, ["GeoLite2-City.mmdb", "dbip-asn-lite-2026-10.mmdb", "dbip-city-lite-2026-10.mmdb"]);
 }
 
+#[test]
+fn manual_files_are_mapped_from_a_private_copy() {
+    // Review C-4/C-15: overwriting a manual file in place (cp, curl -o) must not touch what is mapped.
+    // Without the copy, the reads below would hit pages past the shrunken file's end: SIGBUS.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let cfg = GeoConfig {
+        dir: dir.to_string_lossy().into_owned(),
+        source: GeoSource::Manual,
+        ..Default::default()
+    };
+    std::fs::write(dir.join("GeoLite2-City.mmdb"), city_mmdb(1.0, 2.0, "CN")).unwrap();
+    std::fs::write(dir.join("GeoLite2-ASN.mmdb"), asn_mmdb(4837)).unwrap();
+    let (db, info) = geo::load(&cfg).unwrap();
+    assert_eq!(info.city, dir.join("GeoLite2-City.mmdb"), "reported under the operator's name");
+    assert!(dir.join(".loaded-GeoLite2-City.mmdb").is_file() && dir.join(".loaded-GeoLite2-ASN.mmdb").is_file());
+    // std::fs::write truncates and rewrites the same inode, like cp.
+    std::fs::write(dir.join("GeoLite2-City.mmdb"), b"x").unwrap();
+    std::fs::write(dir.join("GeoLite2-ASN.mmdb"), b"x").unwrap();
+    let rec = db.locate(ip("8.8.8.8")).unwrap();
+    assert_eq!((rec.lat, rec.country.as_deref(), rec.asn), (Some(1.0), Some("CN"), Some(4837)));
+    // A broken update fails to load and leaves the loaded databases alone.
+    assert!(geo::load(&cfg).is_err());
+    assert_eq!(db.locate(ip("8.8.8.8")).unwrap().asn, Some(4837));
+    // The next good file is copied again; the old mapping still reads the old data.
+    std::fs::write(dir.join("GeoLite2-City.mmdb"), city_mmdb(3.0, 4.0, "DE")).unwrap();
+    std::fs::write(dir.join("GeoLite2-ASN.mmdb"), asn_mmdb(3320)).unwrap();
+    let (db2, _) = geo::load(&cfg).unwrap();
+    assert_eq!(db2.locate(ip("8.8.8.8")).unwrap().country.as_deref(), Some("DE"));
+    assert_eq!(db.locate(ip("8.8.8.8")).unwrap().country.as_deref(), Some("CN"));
+    // No temporary files left.
+    assert!(!std::fs::read_dir(dir)
+        .unwrap()
+        .any(|e| e.unwrap().file_name().to_string_lossy().ends_with(".part")));
+}
+
 /// Downloads the real DB-IP Lite files (about 65 MB). Run by hand:
 /// `cargo test --lib router::tests::real_dbip_download -- --ignored --nocapture`
 #[tokio::test]
