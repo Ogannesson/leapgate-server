@@ -11,50 +11,88 @@ use serde_derive::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::{
     collections::HashMap,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+use tokio::sync::Semaphore;
 
 /// Failed logins per user name: 5 within 15 minutes lock the name for 15 minutes (§11).
 const FAIL_WINDOW: Duration = Duration::from_secs(15 * 60);
 const MAX_FAILS: usize = 5;
+/// Longer names are refused before the lookup, so request bodies cannot make big keys.
+const MAX_NAME_LEN: usize = 128;
 
 #[derive(Default)]
 struct FailState {
     /// Failures within the last `FAIL_WINDOW`.
     fails: Vec<Instant>,
+    /// Attempts past the limit check whose password check has not finished.
+    in_flight: usize,
     locked_until: Option<Instant>,
 }
 
 lazy_static::lazy_static! {
+    /// Only names of existing users, so at most one entry per user; a name's stale failures are
+    /// dropped when it is next used, never by scanning the whole map.
     static ref LOGIN_FAILS: Mutex<HashMap<String, FailState>> = Default::default();
+    /// Password checks running at once: each argon2 check takes ~19 MiB and a core for tens of
+    /// milliseconds, so more than one per core only adds memory. The rest wait their turn.
+    static ref ARGON2_SLOTS: Arc<Semaphore> = Arc::new(Semaphore::new(
+        std::thread::available_parallelism().map_or(1, |n| n.get())
+    ));
 }
 
-fn is_locked(name: &str) -> bool {
-    let map = LOGIN_FAILS.lock().unwrap();
-    map.get(name)
-        .and_then(|s| s.locked_until)
-        .is_some_and(|t| t > Instant::now())
+/// A login attempt on an existing user, counted from the limit check on, so concurrent attempts
+/// cannot all pass the check before the first failure is recorded. Dropped without `finish` (an
+/// error, or the client went away) it only gives its place back.
+struct Attempt {
+    name: String,
+    matched: Option<bool>,
 }
 
-fn record_failure(name: &str) {
-    let now = Instant::now();
-    let mut map = LOGIN_FAILS.lock().unwrap();
-    // Forget names that neither are locked nor failed recently, so random names do not pile up.
-    map.retain(|_, s| {
-        s.locked_until.is_some_and(|t| t > now) || s.fails.last().is_some_and(|t| now - *t < FAIL_WINDOW)
-    });
-    let s = map.entry(name.to_owned()).or_default();
-    s.fails.retain(|t| now - *t < FAIL_WINDOW);
-    s.fails.push(now);
-    if s.fails.len() >= MAX_FAILS {
-        s.fails.clear();
-        s.locked_until = Some(now + FAIL_WINDOW);
+impl Attempt {
+    /// `None`: the name is locked, or its failures plus attempts in flight reached `MAX_FAILS`.
+    fn begin(name: &str) -> Option<Self> {
+        let now = Instant::now();
+        let mut map = LOGIN_FAILS.lock().unwrap_or_else(|e| e.into_inner());
+        let s = map.entry(name.to_owned()).or_default();
+        s.fails.retain(|t| now - *t < FAIL_WINDOW);
+        if s.locked_until.is_some_and(|t| t > now) || s.fails.len() + s.in_flight >= MAX_FAILS {
+            return None;
+        }
+        s.in_flight += 1;
+        Some(Self { name: name.to_owned(), matched: None })
+    }
+
+    /// Records the result when dropped: a failure counts, a success forgets the earlier failures.
+    fn finish(mut self, matched: bool) {
+        self.matched = Some(matched);
     }
 }
 
-fn clear_failures(name: &str) {
-    LOGIN_FAILS.lock().unwrap().remove(name);
+impl Drop for Attempt {
+    fn drop(&mut self) {
+        let now = Instant::now();
+        let mut map = LOGIN_FAILS.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(s) = map.get_mut(&self.name) else {
+            return;
+        };
+        s.in_flight -= 1;
+        match self.matched {
+            Some(true) => s.fails.clear(),
+            Some(false) => {
+                s.fails.push(now);
+                if s.fails.len() >= MAX_FAILS {
+                    s.fails.clear();
+                    s.locked_until = Some(now + FAIL_WINDOW);
+                }
+            }
+            None => {}
+        }
+        if s.in_flight == 0 && s.fails.is_empty() && !s.locked_until.is_some_and(|t| t > now) {
+            map.remove(&self.name);
+        }
+    }
 }
 
 /// The user object of login, currentUser and `/api/users` (note 03 §2.5): `name` non-empty,
@@ -136,11 +174,8 @@ pub(crate) async fn login(State(state): State<AppState>, body: Bytes) -> ApiResu
     if req.typ.as_deref().is_some_and(|t| t != "account") {
         return Err(ApiError::bad_request("Unsupported login type"));
     }
-    if is_locked(&req.username) {
-        return Err(ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "Too many failed attempts, try again later",
-        ));
+    if req.username.len() > MAX_NAME_LEN {
+        return Err(ApiError::bad_request("User name too long"));
     }
     let row = sqlx::query_as::<_, (i64, String, i64)>(
         "select id, password_hash, status from user where name = ?",
@@ -148,48 +183,77 @@ pub(crate) async fn login(State(state): State<AppState>, body: Bytes) -> ApiResu
     .bind(&req.username)
     .fetch_optional(&state.db)
     .await?;
+    let attempt = match row {
+        Some(_) => Some(Attempt::begin(&req.username).ok_or_else(|| {
+            ApiError::new(StatusCode::TOO_MANY_REQUESTS, "Too many failed attempts, try again later")
+        })?),
+        None => None,
+    };
     let (uid, stored, status) = row.unwrap_or_default();
-    // argon2 takes tens of milliseconds of CPU: keep it off the async workers.
+    // argon2 takes tens of milliseconds of CPU: keep it off the async workers, a few at a time.
+    // The permit moves into the task, so a client that goes away does not free it early.
+    let permit = ARGON2_SLOTS.clone().acquire_owned().await.map_err(ApiError::internal)?;
     let password = req.password.clone();
+    let checked = stored.clone();
     let (check, upgraded) = tokio::task::spawn_blocking(move || {
-        let check = auth::verify_password(&password, &stored);
+        let _permit = permit;
+        let check = auth::verify_password(&password, &checked);
         let upgraded = (check == PasswordCheck::OkNeedsUpgrade).then(|| auth::hash_password(&password));
         (check, upgraded)
     })
     .await
     .map_err(ApiError::internal)?;
-    if check == PasswordCheck::Mismatch {
-        record_failure(&req.username);
+    let matched = check != PasswordCheck::Mismatch;
+    if let Some(attempt) = attempt {
+        attempt.finish(matched);
+    }
+    if !matched {
         return Err(ApiError::new(StatusCode::UNAUTHORIZED, "Wrong credentials"));
     }
-    clear_failures(&req.username);
     if status != 1 {
         return Err(ApiError::forbidden("Account disabled"));
     }
     let now = crate::common::now() as i64;
-    if let Some(hash) = upgraded {
-        sqlx::query("update user set password_hash = ?, updated_at = ? where id = ?")
-            .bind(hash?)
+    // Both writes below only apply while the hash is still the one just checked: a `user passwd`
+    // in between has already signed out every token, so neither may undo it.
+    let current = match upgraded {
+        Some(hash) => {
+            let hash = hash?;
+            let res = sqlx::query(
+                "update user set password_hash = ?, updated_at = ? where id = ? and password_hash = ?",
+            )
+            .bind(&hash)
             .bind(now)
             .bind(uid)
+            .bind(&stored)
             .execute(&state.db)
             .await?;
-        log::info!("Upgraded the password hash of user {} to argon2id", req.username);
-    }
+            if res.rows_affected() == 1 {
+                log::info!("Upgraded the password hash of user {} to argon2id", req.username);
+            }
+            hash
+        }
+        None => stored,
+    };
 
     let token = auth::new_token();
-    sqlx::query(
+    let issued = sqlx::query(
         "insert into token(token_hash, user_id, device_id, device_uuid, created_at, last_used_at)
-         values(?, ?, ?, ?, ?, ?)",
+         select ?, id, ?, ?, ?, ? from user where id = ? and password_hash = ? and status = 1",
     )
     .bind(auth::token_hash(&token))
-    .bind(uid)
     .bind(&req.id)
     .bind(&req.uuid)
     .bind(now)
     .bind(now)
+    .bind(uid)
+    .bind(&current)
     .execute(&state.db)
-    .await?;
+    .await?
+    .rows_affected();
+    if issued == 0 {
+        return Err(ApiError::new(StatusCode::UNAUTHORIZED, "Wrong credentials"));
+    }
 
     if !req.id.is_empty() && uuid_matches(&state.db, &req.id, Some(&req.uuid)).await? {
         sqlx::query(
@@ -395,6 +459,139 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         let (status, _) = login_as(&t.app, "rl-erin", "pw", "", "").await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn concurrent_attempts_count_against_the_limit() {
+        let t = testutil::app().await;
+        testutil::create_user(&t.state.db, "cc-zoe", "pw", false).await;
+        let tasks: Vec<_> = (0..3 * MAX_FAILS)
+            .map(|_| {
+                let app = t.app.clone();
+                tokio::spawn(async move { login_as(&app, "cc-zoe", "bad", "", "").await.0 })
+            })
+            .collect();
+        let mut statuses = Vec::new();
+        for task in tasks {
+            statuses.push(task.await.unwrap());
+        }
+        // Only MAX_FAILS of the burst get a password check; the rest are refused up front.
+        let checked = statuses.iter().filter(|s| **s == StatusCode::UNAUTHORIZED).count();
+        let refused = statuses.iter().filter(|s| **s == StatusCode::TOO_MANY_REQUESTS).count();
+        assert_eq!((checked, refused), (MAX_FAILS, 2 * MAX_FAILS), "{statuses:?}");
+        let (status, _) = login_as(&t.app, "cc-zoe", "pw", "", "").await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn abandoned_attempt_gives_its_place_back() {
+        let name = "ab-quinn";
+        let mut attempts: Vec<_> = (0..MAX_FAILS).map(|_| Attempt::begin(name).unwrap()).collect();
+        assert!(Attempt::begin(name).is_none());
+        // E.g. the client went away during the password check: no failure is recorded.
+        attempts.pop();
+        attempts.push(Attempt::begin(name).unwrap());
+        drop(attempts);
+        assert!(!LOGIN_FAILS.lock().unwrap().contains_key(name));
+    }
+
+    #[tokio::test]
+    async fn password_checks_wait_for_a_slot() {
+        let t = testutil::app().await;
+        testutil::create_user(&t.state.db, "ps-paul", "pw", false).await;
+        let slots = std::thread::available_parallelism().map_or(1, |n| n.get()) as u32;
+        let all = ARGON2_SLOTS.clone().acquire_many_owned(slots).await.unwrap();
+        let app = t.app.clone();
+        let mut login = tokio::spawn(async move { login_as(&app, "ps-paul", "pw", "", "").await.0 });
+        let waited = tokio::time::timeout(Duration::from_millis(300), &mut login).await;
+        assert!(waited.is_err(), "login finished while every slot was taken");
+        drop(all);
+        assert_eq!(login.await.unwrap(), StatusCode::OK);
+    }
+
+    /// `user passwd` lands while a login with the old password is past the lookup: the login gets
+    /// no token, and a legacy hash upgrade does not write the old password back.
+    #[tokio::test]
+    async fn password_change_during_login_wins() {
+        let t = testutil::app().await;
+        let db = &t.state.db;
+        let slots = std::thread::available_parallelism().map_or(1, |n| n.get()) as u32;
+        let (aid, _) = testutil::create_user(db, "pc-rita", "old", false).await;
+        let (bid, _) = testutil::create_user(db, "pc-sam", "", false).await;
+        sqlx::query("update user set password_hash = ? where id = ?")
+            .bind(bcrypt::hash("old", 4).unwrap())
+            .bind(bid)
+            .execute(db)
+            .await
+            .unwrap();
+        for (uid, name) in [(aid, "pc-rita"), (bid, "pc-sam")] {
+            // Hold the login between reading the stored hash and checking it.
+            let all = ARGON2_SLOTS.clone().acquire_many_owned(slots).await.unwrap();
+            let app = t.app.clone();
+            let mut login = tokio::spawn(async move { login_as(&app, name, "old", "", "").await.0 });
+            assert!(tokio::time::timeout(Duration::from_millis(300), &mut login).await.is_err());
+            let new_hash = auth::hash_password("new").unwrap();
+            sqlx::query("update user set password_hash = ? where id = ?")
+                .bind(&new_hash)
+                .bind(uid)
+                .execute(db)
+                .await
+                .unwrap();
+            sqlx::query("delete from token where user_id = ?").bind(uid).execute(db).await.unwrap();
+            drop(all);
+
+            assert_eq!(login.await.unwrap(), StatusCode::UNAUTHORIZED, "{name}");
+            let tokens: i64 = sqlx::query_scalar("select count(*) from token where user_id = ?")
+                .bind(uid)
+                .fetch_one(db)
+                .await
+                .unwrap();
+            assert_eq!(tokens, 0, "{name}");
+            let stored: String = sqlx::query_scalar("select password_hash from user where id = ?")
+                .bind(uid)
+                .fetch_one(db)
+                .await
+                .unwrap();
+            assert_eq!(stored, new_hash, "{name}");
+            let (status, _) = login_as(&t.app, name, "new", "", "").await;
+            assert_eq!(status, StatusCode::OK, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn failure_table_only_holds_existing_users() {
+        let t = testutil::app().await;
+        testutil::create_user(&t.state.db, "ft-olga", "pw", false).await;
+        let fails = |name: &str| LOGIN_FAILS.lock().unwrap().get(name).map(|s| s.fails.len());
+
+        // Unknown names, however many failures, leave nothing behind.
+        for _ in 0..MAX_FAILS + 1 {
+            let (status, _) = login_as(&t.app, "ft-nobody", "pw", "", "").await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(fails("ft-nobody"), None);
+
+        // Over-long names are refused up front; 128 bytes is still a normal (unknown) name.
+        let long = "n".repeat(MAX_NAME_LEN + 1);
+        let (status, v) = login_as(&t.app, &long, "pw", "", "").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(v["error"].is_string());
+        assert_eq!(fails(&long), None);
+        let (status, _) = login_as(&t.app, &long[1..], "pw", "", "").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // An existing user's failures older than the window are dropped when the name is next used.
+        let old = Instant::now().checked_sub(FAIL_WINDOW).unwrap();
+        LOGIN_FAILS.lock().unwrap().insert(
+            "ft-olga".to_owned(),
+            FailState { fails: vec![old; MAX_FAILS - 1], ..Default::default() },
+        );
+        let (status, _) = login_as(&t.app, "ft-olga", "bad", "", "").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(fails("ft-olga"), Some(1));
+        let (status, _) = login_as(&t.app, "ft-olga", "pw", "", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(fails("ft-olga"), None);
     }
 
     #[tokio::test]
