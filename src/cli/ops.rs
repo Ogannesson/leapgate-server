@@ -4,7 +4,12 @@ use super::{console, console_connect, console_send, fmt_time, table, Args, Ctx, 
 use crate::strategy::GLOBAL;
 use hbb_common::{bail, ResultType};
 use sqlx::SqlitePool;
-use std::{collections::HashSet, net::IpAddr, time::Duration};
+use std::{
+    collections::HashSet,
+    net::{IpAddr, SocketAddr},
+    path::Path,
+    time::Duration,
+};
 
 /// `rs` and `tg` answer at once; `gu` downloads and verifies the databases first.
 const CONSOLE_WAIT: Duration = Duration::from_secs(10);
@@ -109,29 +114,43 @@ pub(super) async fn exec(ctx: &Ctx, cmd: &str, mut args: Args) -> ResultType<Str
             .await?;
             Ok(format!("{scope}: options are pushed again on the next heartbeat\n"))
         }
+        _ => bail!("Unknown command '{cmd} {sub}'\n\n{USAGE}"),
+    }
+}
+
+/// `relay status`, `route test`, `geo …`: they talk to the console or read `porta.toml` and the mmdb
+/// files, never the database, so they run without one (review R2-6).
+pub(super) async fn runtime(
+    console_addr: SocketAddr,
+    porta_config: &Path,
+    cmd: &str,
+    mut args: Args,
+) -> ResultType<String> {
+    let sub = args.next("subcommand")?;
+    match (cmd, sub.as_str()) {
         ("relay", "status") => {
             args.finish()?;
-            console(ctx.console, "rs", CONSOLE_WAIT).await
+            console(console_addr, "rs", CONSOLE_WAIT).await
         }
         ("route", "test") => {
             let a = parse_ip(&args.next("ipA")?)?;
             let b = parse_ip(&args.next("ipB")?)?;
             args.finish()?;
-            console(ctx.console, &format!("tg {a} {b}"), CONSOLE_WAIT).await
+            console(console_addr, &format!("tg {a} {b}"), CONSOLE_WAIT).await
         }
         ("geo", "lookup") => {
             let ip = parse_ip(&args.next("ip")?)?;
             args.finish()?;
-            let cfg = crate::config::Config::load(&ctx.porta_config, "")?;
+            let cfg = crate::config::Config::load(porta_config, "")?;
             Ok(crate::router::geo_lookup(&cfg, ip)? + "\n")
         }
         ("geo", "update") => {
             args.finish()?;
-            match console_connect(ctx.console).await {
+            match console_connect(console_addr).await {
                 Ok(stream) => console_send(stream, "gu", GEO_UPDATE_WAIT).await,
                 Err(err) => {
                     eprintln!("{err}; downloading in this process instead");
-                    let cfg = crate::config::Config::load(&ctx.porta_config, "")?;
+                    let cfg = crate::config::Config::load(porta_config, "")?;
                     Ok(crate::router::geo_download(&cfg.geo).await? + "\n")
                 }
             }

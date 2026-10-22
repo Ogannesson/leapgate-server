@@ -86,13 +86,13 @@ impl Kind {
     }
 }
 
-/// The two opened databases.
-pub(crate) struct GeoDb {
-    city: Reader<Mmap>,
-    asn: Reader<Mmap>,
+/// The two opened databases: mapped (server), or read into memory (`geo lookup`, see [`load_in_memory`]).
+pub(crate) struct GeoDb<S: AsRef<[u8]> = Mmap> {
+    city: Reader<S>,
+    asn: Reader<S>,
 }
 
-impl Locate for GeoDb {
+impl<S: AsRef<[u8]> + Send + Sync> Locate for GeoDb<S> {
     fn locate(&self, ip: IpAddr) -> Option<GeoRecord> {
         let city = self.city.lookup(ip).and_then(|r| r.decode::<geoip2::City>()).ok().flatten();
         let asn = self.asn.lookup(ip).and_then(|r| r.decode::<geoip2::Asn>()).ok().flatten();
@@ -110,7 +110,7 @@ impl Locate for GeoDb {
     }
 }
 
-impl GeoDb {
+impl<S: AsRef<[u8]>> GeoDb<S> {
     /// AS organization, for `geo lookup` only (the cost model never matches on names).
     pub fn asn_org(&self, ip: IpAddr) -> Option<String> {
         let asn = self.asn.lookup(ip).and_then(|r| r.decode::<geoip2::Asn>()).ok().flatten()?;
@@ -144,18 +144,30 @@ fn open(path: &Path) -> ResultType<Reader<Mmap>> {
     unsafe { Reader::open_mmap(path) }.map_err(|e| anyhow!("{}: {e}", path.display()))
 }
 
-/// `source = "manual"`: operators may update a file in place (cp, curl -o), and a mapped file that
-/// shrinks under us kills the process with SIGBUS. So we map `.loaded-<name>` next to it instead,
-/// copied on every load under a temporary name and renamed into place.
-fn private_copy(path: &Path) -> ResultType<PathBuf> {
-    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+/// Reads a whole file into memory: nothing is mapped, so whatever happens to the file later cannot
+/// affect what was read.
+fn read(path: &Path) -> ResultType<Reader<Vec<u8>>> {
+    Reader::open_readfile(path).map_err(|e| anyhow!("{}: {e}", path.display()))
+}
+
+/// Where the server keeps its private copies of manual files: `.porta-geoip/` in its working
+/// directory, next to the database and the key files. That is writable even when `geo.dir` is not
+/// (geoipupdate's root-owned directory, a read-only mount). Fixed, not configurable.
+pub(crate) const COPY_DIR: &str = ".porta-geoip";
+
+/// `source = "manual"` on the server: operators may update a file in place (cp, curl -o), and a
+/// mapped file that shrinks under us kills the process with SIGBUS. So we map a copy,
+/// `<copies>/<file name>`, made on every load under a temporary name and renamed into place. Only the
+/// server writes there (`geo lookup` reads into memory), and its loads are serialized.
+fn private_copy(path: &Path, copies: &Path) -> ResultType<PathBuf> {
+    let Some(name) = path.file_name() else {
         bail!("{}: not a file path", path.display());
     };
-    let name = name.to_string_lossy();
-    let copy = dir.join(format!(".loaded-{name}"));
-    // The pid keeps the server and a `geo lookup` from writing the same temporary file.
-    let part = dir.join(format!(".loaded-{name}.{}.part", std::process::id()));
-    let res = std::fs::copy(path, &part).and_then(|_| std::fs::rename(&part, &copy));
+    let copy = copies.join(name);
+    let part = copies.join(format!("{}.part", name.to_string_lossy()));
+    let res = std::fs::create_dir_all(copies)
+        .and_then(|_| std::fs::copy(path, &part))
+        .and_then(|_| std::fs::rename(&part, &copy));
     if let Err(e) = res {
         std::fs::remove_file(&part).ok();
         bail!("{}: copy to {}: {e}", path.display(), copy.display());
@@ -163,9 +175,14 @@ fn private_copy(path: &Path) -> ResultType<PathBuf> {
     Ok(copy)
 }
 
-/// Opens a city database and checks it: type contains "City", and a probe has a position and country.
+/// Opens a city database and checks it.
 fn open_city(path: &Path) -> ResultType<Reader<Mmap>> {
-    let r = open(path)?;
+    check_city(path, open(path)?)
+}
+
+/// Checks an opened city database (`path` names it in errors): type contains "City", and a probe has
+/// a position and country.
+fn check_city<S: AsRef<[u8]>>(path: &Path, r: Reader<S>) -> ResultType<Reader<S>> {
     let ty = &r.metadata().database_type;
     if !ty.contains("City") {
         bail!("{}: database type '{ty}' is not a city database", path.display());
@@ -183,9 +200,14 @@ fn open_city(path: &Path) -> ResultType<Reader<Mmap>> {
     Ok(r)
 }
 
-/// Opens an ASN database and checks it: type contains "ASN", and 8.8.8.8 has an ASN.
+/// Opens an ASN database and checks it.
 fn open_asn(path: &Path) -> ResultType<Reader<Mmap>> {
-    let r = open(path)?;
+    check_asn(path, open(path)?)
+}
+
+/// Checks an opened ASN database (`path` names it in errors): type contains "ASN", and 8.8.8.8 has
+/// an ASN.
+fn check_asn<S: AsRef<[u8]>>(path: &Path, r: Reader<S>) -> ResultType<Reader<S>> {
     let ty = &r.metadata().database_type;
     if !ty.contains("ASN") {
         bail!("{}: database type '{ty}' is not an ASN database", path.display());
@@ -217,12 +239,16 @@ pub(crate) fn dbip_files(dir: &Path, kind: Kind) -> Vec<(Ym, PathBuf)> {
 }
 
 /// The newest file of `kind` that opens and passes the checks; broken ones are logged and skipped.
-fn open_newest(dir: &Path, kind: Kind) -> ResultType<(Ym, PathBuf, Reader<Mmap>)> {
+fn open_newest<S: AsRef<[u8]>>(
+    dir: &Path,
+    kind: Kind,
+    open: impl Fn(&Path) -> ResultType<Reader<S>>,
+) -> ResultType<(Ym, PathBuf, Reader<S>)> {
     for (ym, path) in dbip_files(dir, kind) {
-        let opened = match kind {
-            Kind::City => open_city(&path),
-            Kind::Asn => open_asn(&path),
-        };
+        let opened = open(&path).and_then(|r| match kind {
+            Kind::City => check_city(&path, r),
+            Kind::Asn => check_asn(&path, r),
+        });
         match opened {
             Ok(r) => return Ok((ym, path, r)),
             Err(e) => log::error!("GeoIP: {e}"),
@@ -246,14 +272,38 @@ pub(crate) fn manual_mtimes(cfg: &GeoConfig) -> (Option<SystemTime>, Option<Syst
     (mtime(&city), mtime(&asn))
 }
 
-/// Finds and opens the databases (server and `geo lookup` alike): dbip takes the newest month of each
-/// kind, manual the configured files. Both files are required.
+/// Finds and maps the databases (server; also `geo update` in the command line, which only needs the
+/// months): dbip maps the newest month of each kind, manual maps private copies of the configured
+/// files in [`COPY_DIR`] (see [`private_copy`]). Both files are required.
 pub(crate) fn load(cfg: &GeoConfig) -> ResultType<(GeoDb, GeoInfo)> {
+    load_copying(cfg, Path::new(COPY_DIR))
+}
+
+/// [`load`], with the private copies of manual files in `copies`.
+pub(super) fn load_copying(cfg: &GeoConfig, copies: &Path) -> ResultType<(GeoDb, GeoInfo)> {
+    match cfg.source {
+        GeoSource::Dbip => load_with(cfg, open),
+        GeoSource::Manual => load_with(cfg, |path| open(&private_copy(path, copies)?)),
+    }
+}
+
+/// `geo lookup` with `source = "manual"`: the same files as [`load`], read into memory, so the
+/// command writes nothing (not even private copies). A short-lived process can afford the memory.
+pub(crate) fn load_in_memory(cfg: &GeoConfig) -> ResultType<(GeoDb<Vec<u8>>, GeoInfo)> {
+    load_with(cfg, read)
+}
+
+/// Finds the files (dbip: the newest month of each kind; manual: the configured files), opens them
+/// with `open` and checks them.
+fn load_with<S: AsRef<[u8]>>(
+    cfg: &GeoConfig,
+    open: impl Fn(&Path) -> ResultType<Reader<S>>,
+) -> ResultType<(GeoDb<S>, GeoInfo)> {
     match cfg.source {
         GeoSource::Dbip => {
             let dir = Path::new(&cfg.dir);
-            let (cm, city_path, city) = open_newest(dir, Kind::City)?;
-            let (am, asn_path, asn) = open_newest(dir, Kind::Asn)?;
+            let (cm, city_path, city) = open_newest(dir, Kind::City, &open)?;
+            let (am, asn_path, asn) = open_newest(dir, Kind::Asn, &open)?;
             let info = GeoInfo {
                 city: city_path,
                 asn: asn_path,
@@ -266,8 +316,8 @@ pub(crate) fn load(cfg: &GeoConfig) -> ResultType<(GeoDb, GeoInfo)> {
             let (city_path, asn_path) = manual_paths(cfg);
             let mtimes = manual_mtimes(cfg);
             let db = GeoDb {
-                city: open_city(&private_copy(&city_path)?)?,
-                asn: open_asn(&private_copy(&asn_path)?)?,
+                city: check_city(&city_path, open(&city_path)?)?,
+                asn: check_asn(&asn_path, open(&asn_path)?)?,
             };
             let info = GeoInfo {
                 city: city_path,
@@ -555,13 +605,16 @@ mod tests {
             source: GeoSource::Manual,
             ..Default::default()
         };
+        let copies = tmp.path().join("copies");
         assert_eq!(manual_mtimes(&cfg), (None, None));
-        assert!(load(&cfg).is_err());
+        assert!(load_copying(&cfg, &copies).is_err());
+        assert!(load_in_memory(&cfg).is_err());
         touch(tmp.path(), "GeoLite2-City.mmdb");
         let (city, asn) = manual_mtimes(&cfg);
         assert!(city.is_some() && asn.is_none());
         // Present but not a database: rejected.
         touch(tmp.path(), "GeoLite2-ASN.mmdb");
-        assert!(load(&cfg).is_err());
+        assert!(load_copying(&cfg, &copies).is_err());
+        assert!(load_in_memory(&cfg).is_err());
     }
 }
