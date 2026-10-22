@@ -277,7 +277,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 
 ## 7. 路由第一级（`src/router/`）
 
-- 接口：`async fn select(&self, q: &RouteQuery<'_>) -> RouteDecision { relay: String, reason: &'static str }`。返回单个中继字符串（原版客户端只认一个）；空串语义照旧（被控端退回"hbbs 主机:21117"）。
+- 接口：`async fn select(&self, q: &RouteQuery<'_>) -> RouteDecision { relay: String, reason: &'static str }`。返回单个中继字符串（原版客户端只认一个）；空串语义照旧（被控端退回"hbbs 主机:21117"）。`reason` 取值为 `fixed`（固定中继）、`geo`（双方都有位置）、`geo_a`/`geo_b`（只有 A 或只有 B 有位置）、`rr`（轮询）、`none`（没有配置中继）。
 - 固定中继：每次调用按 `b_id` 查一次 `device_policy.relay_pin`（主键查询，不缓存），所以命令行 `device pin-relay` 写库后下一次连接就生效。有固定中继时直接用它，不看健康状态（运维的明确意图）。`b_id` 为空串时跳过这一步。中继列表、健康状态、GeoIP 都在内存里。
 - 候选：健康检查判为可达的中继。
 - 代价：`cost(R) = (rtt(A,R) + rtt(B,R)) × weight(R)`，取最小。`rtt` 按笔记 06 §4：大圆距离 × 2 × `detour` / 200 km/ms，加每段的跨运营商组、跨境惩罚；`multi_bgp` 的中继不算跨运营商。
@@ -313,7 +313,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 6. 列表接口回 `{"total": int, "data": [...]}`，`total` 必须是整数；分页参数 `current`、`pageSize`，不能把每页压到客户端要的条数以下。例外：`POST /api/ab/tags/<guid>` 回顶层 JSON 数组 `[{"name":string,"color":int}]`，没有标签回 `[]`，按 name 排序，不带 total、不分页。
 7. sysinfo 成功回纯文本 `SYSINFO_UPDATED`（逐字节，不带换行和引号）；**不回 `ID_NOT_FOUND`**（会让客户端每 3 秒重传）。
 8. 审计成功回 200 + **空 body**。`nonce` 是可选字段：1.5.0 起才有，1.4.x 的审计不带、也不重试。带 nonce 的按 nonce 去重 5 分钟（重复的也回空 body）；不带的直接入库、不去重；不能把空串当去重键，也不能因为缺 nonce 回 4xx。nonce 只在记录写库成功后才登记进去重表，写库失败回 200 + `{"error":"…"}`，保证客户端重试时能入库。
-9. 地址簿：9 个写接口成功只认 200 + 空 body；读接口按笔记 04 §1.2 的三种解析器回；`/api/ab/personal` 永远回 200 + 非空 `guid`（个人簿不存在就当场建）；`settings`、`shared/profiles` 正常实现（不回 404）。
+9. 地址簿：7 个写接口成功只认 200 + 空 body（12 个接口 = 5 个读 + 7 个写）；读接口按笔记 04 §1.2 的三种解析器回；`/api/ab/personal` 永远回 200 + 非空 `guid`（个人簿不存在就当场建）；`settings`、`shared/profiles` 正常实现（不回 404）。
 10. JSON 里不给 null；字符串字段不能给数字（SQLite 读出的纯数字字符串要保持字符串）。
 - 详细字段和每个接口的推荐回包：账号/组/设备/审计看笔记 03，地址簿看笔记 04。
 
@@ -386,6 +386,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 ### 12.3 组面板（`/api/users`、`/api/peers`、`/api/device-group/accessible`）
 - 管理员：看到全部用户和全部设备。
 - 普通用户：看到自己，加上和自己同在任一 `share_devices=1` 组里的用户；设备是这些用户名下的（`device.user_id`）。
+- 客户端拉列表时带 `status=1`：请求带 `status` 参数（数字）时，`/api/users` 在上面的可见范围里只返回 `user.status` 等于该值的用户；`/api/peers` 不按设备过滤（设备没有启用状态），但排除被这个条件滤掉的用户名下的设备（例如禁用用户的设备），没有归属的设备（管理员可见）照常列出。不带参数或参数不是数字时不过滤。
 - `/api/device-group/accessible` 回 `{"total":0,"data":[]}`。
 - `status`（在线）按 `PeerMap` 的内存在线判定；字段和类型照笔记 03 §3。
 
@@ -424,7 +425,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
   - 笔记 05 §8.3 的"被丢弃的规则"报告 SQL 照用。
 - 条目：写进 `ab_peer.data` 的键名一律用客户端 `Peer.fromJson` 的键：`username`、`hostname`、`platform`、`alias`、`rdpPort`、`rdpUsername`、`loginName`（字符串），`forceAlwaysRelay`（字符串 `"true"`/`"false"`）；不写 `same_server`、`online`、`note`。密码和哈希加密后存。
 - 清洗：`CAST(tags AS TEXT)` 后解析，`null`/坏数据 → `[]`，只保留字符串元素；重复条目、重复标签、孤儿标签按笔记 05 的规则处理；共享簿重名、或叫 `My address book`/`Legacy address book` 时改名并打印。
-- 设备（可选，来自 `peers`）：按 `MIN(row_id)` 去重；`user_id` 为 0 或映射不到 → NULL；`hostname/os/username/version/uuid` 原样；`first_seen_at`、`last_seen_at` 取 `last_online_time`，为 0 时用导入时间；`last_ip` 取 `last_online_ip`；`sysinfo` 留 `''`。
+- 设备（可选，来自 `peers`）：按 `MIN(row_id)` 去重；`user_id` 为 0 或映射不到 → NULL；`hostname/os/username/version/uuid` 原样；`first_seen_at`、`last_seen_at` 取 `last_online_time`，为 0 时用导入时间；`last_ip` 取 `last_online_ip`；`sysinfo` 留 `''`。导入时 `device` 表里已经有的行（服务启动后设备心跳写进来的）保留原数据，只补上空着的 `user_id`，并在报告里列出这类设备的数量。
 
 ## 16. 测试与验收
 
