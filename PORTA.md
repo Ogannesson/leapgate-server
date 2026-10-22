@@ -63,7 +63,7 @@
   - `cfg: Arc<Config>`
   - `server_pk`、`sk`（`get_server_sk` 的结果，KeyExchange 和签名用）
 - 模块自己的小状态（登录失败计数、审计 nonce 去重表）放在模块内的 `static`，不进 `AppState`。
-- 所有 IP 在比较、查库、落库前先规范化：`::ffff:a.b.c.d` → IPv4（`to_canonical()` 或 `try_into_v4`）。
+- Porta 新增的代码（路由、结果记录、API、GeoIP、新表）里，IP 在比较、查库、落库前先规范化：`::ffff:a.b.c.d` → IPv4（`to_canonical()` 或 `try_into_v4`）。原版会合逻辑里已有的地址处理保持原样（`same_intranet`、`update_addr`/`RegisterPk` 的 ip 比较、`peer.info.ip` 落库、`tcp_punch` 的键），也不要在 accept 处统一改写地址，否则同公网 IP 的设备拿不到局域网直连，或升级后每台设备都被判成"IP 变了"。
 
 ## 4. 存储
 
@@ -224,23 +224,25 @@ create table audit_alarm (
 );
 ```
 
-`conn_attempt` 表照笔记 02 §4.4 的 DDL 原样放进 `0001`。
+`conn_attempt` 表照笔记 02 §4.4 的 DDL 原样放进 `0001`，`signal` 列注释补上 `'relay_only'`（§8）。
 
 ## 5. 配置
 
 - hbbs 原有参数（`-p`、`-k`、`-r`、`--mask`、`DB_URL`、`.env`、`-c` 指定的 INI…）全部照旧。
 - Porta 自己的结构化配置放在 `porta.toml`：路径取参数 `--porta-config`（环境变量同名规则照 `get_arg`），默认工作目录下的 `porta.toml`；文件不存在就全用默认值。改了要重启。
-- 中继列表：`porta.toml` 里有 `[[relay]]` 就用它；没有就用 `-r` 的列表（权重 1，无覆盖）。控制台 `rs a,b,c` 仍可在运行时临时替换。
+- 中继列表：`porta.toml` 里有 `[[relay]]` 就用它；没有就用 `-r` 的列表（权重 1，无覆盖）。控制台 `rs a,b,c` 仍可在运行时临时替换。载入时只去掉空串和重复项，**不做 DNS 过滤**（不用原版 `get_servers` 里的 `test_if_valid_server`）：解析不了的主机由健康检查判为不可达，恢复后自动回到候选里。
 
 ```toml
 [api]
-listen = "0.0.0.0:21114"          # HTTPS 交给前面的反向代理
+listen = ""                       # 留空 = 0.0.0.0:{port-2}（-p 默认 21116，所以默认 21114），和客户端由会合地址推 API 地址的规则一致
+                                  # HTTPS 交给前面的反向代理
 
 [geo]
 dir = "geoip"                     # 放 mmdb 的目录（相对工作目录）
-source = "dbip"                   # dbip：自动下载 DB-IP Lite；manual：只读目录里已有的文件（MaxMind 走这条）
-city_file = ""                    # 留空按 source 的默认文件名
-asn_file = ""
+source = "dbip"                   # dbip：自动下载 DB-IP Lite，文件名固定 dbip-{city,asn}-lite-YYYY-MM.mmdb，取目录里月份最大的
+                                  # manual：只读目录里已有的文件（MaxMind 走这条），每天看一次 mtime，变了就重新加载
+city_file = "GeoLite2-City.mmdb"  # 只在 manual 时生效，相对 dir（默认值是 geoipupdate 的文件名）
+asn_file = "GeoLite2-ASN.mmdb"
 auto_update = true
 # server_location = { lat = 0.0, lon = 0.0, country = "XX", carrier = "" }  # 私网来源地址按服务端位置算（笔记 06 §5.2）
 
@@ -264,9 +266,9 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 ## 6. 会合模块（`rendezvous_server.rs` 等）
 
 改动都按"只加挂钩、不重写流程"做，行为和原版保持一致，除非下面明确要求。
-1. **KeyExchange v1**：21116/TCP 每条连接 accept 后、有 `sk` 时先发 `KeyExchange`（v1：签名的临时公钥 + `signed_params`），读第一帧：是 `KeyExchange` 且 `keys.len()==2` 就建立加密，之后收发都加解密；第一帧不是 `KeyExchange` 就按明文 `RendezvousMessage` 处理。写半边存进 `tcp_punch` 时要带上加密器（`Sink` 改型）。完整步骤和客户端测试里的服务端替身见笔记 02 §6.2。21118（WebSocket）上客户端会不会同样要求加密，读客户端 `secure_tcp` 的调用点确认；要求的话 WS 也做。
+1. **KeyExchange v1**：21116/TCP 每条连接 accept 后、有 `sk` 时先发 `KeyExchange`（v1：签名的临时公钥 + `signed_params`），读第一帧：是 `KeyExchange` 且 `keys.len()==2` 就建立加密，之后收发都加解密；第一帧不是 `KeyExchange` 就按明文 `RendezvousMessage` 处理。写半边存进 `tcp_punch` 时要带上加密器（`Sink` 改型）。完整步骤和客户端测试里的服务端替身见笔记 02 §6.2。21118（WebSocket）**不做** KeyExchange、服务端也不先发：客户端 `use_ws()` 时 `secure_tcp`/`secure_tcp_required` 都直接跳过（客户端 `src/common.rs` `secure_tcp_impl`），`Sink::Ws` 不带加密器。`sk` 为 None（`-k` 传的是公钥）时，启动时打一条 error 日志："没有私钥，无法做 KeyExchange，登录过的客户端会连接失败；请用 `-k -` 或 `-k <base64 私钥>`"。
 2. **IPv6 信令转发**：按笔记 02 §6.5 的表补 `socket_addr_v6`（以及 `PunchHole` 的 `force_relay`、`PunchHoleResponse` 的 `upnp_port`）。不转发 `udp_port` 和 WebRTC 字段。hbbs 强制中继（`ALWAYS_USE_RELAY` 或 mask 异或）时清空转发的 v6 地址并置 `force_relay`（笔记 02 §6.4）。
-3. **路由挂钩**：`handle_punch_hole_request` 里调 `router.select(&RouteQuery{a_ip, b_ip, b_id, a_token, conn_type})`；`RelayResponse` 分支和控制台 `tg` 也改调 router。`io_loop` 的中继定时器分支、`Data::RelayServers` 删掉，健康检查挪进 router（笔记 02 §3.5）。控制台 `rs` 无参数时打印 `router.status_text()`。
+3. **路由挂钩**：`handle_punch_hole_request` 里调 `router.select(&RouteQuery{a_ip, b_ip, b_id, a_token, conn_type}).await`；`RelayResponse` 分支和控制台 `tg` 也改调 router（`b_id` 传空串）。新增控制台命令 `gu`：让路由模块立即执行一次 GeoIP 下载/重新加载并回显结果（§14 `geo update` 用）。`io_loop` 的中继定时器分支、`Data::RelayServers` 删掉，健康检查挪进 router（笔记 02 §3.5）。控制台 `rs` 无参数时打印 `router.status_text()`。
 4. **结果记录挂钩**：H1~H5 五处调用 `tracker`（笔记 02 §4.4），只取字段、不阻塞（tracker 内部用通道异步落库）。
 5. 修掉控制台 `aur` 把中继列表清空的那一行（笔记 02 §3.4）。
 6. 删掉 `check_software_update` 及其调用。
@@ -274,41 +276,59 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 
 ## 7. 路由第一级（`src/router/`）
 
-- 接口：`Router::select(&RouteQuery) -> RouteDecision { relay: String, reason: &'static str }`。返回单个中继字符串（原版客户端只认一个）；空串语义照旧（被控端退回"hbbs 主机:21117"）。
-- 候选：健康检查通过的中继。被控端（`b_id`）在 `device_policy.relay_pin` 有固定中继时直接用它，不看健康状态（运维的明确意图）。
-- 代价：`cost(R) = (rtt(A,R) + rtt(B,R)) × weight(R)`，取最小。`rtt` 按笔记 06 §4：大圆距离 × 2 × `detour` / 200 km/ms，加每段的跨运营商组、跨境惩罚；`multi_bgp` 的中继不算跨运营商。缺位置的回退规则按笔记 06 §5.2（一方未知用 `2 × rtt(已知方, R)`；都未知或中继无位置时在健康中继里轮询）。
-- 中继位置：配置覆盖优先，否则解析主机名后查库，结果缓存。客户端 IP 的查询结果做小 LRU，换库后清空。
-- 健康检查：每 3 秒对每台中继做一次 TCP 建连（3 秒超时），只有一台也要查；记录是否可达和建连耗时；全部失败时保留上一轮结果（和原版一致）。
-- GeoIP：`maxminddb`（开 `mmap`）。`source = "dbip"` 且 `auto_update` 时，启动后在后台检查、此后每天检查一次，目录里没有当月文件就下载 `dbip-{city,asn}-lite-YYYY-MM.mmdb.gz`（当月 404 时退回上月），解压到临时文件、用 maxminddb 打开抽查通过后原子替换并热切换。没有库时路由退回轮询，不阻塞启动。下载用已有的 `reqwest` + `flate2`（笔记 06 §3）。
+- 接口：`async fn select(&self, q: &RouteQuery<'_>) -> RouteDecision { relay: String, reason: &'static str }`。返回单个中继字符串（原版客户端只认一个）；空串语义照旧（被控端退回"hbbs 主机:21117"）。
+- 固定中继：每次调用按 `b_id` 查一次 `device_policy.relay_pin`（主键查询，不缓存），所以命令行 `device pin-relay` 写库后下一次连接就生效。有固定中继时直接用它，不看健康状态（运维的明确意图）。`b_id` 为空串时跳过这一步。中继列表、健康状态、GeoIP 都在内存里。
+- 候选：健康检查判为可达的中继。
+- 代价：`cost(R) = (rtt(A,R) + rtt(B,R)) × weight(R)`，取最小。`rtt` 按笔记 06 §4：大圆距离 × 2 × `detour` / 200 km/ms，加每段的跨运营商组、跨境惩罚；`multi_bgp` 的中继不算跨运营商。
+- 回退：有位置的候选按代价排序、取最小；没有位置的中继不参加排序。一方位置未知时用 `2 × rtt(已知方, R) × weight(R)`。只有双方位置都未知，或候选里一台有位置的都没有时，才在全部候选里轮询。私网、回环、链路本地、ULA 来源地址按 `server_location` 算，`100.64/10` 当作未知（笔记 06 §5.2）。
+- 惩罚的精确算法：运营商组键统一用字符串，内置表里有的用组名，没有的用 `AS<号>`；配置里的 `carrier` 可写组名或 `AS<号>`。跨运营商惩罚只在一段两端国家相同时计算，取该国覆盖值，没有覆盖用全局值；任一端组未知不加。跨境惩罚取两端国家覆盖值里较大的，都没有覆盖用全局值；任一端国家未知不加。`[[relay]]` 和 `server_location` 的覆盖按字段生效，空串或不写等于不覆盖：中继没覆盖的字段仍然查库，`server_location` 没写的字段视为未知。
+- 中继位置：配置覆盖优先，否则解析主机名后查库。启动时、每次换库热切换后、`rs` 替换中继列表后都重新计算；DNS 解析失败或库里查不到就当作没有位置，下一轮健康检查时再试，不当成永久结果缓存。客户端 IP 不做缓存，每次直接查 mmap。
+- 健康检查：配置载入时（启动、控制台 `rs` 替换）把全部中继视为可达；之后每 3 秒对每台中继做一次 TCP 建连（3 秒超时），只有一台也要查；记录是否可达和建连耗时；某一轮全部失败时保留上一轮的可达集合（和原版一致）。
+- GeoIP：`maxminddb`（开 `mmap`），文件名规则见 §5。没有库时路由退回轮询，不阻塞启动。
+  - `source = "dbip"` 且 `auto_update`：启动后在后台检查、此后每天检查一次。want = 当前 **UTC** 年月；本地 city 和 asn 都 ≥ want 就跳过。否则下载 `dbip-{city,asn}-lite-YYYY-MM.mmdb.gz`；当月 404 时，本地没有库或本地库比上月还旧才下载上月，本地已有上月文件就保持不动、次日再试。解压到 `*.part`、用 maxminddb 打开并抽查几个 IP 通过后原子改名并热切换。下载用已有的 `reqwest` + `flate2`（笔记 06 §3）。
+  - `source = "manual"`：每天检查一次两个文件的 mtime，变了就按同样的打开、抽查流程重新加载并热切换；抽查失败保留旧库。
+  - 清理：服务进程启动时删除目录里残留的 `*.part`；热切换成功后删除旧月份的 mmdb（删不掉就忽略，下次启动再删）；任何一步失败都删掉本次的 `*.part`，保留旧库，次日重试。只有服务进程做清理。
+  - 命令行 `geo lookup` 用同一个加载函数找文件。
 - 每次决策打一行 debug 日志：双方国家/运营商组、候选代价、选中的中继和 `reason`。
 - 运营商组：内置中国三大运营商的主要 ASN 表（写代码前到 bgp.he.net 或 PeeringDB 核对），查不到时按"ASN 相等算同组"。不用 AS 名称做字符串匹配。
 
 ## 8. 连接结果记录（`src/conn_tracker.rs`）
 
-- 按笔记 02 §4.4 实现：内存跟踪器（键 `try_into_v4(A:p1)`、`(A 公网 IP, B id)`、`try_into_v4(A:p3)`），每 5 秒扫一遍把到期的记录定稿写入 `conn_attempt`，定稿规则照笔记。热路径只做内存操作。
-- `a_user`/`a_device_id` 用 `PunchHoleRequest.token` 经 `auth::token_owner` 反查（未登录为 NULL）。
-- 提供统计查询给命令行：按时间范围算中继回落率 = (`relay` + `relay_or_v6`) / (`relay*` + `direct*`)，并列出各 `outcome` 的计数，以及 `b_relay ≠ relay_offered` 的次数（被控端本地写死了中继）。
+- 按笔记 02 §4.4 实现：内存跟踪器（键 `try_into_v4(A:p1)`、`(A 公网 IP, B id)`、`try_into_v4(A:p3)`），每 5 秒扫一遍把到期的记录定稿写入 `conn_attempt`，定稿规则照笔记，下面几条是对笔记的补充和更正。热路径（H1~H5）只做内存操作，不 await 数据库。
+- `a_user`/`a_device_id`：H1 只把 `PunchHoleRequest.token` 原串存进内存记录，反查放在后台（定稿写库时）调 `auth::token_owner`（async）；`a_user` 存 `user.name`，`a_device_id` 存 `token.device_id`；未登录或令牌已失效时两者都是 NULL。
+- `outcome` 取值全集：`rejected`、`no_reply`、`relay`、`relay_or_v6`、`relay_failed`、`relay_unmatched`、`direct_lan`、`direct_tcp`、`direct_tcp_or_v6`。
+- 窗口（命名常量，标注"待实测"）：直连判定窗口 `W = max(45 秒, 6 × (reply_at − started_at) + 10 秒)`（A 的直连超时 = 打洞耗时 × 6，没有封顶）；H5 匹配时要求 `RequestRelay` 落在 `reply_at + W` 以内；匹配到 `RequestRelay` 的记录，等最后一次 `relay_req_at` + 20 秒后才定稿，那时有 `relay_resp_at` 记 `relay`，没有记 `relay_failed`。
+- H5 没匹配到打洞记录：写一行 `signal='relay_only'`：`started_at`、`relay_req_at` 取收到的时刻；`a_ip`/`a_port` 取 A:p3；`via` 照实；`b_id = rf.id`；`conn_type`、`a_nat_type`、`a_force_relay`、`a_has_v6`、`server_forced_relay` 填 0；`a_user` 照常反查。有 `relay_resp_at` 记 `relay_unmatched`，没有记 `relay_failed`。
+- 统计查询（给命令行）：按时间范围算中继回落率 = count(outcome IN (`relay`,`relay_or_v6`)) / count(outcome IN (`relay`,`relay_or_v6`,`direct_lan`,`direct_tcp`,`direct_tcp_or_v6`))；`rejected`、`no_reply`、`relay_failed`、`relay_unmatched` 不进分子分母，只在分项计数里列出。另列 `relay_offered` 非空、`b_relay` 非空且两者不相等的次数（被控端本地写死了中继）。
 
 ## 9. HTTP API 通则
 
 ### 9.1 必须遵守（任何一条写错，原版客户端都会走错分支）
-1. **任何接口都不回 5xx**：客户端遇到 5xx 或连不上会改走 hbbs 的 TCP 代理（第一期不做），白等最长 36 秒，心跳也跟着卡住。内部错误：审计接口回 200 + `{"error":"…"}`（客户端会重试），其他接口回 400 + `{"error":"…"}`。
-2. 请求体一律用 `Bytes` 收、自己解析 JSON；不用 axum 的 `Json` 提取器（出错回 415/422 纯文本）。响应带 `Content-Type: application/json; charset=utf-8`。
+1. **任何接口都不回 5xx**：客户端遇到 5xx 或连不上会改走 hbbs 的 TCP 代理（第一期不做），白等最长 36 秒，心跳也跟着卡住。内部错误：审计接口回 200 + `{"error":"…"}`（客户端会重试）；`/api/currentUser` 回 200 + `{"error":"…"}`（客户端收到 400 会清本地令牌、401 会全部重置，一次临时错误不能把用户登出）；其他接口回 400 + `{"error":"…"}`。
+2. 请求体一律用 `Bytes` 收、自己解析 JSON；不用 axum 的 `Json` 提取器（出错回 415/422 纯文本）。JSON 响应带 `Content-Type: application/json; charset=utf-8`；`SYSINFO_UPDATED` 用 `text/plain; charset=utf-8`；空 body 的响应（sysinfo 403、审计成功、地址簿写接口成功）不要求 Content-Type。
 3. 令牌无效、过期、账号禁用 → **401**（客户端据此清登录态）。
 4. `/api/login-options` 回 `[]`（没有第三方登录）。
 5. 用户信息里 `name` 必须是非空字符串；登录成功必须带 `user`；`info`、`is_admin`、`status` 不能是 null（笔记 03 §2.5）。
-6. 列表接口回 `{"total": int, "data": [...]}`，`total` 必须是整数；分页参数 `current`、`pageSize`，不能把每页压到客户端要的条数以下。
+6. 列表接口回 `{"total": int, "data": [...]}`，`total` 必须是整数；分页参数 `current`、`pageSize`，不能把每页压到客户端要的条数以下。例外：`POST /api/ab/tags/<guid>` 回顶层 JSON 数组 `[{"name":string,"color":int}]`，没有标签回 `[]`，按 name 排序，不带 total、不分页。
 7. sysinfo 成功回纯文本 `SYSINFO_UPDATED`（逐字节，不带换行和引号）；**不回 `ID_NOT_FOUND`**（会让客户端每 3 秒重传）。
-8. 审计成功回 200 + **空 body**；按 `nonce` 去重 5 分钟（重复的也回空 body）。
+8. 审计成功回 200 + **空 body**。`nonce` 是可选字段：1.5.0 起才有，1.4.x 的审计不带、也不重试。带 nonce 的按 nonce 去重 5 分钟（重复的也回空 body）；不带的直接入库、不去重；不能把空串当去重键，也不能因为缺 nonce 回 4xx。nonce 只在记录写库成功后才登记进去重表，写库失败回 200 + `{"error":"…"}`，保证客户端重试时能入库。
 9. 地址簿：9 个写接口成功只认 200 + 空 body；读接口按笔记 04 §1.2 的三种解析器回；`/api/ab/personal` 永远回 200 + 非空 `guid`（个人簿不存在就当场建）；`settings`、`shared/profiles` 正常实现（不回 404）。
 10. JSON 里不给 null；字符串字段不能给数字（SQLite 读出的纯数字字符串要保持字符串）。
 - 详细字段和每个接口的推荐回包：账号/组/设备/审计看笔记 03，地址簿看笔记 04。
 
 ### 9.2 账号接口（`account.rs`）
-`GET /api/login-options`、`POST /api/login`（只做 `type=account`）、`POST /api/currentUser`、`POST /api/logout`。见 §11。
+`GET /api/login-options`、`POST /api/login`（只做 `type=account`）、`POST /api/currentUser`、`POST /api/logout`。见 §11。`currentUser` 忽略请求体，不因请求体缺字段或解析失败回 400；只有令牌无效、过期、账号禁用时回 401。
 
 ### 9.3 设备上报（`device.rs`、`audit.rs`）
-`POST /api/sysinfo`、`POST /api/heartbeat`、`POST /api/audit/conn`、`POST /api/audit/file`、`POST /api/audit/alarm`。不带认证（兼容债务），做弱校验：body 里有 `uuid`、且 hbbs 的 `peer` 表里有这个 id 时，要求 `base64(peer.uuid) == body.uuid`（编码和客户端 `encode64` 一致），不符时 sysinfo 回 403 空 body（客户端 120 秒后重试）、心跳回 `{}`、审计回 200 空 body 但不入库；`peer` 表里没有这个 id 时照常接受。控制端会话结束写备注那条 `/api/audit/conn` 只带 `id`、`session_id`、`note`，没有 uuid 和 nonce（笔记 03 §5.2），不做 uuid 校验、不按 nonce 去重，按 `session_id` 更新对应记录的 `note`。
+`POST /api/sysinfo`、`POST /api/heartbeat`、`POST /api/audit/conn`、`POST /api/audit/file`、`POST /api/audit/alarm`。不带认证（兼容债务），做弱校验：hbbs 的 `peer` 表里有这个 id 时，body **必须**带 `uuid`，且 base64 解码后与 `peer.uuid` 逐字节相等（真实客户端的心跳、sysinfo、被控端审计总是带 uuid）；缺 uuid 按不符处理：sysinfo 回 403 空 body（客户端 120 秒后重试）、心跳回 `{}`、审计回 200 空 body 但不入库。`peer` 表里没有这个 id 时照常接受。
+
+唯一免校验的是控制端会话结束写备注那条 `/api/audit/conn`：判别条件是"有 `note` 键且没有 `uuid` 键"（不能用"没有 nonce"判别，1.4.x 的审计都不带 nonce）。
+
+`audit_conn` 的关联规则：
+- `action:"new"`：插入一行，`session_id` 存 `''`。
+- 认证成功（没有 action）：找 `device_id = body.id`、`conn_id = body.conn_id`、`closed_at IS NULL` 的记录里 id 最大的一条，更新 `peer_id`、`peer_name`、`conn_type`、`session_id`（u64 十进制字符串）、`auth`、`authed_at`；找不到就新插一条（`created_at = authed_at = now`）。
+- `action:"close"`：同样的条件找到后写 `closed_at`，找不到就忽略。
+- 备注：按 `device_id = body.id` 且 `session_id = body.session_id` 更新所有匹配记录的 `note`（同一会话可能有远程桌面和文件传输两条），一条都匹配不到就忽略。
 
 ### 9.4 其他
 - `GET /`：静态说明页（HTML）：服务名 Porta、源代码地址（AGPL-3.0 第 13 条：链接到公开仓库）、"IP Geolocation by DB-IP" 署名并链接 https://db-ip.com 。客户端"在 Web 控制台管理"菜单打开的就是这里。
@@ -321,28 +341,41 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 - 下发规则（笔记 01 §2.2）：**仅当 `req.modified_at != rev` 时**，响应同时带 `"modified_at": rev` 和 `"strategy": {"config_options": {…全部生效选项…}}`；否则两者都不带。值一律是字符串，不给 null。这样"设备首次接入或策略变更时清一次 `relay-server`"自然成立，之后用户在本地改了也不会每次被覆盖。
 - 客户端是**增量合并**：只改下发里出现的键，空值表示删键（笔记 01 §3）。所以"撤销"一个推过的键不能删行，要把值写成 `''`（墓碑，下发时客户端删掉这个键）。删掉设备级的同名行，生效值回到全局值；全局也没有这个键时，客户端上的旧值不会被清掉。
 - 设备级值为 `''` 时照样覆盖全局值（也就是让这台设备删掉这个键）。
-- 设备还没有 sysinfo（`device.sysinfo = ''`）时响应带 `"sysinfo": true`。
+- 编码：`modified_at` 是 JSON 整数（i64），不能写成字符串；"值一律是字符串"只指 `config_options` 里的值。
+- `sysinfo` 键只在设备还没有 sysinfo（`device.sysinfo = ''`）时出现，值固定为 `true`；其余情况必须完全省略这个键，不能发 `false` 或 `null`（客户端只看键在不在，带了就会重传 sysinfo）。响应结构体的可选键一律用 `Option` + `skip_serializing_if`。
 - 每次心跳更新 `device.last_seen_at`、`ver`、`last_ip`；设备行不存在就建。
+- 客户端 IP（`last_ip` 等）：TCP 对端是回环地址时取 `X-Real-IP`，没有就取 `X-Forwarded-For` 的最后一个地址；否则直接用 TCP 对端地址；取到后规范化（§3）。反代和 porta-server 不在同一台机器的情况第一期不支持。
 - sysinfo：存原文，拆出 `hostname`、`username`、`os`、`version`；`client_type` 第一期一律 `rustdesk`（Porta 客户端以后在上报里加专门的键来区分，见笔记 01 §6）。
 
 ## 11. 账号、令牌、密码（`auth.rs`、`account.rs`）
 
 - 密码：argon2id（`argon2` crate 默认参数）。校验时按前缀识别 `$argon2id$`、`$2a$/$2b$/$2y$`（bcrypt）、`md5:`（rustdesk-api 旧格式 `md5(明文+"rustdesk-api")`，笔记 05 §3）；旧格式校验通过后当场改存 argon2id。`password_hash = ''` 的账号不能密码登录。
 - 令牌：32 字节随机数的 base64url（无填充），库里只存 sha256 hex。没有过期时间；登出、改密码、禁用账号时删掉该用户的令牌（登出只删当前这个）。每次使用更新 `last_used_at`。
-- 登录时把请求体里的设备 `id`/`uuid` 记进令牌行，并把 `device.user_id` 设成这个用户（设备行不存在就建）；登出时若 `device.user_id` 是本人则清空。
+- 登录时把请求体里的设备 `id`/`uuid` 记进令牌行；再做 §9.3 同样的弱校验：`peer` 表里有这个 id、且 uuid 不符时，登录照常成功但不改 `device.user_id`（防止别人把你的设备挂到自己名下）；校验通过或 `peer` 表里没有这个 id 时，把 `device.user_id` 设成这个用户（设备行不存在就建）。登出时若 `device.user_id` 是本人则清空。
+- 账号可用的判定写死为 `status = 1`。
 - 登录失败限流：只按用户名，15 分钟内失败 5 次后，15 分钟内直接拒绝（回 `{"error": "…"}`）。不按来源 IP 限：API 在反向代理后面时看到的全是代理地址，按 IP 限会把所有人一起锁住。
-- `auth::token_owner(token) -> Option<(user_id, user_name, device_id)>` 给会合模块用。
+- `async fn auth::token_owner(db, token) -> Option<(user_id, user_name, device_id)>` 给结果记录模块用（在后台调用，不在会合热路径上 await）。
 
 ## 12. 地址簿、权限、用户组（`ab.rs`、`group.rs`）
 
 ### 12.1 地址簿
 - 个人簿：每个用户一本，`personal=1`，名字固定为客户端认的 `My address book`（客户端按名字认个人簿，笔记 04 §6）。
-- 共享簿：命令行创建；名字全局唯一，且不能叫 `My address book`。`shared/profiles` 列出当前用户能看到的共享簿（主人或有规则），`owner` 填主人的用户名，`rule` 填该用户的有效权限，`info` 回 `{}`。个人簿不出现在 profiles 里。
+- 共享簿：命令行创建；名字全局唯一，且不能叫 `My address book` 或 `Legacy address book`（客户端把两者都当个人簿，后者还会让客户端切进旧版模式）。`shared/profiles` 列出当前用户能看到的共享簿（主人或有规则），`owner` 填主人的用户名，`rule` 填该用户的有效权限，`info` 回 `{}`。个人簿不出现在 profiles 里。
 - 有效权限 = 主人为 3；否则取"直接授给本人的规则"和"授给本人所在任一组的规则"中的最大值；都没有就是无权访问（读写一律 403 + `{"error"}`）。
 - 权限语义（维护者 2026-10-22 定）：1 只读；2 读写，可以增删改簿内的设备和标签；3 在 12 个接口里和 2 相同，管理簿本身（改名、成员）走命令行。只读簿收到写请求要拒绝（客户端多选模式下仍会发，笔记 04）。
 - `max_peer_one_ab` 回 0（不限）。
-- 设备：`peer/add` 对已存在的 id 按"合并更新"处理并回成功（客户端加标签、加设备都不查重，笔记 04）；`peer/update` 只合并请求里出现的字段；个人簿存 `hash`、共享簿存明文 `password`，两者都加密落盘，读出时解密回给客户端；`tags` 存字符串数组；其余字段原样存进 `data`（保留原 JSON 类型）。
-- 标签：改名、删除时由服务端级联修改本簿所有设备的 `tags`。`color` 按 i64 存取。
+- 设备：
+  - `peer/add` 遇到簿内已存在的 id：**不改任何字段**，直接回 200 空 body。客户端只按本地缓存查重；目标簿没拉取过时，重复的 id 会带着被清空的 tags 和空的 alias/note 发过来，按合并处理会把现有数据清掉（笔记 04 §3.6、§4.4）。
+  - `peer/update` 只合并请求里出现的字段；id 不在簿里回 404 + error，不新建。
+  - `DELETE peer`：一个事务里删掉存在的、忽略不存在的，回 200 空 body。
+  - 个人簿存 `hash`、共享簿存明文 `password`，两者都加密落盘。`tags` 存字符串数组。其余字段存进 `data`：写入时丢掉值为 null 的键（当作没给）；`alias、note、username、hostname、platform、rdpPort、rdpUsername、loginName、device_group_name、forceAlwaysRelay` 不是字符串、`same_server` 不是 bool 时回 400 + error。
+  - `peers` 回包每条 = `data` 的全部键 + `id` + `tags`（数组）+ 个人簿的 `hash` 或共享簿的 `password`（解密后）；`hash_enc`/`password_enc` 为 `''` 时不解密、省略这个键；客户端传来 `hash:""`/`password:""` 时存成 `''`。
+- 标签：
+  - `tag/add` 遇到同名标签：不改颜色，回 200 空 body（`on conflict do nothing`）。
+  - `tag/rename`：old 不存在回 404，new 已存在回 409；成功时同一事务里改 `ab_tag`，并把本簿所有设备 `tags` 里的 old 换成 new、去重。
+  - `tag/update`：name 不存在回 404。
+  - `DELETE tag`：忽略不存在的名字，同一事务里删标签并从本簿所有设备的 `tags` 中移除，回 200 空 body。
+  - `color` 按 i64 存取。
 - 分页和类型严格性按笔记 04 §1.6、§2。
 
 ### 12.2 用户组（维护者 2026-10-22 定：Porta 也做用户组）
@@ -357,7 +390,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 
 ## 13. 密码字段加密（`crypto.rs`）
 
-- 工作目录下的 `porta_secret.key`（32 字节随机数，首次启动生成，权限 0600，和 `id_ed25519` 放在一起）。
+- 工作目录下的 `porta_secret.key`（32 字节随机数，权限 0600，和 `id_ed25519` 放在一起）。**只有服务模式**在缺失时生成；命令行（含 import）只读已有的文件，不存在就报错退出，提示到服务的工作目录下运行或先启动一次服务（否则在别处跑命令行会多生成一把密钥，导入的密码就解不开了）。
 - `sodiumoxide::crypto::secretbox`；存储格式 `sb1:` + base64(nonce ‖ 密文)。
 - 加密的字段：`ab_peer.hash_enc`、`ab_peer.password_enc`。服务端运维者本人仍能解开，目的是防数据库文件和备份泄露。
 - 备份数据库时要连同 `porta_secret.key` 一起备份，丢了这个文件，地址簿里的密码就解不开了。
@@ -368,27 +401,34 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 - `user add <name> [--admin] [--display-name …] [--email …]`、`user passwd <name>`、`user list`、`user disable|enable <name>`、`user admin <name> on|off`、`user del <name>`
 - `group add <name> [--share-devices]`、`group del <name>`、`group list`、`group member add|rm <group> <user>`
 - `ab list`、`ab create <name> --owner <user> [--note …]`、`ab rename <name> <new>`、`ab del <name>`、`ab grant <book> --user <u>|--group <g> ro|rw|full`、`ab revoke <book> --user <u>|--group <g>`
-- `device list [--legacy]`：id、主机名、账号、客户端类型和版本、最后上报时间；`--legacy` 只列原版客户端（退出兼容时用）
+- `device list [--legacy]`：id、主机名、账号、客户端类型和版本、最后上报时间；`--legacy` 只列原版客户端（退出兼容时用），并同时列出 `conn_attempt` 里出现过、但 `device` 表里没有的 id（`b_id` 配 `b_version`；`a_device_id` 非空时配 `a_version`），标注"仅见于会合"。输出注明：从不发心跳、也从没参与过连接的设备统计不到。
 - `strategy show [<device>]`（列出生效选项和 rev）、`strategy set <device|'*'> <key> <value>`、`strategy unset <device|'*'> <key>`（写成墓碑 `''`，让客户端删掉这个键）、`strategy forget <device|'*'> <key>`（删行，不再下发这个键；设备级删掉后回到全局值）、`strategy repush <device|'*'>`（递增 epoch）
 - `device pin-relay <device> <host|none>`
 - `relay status`（控制台 `rs`）、`route test <ipA> <ipB>`（控制台 `tg`）
-- `geo lookup <ip>`（直接读本地 mmdb：国家、经纬度、ASN、运营商组）、`geo update`（立即下载）
+- `geo lookup <ip>`（直接读本地 mmdb：国家、经纬度、ASN、运营商组）、`geo update`（走控制台 `gu`，由服务进程执行下载、校验和热切换并回显结果；连不上控制台即服务没在运行时，才在命令行进程里直接下载，不做目录清理）
 - `stats [--days N]`：中继回落率和各结果计数（§8）
 - `import rustdesk-api <db 路径> [--dry-run]`（§15）
-- 名字校验：用户名、组名、簿名不能为空；共享簿名唯一且不能是 `My address book`。
+- 名字校验：用户名、组名、簿名不能为空；共享簿名唯一且不能是 `My address book` 或 `Legacy address book`。
 
 ## 15. 从 rustdesk-api 导入（`src/import.rs`）
 
-- 只读打开 rustdesk-api 的 SQLite，按笔记 05 §8 的 SQL 读取；Porta 库里已有用户时拒绝执行（只支持往空库导入一次）。`--dry-run` 只打印将导入的数量和冲突。
-- 导入：用户（密码哈希原样，登录时升级）、用户组（`groups.type=2` → `share_devices=1`）和成员、个人簿、共享簿、授权规则（个人规则和组规则分别导入）、条目、标签、设备归属（`peers.user_id`，可选）。令牌、登录日志、审计不导入。
-- 清洗：`CAST(tags AS TEXT)` 后解析，`null`/坏数据 → `[]`；重复条目、重复标签、孤儿标签按笔记 05 的规则处理；共享簿重名或叫 `My address book` 时改名并打印；`forceAlwaysRelay` 转成字符串 `"true"`/`"false"` 存进 `data`；密码和哈希加密后存。
-- 只能靠 OAuth/LDAP 登录的用户（密码为空）照样导入，打印清单，提示用 `user passwd` 设密码。
-- 导入在一个事务里完成。
+- 只读打开 rustdesk-api 的 SQLite，按笔记 05 §8 的 SQL 读取（下面写明的地方除外）；Porta 库里已有用户时拒绝执行（只支持往空库导入一次）。`--dry-run` 只打印将导入的数量、冲突和被丢弃的数据。
+- 导入：用户、用户组和成员、个人簿、共享簿、授权规则、条目、标签、设备归属（`peers.user_id`，可选）。令牌、登录日志、审计不导入。导入在一个事务里完成，结束时打印所用密钥文件的绝对路径。
+- 用户：`username→name`、`nickname→display_name`、`email→email`、`remark→note`，avatar 丢弃。`status` 为 1 → 1，其他值（rustdesk-api 的 2=禁用）→ 0；`is_admin` 用 `CAST(is_admin AS INTEGER)`，非 0 → 1。`created_at` 按 `%Y-%m-%d %H:%M:%S%.f%:z` 解析成 unix 秒，NULL 或解析失败用导入时间；其余表的时间一律用导入时间。建立旧 user id → 新 id 的映射。
+- 密码：以 `$2a$`/`$2b$`/`$2y$` 开头的原样写入；恰好 32 位 `[0-9a-f]` 的写成 `md5:` + 原值；空串写 `''`；其他无法识别的非空值写 `''`。密码为 `''` 的用户（含只能靠 OAuth/LDAP 登录的）照样导入，打印清单，提示用 `user passwd` 设密码。登录时按 §11 升级。
+- 用户组：组 = `groups` 表的行 ∪ `users.group_id` 里出现过、`groups` 表却没有的 id；后者建占位组 `rustdesk-api-group-<旧 id>`，`share_devices=0`。`groups.type=2` → `share_devices=1`。成员按 `users.group_id` 导入（每人一个组）。组名重复时第二个起追加 `-<旧 id>` 改名并打印。
+- 授权规则：**不用笔记 05 §8.3 的展开 SQL**（它把组规则展开成个人规则，违背 §12.2），换成两条，都按 MAX 去重：
+  - 个人规则 → `ab_rule.user_id`：`SELECT r.collection_id, r.to_id, MAX(r.rule) FROM address_book_collection_rules r JOIN address_book_collections c ON c.id=r.collection_id AND c.user_id=r.user_id JOIN users u ON u.id=r.to_id WHERE r.type=1 AND r.rule BETWEEN 1 AND 3 AND r.to_id<>c.user_id GROUP BY r.collection_id, r.to_id`
+  - 组规则 → `ab_rule.group_id`（映射后的组 id）：`SELECT r.collection_id, r.to_id, MAX(r.rule) FROM address_book_collection_rules r JOIN address_book_collections c ON c.id=r.collection_id AND c.user_id=r.user_id WHERE r.type=2 AND r.rule BETWEEN 1 AND 3 GROUP BY r.collection_id, r.to_id`。`to_id` 既不在 `groups` 表、也没有用户用这个 `group_id` 的，在 rustdesk-api 里本来就不起作用，跳过并写进报告。
+  - 笔记 05 §8.3 的"被丢弃的规则"报告 SQL 照用。
+- 条目：写进 `ab_peer.data` 的键名一律用客户端 `Peer.fromJson` 的键：`username`、`hostname`、`platform`、`alias`、`rdpPort`、`rdpUsername`、`loginName`（字符串），`forceAlwaysRelay`（字符串 `"true"`/`"false"`）；不写 `same_server`、`online`、`note`。密码和哈希加密后存。
+- 清洗：`CAST(tags AS TEXT)` 后解析，`null`/坏数据 → `[]`，只保留字符串元素；重复条目、重复标签、孤儿标签按笔记 05 的规则处理；共享簿重名、或叫 `My address book`/`Legacy address book` 时改名并打印。
+- 设备（可选，来自 `peers`）：按 `MIN(row_id)` 去重；`user_id` 为 0 或映射不到 → NULL；`hostname/os/username/version/uuid` 原样；`first_seen_at`、`last_seen_at` 取 `last_online_time`，为 0 时用导入时间；`last_ip` 取 `last_online_ip`；`sysinfo` 留 `''`。
 
 ## 16. 测试与验收
 
 - 构建、测试都在 Linux 测试机上跑（`cargo build`、`cargo test`）。每个模块要有单元测试；行为以笔记里的客户端代码为准，不以 rustdesk-api 为准。
-- HTTP 契约测试：用 axum `Router` + 临时 SQLite（`tower::ServiceExt::oneshot`），逐条断言 §9.1 的约定（状态码、Content-Type、空 body、字段类型），以及地址簿权限、级联、合并更新、心跳下发规则。
+- HTTP 契约测试：用 axum `Router` + 临时 SQLite（`tower::ServiceExt::oneshot`，骨架提供测试辅助），逐条断言 §9.1 的约定（状态码、Content-Type、空 body、字段类型），以及地址簿权限、级联、写接口边界、心跳下发规则（含：sysinfo 已存在时响应里没有 `sysinfo` 键；`modified_at` 是 JSON number）。
 - 会合测试：在回环地址上起真实监听，模拟客户端做 KeyExchange（v0 和 v1 都测）后发 `PunchHoleRequest`，断言 v6 地址被转发、强制中继时被清空、选中的中继符合路由规则（可参照客户端 `src/common.rs` 里的 `rendezvous_stub` 测试写法）。
 - 第一期验收（部署后由维护者用原版客户端做）：登录、地址簿、设备列表、审计正常；被控端本地写死的中继能被远程清掉；中继按双方位置选择；控制端勾选 IPv6 后两端都有 IPv6 时能直连。
 
