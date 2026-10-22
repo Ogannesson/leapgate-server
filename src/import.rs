@@ -3,7 +3,14 @@
 //! Everything is read into a [`Plan`] first (old rustdesk-api ids), the report is printed, and unless
 //! `--dry-run` the plan is written in one transaction, mapping old ids to new ones as rows are inserted.
 
-use crate::{api::account::MAX_NAME_LEN, cli::RESERVED_BOOK_NAMES, crypto::SecretBox};
+use crate::{
+    api::{
+        ab::{check_tag, MAX_PEER_TAGS},
+        account::MAX_NAME_LEN,
+    },
+    cli::RESERVED_BOOK_NAMES,
+    crypto::SecretBox,
+};
 use hbb_common::{bail, ResultType};
 use sqlx::{
     sqlite::SqliteConnectOptions, Connection as _, SqliteConnection, SqlitePool,
@@ -346,6 +353,10 @@ async fn plan(db: &SqlitePool, src_path: &Path) -> ResultType<Plan> {
     .fetch_all(&mut *src)
     .await?;
     let mut entries = Vec::new();
+    // Tags that Porta's address book writes refuse (`ab::check_tag`), by book and name: imported as
+    // they are, only reported (review C-6).
+    let mut refused_tags: BTreeMap<(BookRef, String), &str> = BTreeMap::new();
+    let mut too_many_tags = false;
     let rows = personal_rows
         .into_iter()
         .map(|row| (BookRef::Personal(row.0), row))
@@ -369,11 +380,26 @@ async fn plan(db: &SqlitePool, src_path: &Path) -> ResultType<Plan> {
             "loginName": login_name,
             "forceAlwaysRelay": if far != 0 { "true" } else { "false" },
         });
+        let tags = parse_tags(&tags);
+        if tags.len() > MAX_PEER_TAGS {
+            too_many_tags = true;
+            let _ = writeln!(
+                r,
+                "Over the limits: entry {id:?} in {} has {} tags (Porta takes at most {MAX_PEER_TAGS} on a peer)",
+                book_name(book),
+                tags.len()
+            );
+        }
+        for tag in &tags {
+            if let Err(why) = check_tag(tag) {
+                refused_tags.insert((book, tag.clone()), why);
+            }
+        }
         entries.push(Entry {
             book,
             id,
             data: data.to_string(),
-            tags: serde_json::Value::from(parse_tags(&tags)).to_string(),
+            tags: serde_json::Value::from(tags).to_string(),
             hash,
             password,
         });
@@ -426,8 +452,29 @@ async fn plan(db: &SqlitePool, src_path: &Path) -> ResultType<Plan> {
             BookRef::Shared(b) => book_ids.contains(&b),
         };
         if imported {
+            if let Err(why) = check_tag(&name) {
+                refused_tags.insert((book, name.clone()), why);
+            }
             tags.push(Tag { book, name, color });
         }
+    }
+    let listed: HashSet<(BookRef, &str)> = tags.iter().map(|t| (t.book, t.name.as_str())).collect();
+    for ((book, name), why) in &refused_tags {
+        let orphan = if listed.contains(&(*book, name.as_str())) {
+            ""
+        } else {
+            "; not in the book's tag list, so the client can neither rename nor untick it"
+        };
+        let _ = writeln!(r, "Over the limits: tag {name:?} in {}: {why}{orphan}", book_name(*book));
+    }
+    if !refused_tags.is_empty() || too_many_tags {
+        let _ = writeln!(
+            r,
+            "Entries and tags over the limits are imported as they are, but Porta refuses them in a peer's \
+             tags (400): editing the tags of such an entry fails as long as it keeps such a tag or more than \
+             {MAX_PEER_TAGS} tags, and so does adding the entry to a book that has the tag. After the import, \
+             rename these tags (client: tag menu > Rename) and untick tags on those entries."
+        );
     }
     let rows = sqlx::query_as::<_, (i64, i64, String, i64)>(
         "SELECT user_id, collection_id, name, COUNT(*) FROM tags
@@ -547,6 +594,14 @@ async fn plan(db: &SqlitePool, src_path: &Path) -> ResultType<Plan> {
         devices,
         report: r,
     })
+}
+
+/// A book in the report, by its rustdesk-api ids.
+fn book_name(book: BookRef) -> String {
+    match book {
+        BookRef::Personal(owner) => format!("the personal book of user_id {owner}"),
+        BookRef::Shared(id) => format!("collection {id}"),
+    }
 }
 
 /// Duplicate group names get `-<old id>` appended (PORTA.md §15).
@@ -1038,6 +1093,7 @@ INSERT INTO peers(row_id, id, uuid, user_id, hostname, os, username, version, la
         }
         assert!(report.contains("rule id 8 (user_id 2, collection 10, type 1, to 3, rule 1)"), "{report}");
         assert!(!report.contains("WARNING"), "{report}");
+        assert!(!report.contains("Over the limits") && !report.contains("as they are"), "{report}");
 
         // Only once.
         let err = plan(db, &f.src).await.err().unwrap().to_string();
@@ -1101,6 +1157,49 @@ INSERT INTO peers(row_id, id, uuid, user_id, hostname, os, username, version, la
         }
         write(&f.db, &f.secret, &p).await.unwrap();
         assert_eq!(count(&f.db, "select max(length(cast(name as blob))) from user").await, MAX_NAME_LEN as i64);
+    }
+
+    /// Tags Porta's writes refuse (over 64 bytes, control characters) and entries with more than 64
+    /// tags are imported unchanged and listed in the report (review C-6).
+    #[tokio::test]
+    async fn over_limit_tags_reported() {
+        let f = fixture().await;
+        let long = "长".repeat(30);
+        let many: Vec<String> = (0..65).map(|i| format!("t{i}")).collect();
+        let entry_tags = serde_json::json!([long, "ok", "a\u{1}b"]).to_string();
+        let mut conn = SqliteConnection::connect_with(&SqliteConnectOptions::new().filename(&f.src)).await.unwrap();
+        sqlx::query("INSERT INTO address_books(user_id, collection_id, id, tags) VALUES (1, 0, 'T1', ?), (1, 10, 'T2', ?)")
+            .bind(&entry_tags)
+            .bind(serde_json::json!(many).to_string())
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO tags(user_id, collection_id, name, color) VALUES (1, 0, ?, 1), (1, 0, 'ok', 1)")
+            .bind(&long)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+
+        let p = plan(&f.db, &f.src).await.unwrap();
+        for needle in [
+            format!("Over the limits: tag {long:?} in the personal book of user_id 1: Tag name too long\n"),
+            "Over the limits: tag \"a\\u{1}b\" in the personal book of user_id 1: Tag name contains control \
+             characters; not in the book's tag list"
+                .to_owned(),
+            "Over the limits: entry \"T2\" in collection 10 has 65 tags".to_owned(),
+            "rename these tags".to_owned(),
+        ] {
+            assert!(p.report.contains(&needle), "missing {needle:?} in:\n{}", p.report);
+        }
+        assert!(!p.report.contains("tag \"ok\""), "{}", p.report);
+        write(&f.db, &f.secret, &p).await.unwrap();
+        let stored: Vec<String> = sqlx::query_scalar("select tags from ab_peer where id in ('T1', 'T2') order by id")
+            .fetch_all(&f.db)
+            .await
+            .unwrap();
+        assert_eq!(stored, [entry_tags, serde_json::json!(many).to_string()], "imported unchanged");
+        assert_eq!(count(&f.db, &format!("select count(*) from ab_tag where name = '{long}'")).await, 1);
     }
 
     #[tokio::test]

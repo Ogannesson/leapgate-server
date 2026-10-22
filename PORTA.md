@@ -326,7 +326,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 
 ### 9.1 必须遵守（任何一条写错，原版客户端都会走错分支）
 1. **任何接口都不回 5xx**：客户端遇到 5xx 或连不上会改走 hbbs 的 TCP 代理（第一期不做），白等最长 36 秒，心跳也跟着卡住。内部错误：审计接口回 200 + `{"error":"…"}`（客户端会重试）；`/api/currentUser` 回 200 + `{"error":"…"}`（客户端收到 400 会清本地令牌、401 会全部重置，一次临时错误不能把用户登出）；其他接口回 400 + `{"error":"…"}`。
-2. 请求体一律用 `Bytes` 收、自己解析 JSON；不用 axum 的 `Json` 提取器（出错回 415/422 纯文本）。JSON 响应带 `Content-Type: application/json; charset=utf-8`；`SYSINFO_UPDATED` 用 `text/plain; charset=utf-8`；空 body 的响应（sysinfo 403、审计成功、地址簿写接口成功）不要求 Content-Type。axum 自己产生的错误也回 JSON：用错 HTTP 方法回 405 + `{"error":"Method Not Allowed"}`，请求体超过 2 MB（`Bytes` 的默认上限）回 413 + `{"error":"Request body too large"}`。
+2. 请求体一律用 `Bytes` 收、自己解析 JSON；不用 axum 的 `Json` 提取器（出错回 415/422 纯文本）。JSON 响应带 `Content-Type: application/json; charset=utf-8`；`SYSINFO_UPDATED` 用 `text/plain; charset=utf-8`；空 body 的响应（sysinfo 403、审计成功、地址簿写接口成功）不要求 Content-Type。axum 自己产生的错误也回 JSON：用错 HTTP 方法回 405 + `{"error":"Method Not Allowed"}`，请求体超过该路由的上限（§9.4）回 413 + `{"error":"Request body too large"}`，审计接口也回 413（客户端对 4xx 直接放弃、对 200 + error 会重试，同一个超大请求体重发没有意义）。
 3. 令牌无效、过期、账号禁用 → **401**（客户端据此清登录态）。
 4. `/api/login-options` 回 `[]`（没有第三方登录）。
 5. 用户信息里 `name` 必须是非空字符串；登录成功必须带 `user`；`info`、`is_admin`、`status` 不能是 null（笔记 03 §2.5）。
@@ -360,6 +360,13 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 ### 9.4 其他
 - `GET /`：静态说明页（HTML）：服务名 Porta、源代码地址（AGPL-3.0 第 13 条：链接到公开仓库）、"IP Geolocation by DB-IP" 署名并链接 https://db-ip.com 。客户端"在 Web 控制台管理"菜单打开的就是这里。
 - 其余未知路径回 404。
+- 连接保护（审查 C-9；常量写死，不做配置，`src/api/listen.rs`）：API 端口不用 `axum::serve`（它不给 hyper 设 timer，hyper 默认的 30 秒请求头超时因此不生效，实测发半个请求头的连接一直挂着），自己写 accept 循环：
+  - 并发连接最多 512 条，每个来源（IPv4 地址 / IPv6 /64）最多 32 条，回环来源只计入总数（和会合端口同一套规则，§6 第 8 条）。超限的连接在 accept 后直接关闭，不回 HTTP 响应，每分钟最多打一条 warn；客户端把它当连不上处理（会尝试 TCP 代理回退）。
+  - 请求头 10 秒内收完（从连接建立或上一个响应结束算起，所以也是 keep-alive 的空闲超时）；请求头最大 16 KB（hyper 默认约 400 KB），超出回 431。
+  - 整个请求（含收请求体）20 秒内要产生响应，超时按内部错误回：审计接口和 `/api/currentUser` 回 200 + `{"error":"Request timeout"}`，其他接口回 400 + `{"error":"Request timeout"}`。
+  - 套接字上有读或写在等、且 30 秒没有任何字节进出就断开（防止客户端不读响应，一直占着已经组好的响应体）。这个值要大于整请求超时：handler 执行期间 hyper 会挂着一个读来探测对端关闭，慢 handler 要先拿到超时响应。
+  - 请求体上限按路由：默认 16 KB（登录、登出、currentUser、sysinfo、心跳、单个标签的写接口，以及不读请求体的接口）；审计 64 KB（超长字段要截断入库，§9.3）；`peer/add`、`peer/update` 64 KB（合法的单条最大约 18 KB）；`DELETE /api/ab/tag` 256 KB（一本簿最多 1000 个标签）；`DELETE /api/ab/peer` 2 MB（客户端一次删除把全部 id 放进一个数组，满簿 5000 个 253 字节的 id 约 1.3 MB）。
+  - 默认监听地址不变（`0.0.0.0:21114`）。推荐部署：同机反向代理终结 HTTPS，防火墙不对外开 21114；直接暴露时以上保护照样生效，但每来源上限按 TCP 对端地址算。
 
 ## 10. 心跳与策略（`strategy.rs`、`device.rs`）
 
@@ -396,14 +403,14 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 - 有效权限 = 主人为 3；否则取"直接授给本人的规则"和"授给本人所在任一组的规则"中的最大值；都没有就是无权访问（读写一律 403 + `{"error"}`）。
 - 权限语义（维护者 2026-10-22 定）：1 只读；2 读写，可以增删改簿内的设备和标签；3 在 12 个接口里和 2 相同，管理簿本身（改名、成员）走命令行。只读簿收到写请求要拒绝（客户端多选模式下仍会发，笔记 04）。
 - 写入上限（常量写死，不做配置）：任何登录用户对自己的个人簿天生有写权限，不限的话一个账号就能写满磁盘。超出一律回 400 + `{"error"}`，客户端把它当失败提示（`_jsonDecodeActionResp` 取 `error` 文本弹 toast），不会走错分支。
-  - 每条设备：`id` ≤ 253 字节（`MAX_PEER_ID_LEN`）；`data` 按落盘的 JSON 序列化后 ≤ 8 KB，且 JSON 节点总数 ≤ 64（每个键、每个值都算一个，嵌套的数组和对象里的元素、键、值递归计入；客户端 `Peer.toJson` 只有 11 个 data 键，即 22 个节点），两项都在 `peer/update` 合并之后再查（每次 update 都可能往同一行加键），超了整个请求不生效；`tags` ≤ 64 个、每个 ≤ 64 字节；本簿要存的 `hash`/`password`（客户端上传的明文，加密前）≤ 1 KB，另一个键照旧忽略、不查。
-  - 节点数上限的理由：`/api/ab/peers` 要把一整页解析成 JSON 对象，键值很短时内存约是原文的十倍；限住每条的节点数，一页 1000 条解析后约 10 MB。不靠调小 `pageSize` 上限来压内存：客户端翻页循环是 `while (current * pageSize < total)`，用的是它自己请求的 `pageSize`，服务端上限低于它请求的值时客户端会提前停止翻页、静默丢数据。
+  - 每条设备：`id` ≤ 253 字节（`MAX_PEER_ID_LEN`）；`data` 按落盘的 JSON 序列化后 ≤ 8 KB，且 JSON 节点总数 ≤ 64（每个键、每个值都算一个，嵌套的数组和对象里的元素、键、值递归计入；客户端 `Peer.toJson` 只有 11 个 data 键，即 22 个节点），两项都在 `peer/update` 合并之后再查（每次 update 都可能往同一行加键），超了整个请求不生效；`peer/update` 还在开事务之前先查一次请求自带的 data，超限的不带进事务（所以请求自带的 data 超限时，id 不在簿里也回 400 而不是 404）；`tags` ≤ 64 个、每个 ≤ 64 字节；本簿要存的 `hash`/`password`（客户端上传的明文，加密前）≤ 1 KB 且不能含控制字符（理由同标签名，见下），另一个键照旧忽略、不查。
+  - 节点数上限的理由：解析成 JSON 对象后，键值很短时内存约是原文的十倍；`peer/update` 要把库里的一行解析出来合并。`/api/ab/peers` 逐行解析、马上序列化进响应缓冲，不建整页的对象树。一页的内存（实测，1000 条最坏的行：id 253 字节，data 约 8 KB，64 个全是引号的 64 字节标签序列化后约 8.4 KB，hash 1 KB 加密后约 1.4 KB）：查出的原文约 18 MB 加响应缓冲约 18 MB，handler 内峰值约 36 MB；返回后响应体约 18 MB，客户端读完或连接断开（30 秒不读，§9.4）才释放。原版客户端每页只要 100 条，约是十分之一。不靠调小 `pageSize` 上限来压内存：客户端翻页循环是 `while (current * pageSize < total)`，用的是它自己请求的 `pageSize`，服务端上限低于它请求的值时客户端会提前停止翻页、静默丢数据。
   - 标签名（`tag/add`、`tag/rename` 的新名字，设备 `tags` 里的每个元素）≤ 64 字节，且不能含控制字符（`char::is_control`），否则回 400。理由：serde_json 把控制字符写成 6 字节的 `\u00XX`，级联改写一次读出的 tags 最多会膨胀到字节数的 6 倍；禁掉后最坏约 21 MB（5000 个设备 × 64 个 64 字节的标签；标签全是引号、反斜杠时每字节转义成 2 字节，约 42 MB），这一步在写锁事务里串行执行，可以接受。
   - 每本簿最多 5000 个设备、1000 个标签：计数和插入在同一条语句里，并发添加也不会超。簿满时 `peer/add` 新 id 回 400，簿里已有的 id 照旧回 200 空 body、不改字段；`tag/add` 同理（已有的名字照旧成功）。
   - 5000 是按在线状态查询定的：客户端把一个标签页的全部 id 放进一条 `OnlineRequest` 发到 21115，那里单帧上限 128 KB（§6 第 8 条）；5000 个 16 字符的 id 约 90 KB，簿满时在线状态也能查出来。
   - `max_peer_one_ab` 回 5000（和设备上限一致）。客户端拿到后，本地缓存的条数到了这个数就不再发添加请求，直接提示 `exceed_max_devices`（`Ab.isFull`，笔记 04 §3.2）。
   - `/api/ab/tags` 不分页、`tag/rename`/`DELETE tag` 的级联改写一次读出本簿所有带该标签的设备，两者靠上面的标签数、设备数和每条 tags 的上限封顶。
-  - 从 rustdesk-api 导入（§15）不查这些上限。
+  - 从 rustdesk-api 导入（§15）不查这些上限，超限的标签只写进报告，后果见 §15。
 - 设备：
   - `peer/add` 遇到簿内已存在的 id：**不改任何字段**，直接回 200 空 body。客户端只按本地缓存查重；目标簿没拉取过时，重复的 id 会带着被清空的 tags 和空的 alias/note 发过来，按合并处理会把现有数据清掉（笔记 04 §3.6、§4.4）。
   - `peer/update` 只合并请求里出现的字段；id 不在簿里回 404 + error，不新建。
@@ -416,7 +423,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
   - `tag/update`：name 不存在回 404。
   - `DELETE tag`：忽略不存在的名字，同一事务里删标签并从本簿所有设备的 `tags` 中移除，回 200 空 body。
   - `color` 按 i64 存取。
-- 分页和类型严格性按笔记 04 §1.6、§2。`pageSize` 最大 1000，超过的按 1000 截断，`total` 照样是全部条数（客户端写死每页 100，按 `total` 翻页；`/api/ab/peers` 一页要整页读进内存解析）。这个上限对所有分页接口（含 §12.3 组面板）都生效。
+- 分页和类型严格性按笔记 04 §1.6、§2。`pageSize` 最大 1000，超过的按 1000 截断，`total` 照样是全部条数（客户端写死每页 100，按 `total` 翻页；`/api/ab/peers` 一页的原文和回包都在内存里，见上面的估算）。这个上限对所有分页接口（含 §12.3 组面板）都生效。
 
 ### 12.2 用户组（维护者 2026-10-22 定：Porta 也做用户组）
 - 一个用户可以在多个组里（`group_member`）。共享簿可以授权给组（`ab_rule.group_id`），成员变动后权限立即跟着变。
@@ -466,6 +473,8 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
   - 笔记 05 §8.3 的"被丢弃的规则"报告 SQL 照用。
 - 条目：写进 `ab_peer.data` 的键名一律用客户端 `Peer.fromJson` 的键：`username`、`hostname`、`platform`、`alias`、`rdpPort`、`rdpUsername`、`loginName`（字符串），`forceAlwaysRelay`（字符串 `"true"`/`"false"`）；不写 `same_server`、`online`、`note`。密码和哈希加密后存。
 - 清洗：`CAST(tags AS TEXT)` 后解析，`null`/坏数据 → `[]`，只保留字符串元素；重复条目、重复标签、孤儿标签按笔记 05 的规则处理；共享簿重名、或叫 `My address book`/`Legacy address book` 时改名并打印。
+- 超出 §12.1 上限的标签（审查 C-6）：超过 64 字节或含控制字符的标签名（标签表和条目的 tags 里出现的都算），以及标签超过 64 个的条目，原样导入，报告（`--dry-run` 也输出）逐条列出，孤儿标签另外注明。后果：带这类标签的设备，改标签时只要还保留它（或仍超过 64 个），`peer/update` 就回 400；把这台设备加进同样有该标签的簿，`peer/add` 也回 400。导入后用客户端标签菜单的 Rename 把它改短（`tag/rename` 只查新名字，会级联改掉设备上的旧名）；孤儿标签不在簿的标签列表里，客户端既改不了名也取消不了勾选。
+- `data` 只由上面列出的固定键组成，不会出现 `id`、`tags`、`hash`、`password`，`/api/ab/peers` 拼回包时不会和这几个键冲突。
 - 设备（可选，来自 `peers`）：按 `MIN(row_id)` 去重；`user_id` 为 0 或映射不到 → NULL；`hostname/os/username/version/uuid` 原样；`first_seen_at`、`last_seen_at` 取 `last_online_time`，为 0 时用导入时间；`last_ip` 取 `last_online_ip`；`sysinfo` 留 `''`。导入时 `device` 表里已经有的行（服务启动后设备心跳写进来的）保留原数据，只补上空着的 `user_id`，并在报告里列出这类设备的数量。
 
 ## 16. 测试与验收

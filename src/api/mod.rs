@@ -9,17 +9,22 @@ pub(crate) mod account;
 pub(crate) mod audit;
 pub(crate) mod device;
 pub(crate) mod group;
+mod listen;
 
 use crate::state::AppState;
 use axum::{
     body::Body,
-    extract::{ConnectInfo, FromRequestParts, Request, State},
+    extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, Request, State},
     http::{header, request::Parts, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
 };
-use hbb_common::{futures::FutureExt as _, log, tokio::net::TcpListener};
+use hbb_common::{
+    futures::FutureExt as _,
+    log,
+    tokio::{self, net::TcpListener},
+};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_derive::Deserialize;
 use std::{
@@ -33,7 +38,26 @@ const JSON: &str = "application/json; charset=utf-8";
 const TEXT: &str = "text/plain; charset=utf-8";
 const HTML: &str = "text/html; charset=utf-8";
 
+// Request body limits (review C-9/C-14; over one → 413, `json_rejections`). Real bodies are small;
+// the 2 MB default of `Bytes` let any request make a handler hold and parse 2 MB.
+/// Every route not listed below: login, logout, currentUser, sysinfo (over 8 KB is a 403 anyway,
+/// §9.3), heartbeat, single-tag writes, and the routes that ignore their body. Real ones are under 2 KB.
+const BODY_LIMIT: usize = 16 * 1024;
+/// Audit reports: real ones are under 4 KB, but over-long fields (a session note can be any length)
+/// are truncated and stored (§9.3), so allow a few times the 4 KB field caps.
+const AUDIT_BODY_LIMIT: usize = 64 * 1024;
+/// `peer/add` and `peer/update`, one peer each (ab_model.dart sends them one by one): the largest
+/// valid one is ~18 KB (data 8 KB + 64 tags of 64 bytes, quotes escaped + hash 1 KB + id).
+const AB_PEER_BODY_LIMIT: usize = 64 * 1024;
+/// `DELETE /api/ab/tag`: the selected names in one array, up to a book's 1000 tags of 64 bytes
+/// (~131 KB if every byte is an escaped quote).
+const AB_TAG_DELETE_BODY_LIMIT: usize = 256 * 1024;
+/// `DELETE /api/ab/peer`: ab_model.dart puts every id to delete in one array, up to a book's 5000
+/// ids of 253 bytes (~1.3 MB).
+const AB_PEER_DELETE_BODY_LIMIT: usize = 2 * 1024 * 1024;
+
 pub(crate) fn router(state: AppState) -> axum::Router {
+    let limit = DefaultBodyLimit::max;
     axum::Router::new()
         .route("/", get(index))
         // Account (account.rs)
@@ -48,34 +72,34 @@ pub(crate) fn router(state: AppState) -> axum::Router {
         // Device reports (device.rs, audit.rs)
         .route("/api/sysinfo", post(device::sysinfo))
         .route("/api/heartbeat", post(device::heartbeat))
-        .route("/api/audit/conn", post(audit::conn))
-        .route("/api/audit/file", post(audit::file))
-        .route("/api/audit/alarm", post(audit::alarm))
+        .route("/api/audit/conn", post(audit::conn).layer(limit(AUDIT_BODY_LIMIT)))
+        .route("/api/audit/file", post(audit::file).layer(limit(AUDIT_BODY_LIMIT)))
+        .route("/api/audit/alarm", post(audit::alarm).layer(limit(AUDIT_BODY_LIMIT)))
         // Address book (ab.rs)
         .route("/api/ab/personal", post(ab::personal))
         .route("/api/ab/settings", post(ab::settings))
         .route("/api/ab/shared/profiles", post(ab::shared_profiles))
         .route("/api/ab/peers", post(ab::peers))
         .route("/api/ab/tags/{guid}", post(ab::tags))
-        .route("/api/ab/peer/add/{guid}", post(ab::peer_add))
-        .route("/api/ab/peer/update/{guid}", put(ab::peer_update))
-        .route("/api/ab/peer/{guid}", delete(ab::peer_delete))
+        .route("/api/ab/peer/add/{guid}", post(ab::peer_add).layer(limit(AB_PEER_BODY_LIMIT)))
+        .route("/api/ab/peer/update/{guid}", put(ab::peer_update).layer(limit(AB_PEER_BODY_LIMIT)))
+        .route("/api/ab/peer/{guid}", delete(ab::peer_delete).layer(limit(AB_PEER_DELETE_BODY_LIMIT)))
         .route("/api/ab/tag/add/{guid}", post(ab::tag_add))
         .route("/api/ab/tag/rename/{guid}", put(ab::tag_rename))
         .route("/api/ab/tag/update/{guid}", put(ab::tag_update))
-        .route("/api/ab/tag/{guid}", delete(ab::tag_delete))
+        .route("/api/ab/tag/{guid}", delete(ab::tag_delete).layer(limit(AB_TAG_DELETE_BODY_LIMIT)))
         .fallback(not_found)
+        // Outside the per-route layers above, so theirs is set last and wins.
+        .layer(limit(BODY_LIMIT))
         .layer(middleware::from_fn(json_rejections))
         .layer(middleware::from_fn(catch_panic))
+        .layer(middleware::from_fn(request_timeout))
         .with_state(state)
 }
 
-/// Serves the API until the listener fails; spawned by `start_with_bind`.
+/// Serves the API with connection caps and timeouts (`listen`); spawned by `start_with_bind`.
 pub(crate) async fn serve(listener: TcpListener, state: AppState) {
-    let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
-    if let Err(err) = axum::serve(listener, app).await {
-        log::error!("API server stopped: {err}");
-    }
+    listen::serve(listener, router(state)).await;
 }
 
 // ---- Responses ----
@@ -91,6 +115,11 @@ pub(crate) fn json<T: Serialize + ?Sized>(status: StatusCode, value: &T) -> Resp
 /// 200 + JSON.
 pub(crate) fn ok_json<T: Serialize + ?Sized>(value: &T) -> Response {
     json(StatusCode::OK, value)
+}
+
+/// 200 + JSON serialized by the caller.
+pub(crate) fn ok_json_bytes(body: Vec<u8>) -> Response {
+    (StatusCode::OK, [(header::CONTENT_TYPE, JSON)], body).into_response()
 }
 
 /// 200 + empty body (address book writes, audit success).
@@ -181,11 +210,11 @@ pub(crate) fn parse_json<T: DeserializeOwned>(body: &[u8]) -> Result<T, ApiError
     serde_json::from_slice(body).map_err(|err| ApiError::bad_request(&format!("Invalid request body: {err}")))
 }
 
-/// Largest page: one `/api/ab/peers` page is parsed into memory whole. The client always asks for
-/// 100 (`pageSize = 100` in flutter/lib/models/ab_model.dart and group_model.dart, note 04 §1.1)
-/// and pages with its own value (`while (current * pageSize < total)`): a cap below what any client
-/// asks would make it stop early and silently drop entries, so this stays well above 100 and the
-/// memory of a page is bounded per row instead (`ab::MAX_DATA_NODES`).
+/// Largest page: one `/api/ab/peers` page is read and its response built in memory whole (about
+/// 18 MB for 1000 of the largest rows, PORTA.md §12.1). The client always asks for 100 (`pageSize =
+/// 100` in flutter/lib/models/ab_model.dart and group_model.dart, note 04 §1.1) and pages with its
+/// own value (`while (current * pageSize < total)`): a cap below what any client asks would make it
+/// stop early and silently drop entries, so this stays well above 100.
 const MAX_PAGE_SIZE: i64 = 1000;
 
 /// `current`, `pageSize`, `status` (the group panel's user filter) and `ab` (`/api/ab/peers`);
@@ -229,7 +258,8 @@ pub(crate) struct CurrentUser {
     pub id: i64,
     pub name: String,
     pub is_admin: bool,
-    /// `token.token_hash` of the token used (logout deletes only this one).
+    /// `token.token_hash` of the token used (logout deletes it, plus the user's other tokens with
+    /// the same non-empty `device_id`).
     pub token_hash: String,
 }
 
@@ -339,8 +369,10 @@ async fn not_found() -> Response {
     error(StatusCode::NOT_FOUND, "Not Found")
 }
 
-/// axum's own 405 (wrong method) and 413 (body over the 2 MB default limit of `Bytes`) are plain
-/// text; §9.1 wants JSON errors. No handler of ours answers either status.
+/// axum's own 405 (wrong method) and 413 (body over the route's limit, `BODY_LIMIT` and the
+/// others) are plain text; §9.1 wants JSON errors. No handler of ours answers either status. The
+/// audit endpoints keep the 413 too: the client gives up on a 4xx at once and retries a 200 with
+/// an error, and resending the same body cannot help.
 async fn json_rejections(req: Request<Body>, next: Next) -> Response {
     let resp = next.run(req).await;
     let msg = match resp.status() {
@@ -353,6 +385,19 @@ async fn json_rejections(req: Request<Body>, next: Next) -> Response {
         json.headers_mut().insert(header::ALLOW, allow.clone());
     }
     json
+}
+
+/// A request not answered within `listen::REQUEST_TIMEOUT` (receiving its body included) gets an
+/// internal-error answer (§9.1): 200 + `{"error"}` from the audit endpoints (the client retries)
+/// and `/api/currentUser` (a 400 would log the user out), 400 + `{"error"}` from the others.
+async fn request_timeout(req: Request<Body>, next: Next) -> Response {
+    let path = req.uri().path();
+    let ok_status = path.starts_with("/api/audit/") || path == "/api/currentUser";
+    match tokio::time::timeout(listen::REQUEST_TIMEOUT, next.run(req)).await {
+        Ok(resp) => resp,
+        Err(_) if ok_status => ok_error("Request timeout"),
+        Err(_) => error(StatusCode::BAD_REQUEST, "Request timeout"),
+    }
 }
 
 /// A panicking handler answers like any other internal error instead of dropping the connection
@@ -406,8 +451,50 @@ mod tests {
             assert_eq!(&body[..], br#"{"error":"Request body too large"}"#, "{path}");
         }
         // Still within the limit: the handler's own answer.
-        let (status, ct, _) = send(&t.app, "POST", "/api/login", None, &"x".repeat(1 << 20)).await;
+        let (status, ct, _) = send(&t.app, "POST", "/api/login", None, &"x".repeat(BODY_LIMIT)).await;
         assert_eq!((status, ct.as_str()), (StatusCode::BAD_REQUEST, JSON));
+    }
+
+    #[tokio::test]
+    async fn body_limits_per_route() {
+        let t = testutil::app().await;
+        let (_, token) = testutil::create_user(&t.state.db, "u", "pw", false).await;
+        let guid = String::from_utf8(send(&t.app, "POST", "/api/ab/personal", Some(&token), "").await.2.to_vec())
+            .unwrap();
+        let guid = serde_json::from_str::<serde_json::Value>(&guid).unwrap()["guid"].as_str().unwrap().to_owned();
+        let routes: &[(&str, String, usize)] = &[
+            ("POST", "/api/login".into(), BODY_LIMIT),
+            ("POST", "/api/currentUser".into(), BODY_LIMIT),
+            ("POST", "/api/sysinfo".into(), BODY_LIMIT),
+            ("POST", "/api/heartbeat".into(), BODY_LIMIT),
+            ("POST", "/api/audit/conn".into(), AUDIT_BODY_LIMIT),
+            ("POST", "/api/audit/file".into(), AUDIT_BODY_LIMIT),
+            ("POST", "/api/audit/alarm".into(), AUDIT_BODY_LIMIT),
+            ("POST", format!("/api/ab/peer/add/{guid}"), AB_PEER_BODY_LIMIT),
+            ("PUT", format!("/api/ab/peer/update/{guid}"), AB_PEER_BODY_LIMIT),
+            ("DELETE", format!("/api/ab/peer/{guid}"), AB_PEER_DELETE_BODY_LIMIT),
+            ("POST", format!("/api/ab/tag/add/{guid}"), BODY_LIMIT),
+            ("PUT", format!("/api/ab/tag/rename/{guid}"), BODY_LIMIT),
+            ("PUT", format!("/api/ab/tag/update/{guid}"), BODY_LIMIT),
+            ("DELETE", format!("/api/ab/tag/{guid}"), AB_TAG_DELETE_BODY_LIMIT),
+            // Last: at the limit it logs the token out.
+            ("POST", "/api/logout".into(), BODY_LIMIT),
+        ];
+        // A real batch delete of a full book's longest ids fits.
+        let ids: Vec<String> = (0..5000).map(|i| format!("{i:0>253}")).collect();
+        let (status, _, body) =
+            send(&t.app, "DELETE", &format!("/api/ab/peer/{guid}"), Some(&token), &serde_json::to_string(&ids).unwrap())
+                .await;
+        assert_eq!((status, &body[..]), (StatusCode::OK, &b""[..]));
+        for (method, path, max) in routes {
+            let (status, ct, body) = send(&t.app, method, path, Some(&token), &" ".repeat(max + 1)).await;
+            assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{method} {path} over {max}");
+            assert_eq!(ct, JSON, "{method} {path}");
+            assert_eq!(&body[..], br#"{"error":"Request body too large"}"#, "{method} {path}");
+            // At the limit: whatever the handler says about the bad JSON, never 413.
+            let (status, _, _) = send(&t.app, method, path, Some(&token), &" ".repeat(*max)).await;
+            assert_ne!(status, StatusCode::PAYLOAD_TOO_LARGE, "{method} {path} at {max}");
+        }
     }
 
     #[tokio::test]
