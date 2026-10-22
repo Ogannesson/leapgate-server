@@ -400,7 +400,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 
 ## 14. 命令行（`src/cli/`）
 
-`porta-server <子命令>`，直接读写同一个数据库（`DB_URL`），启动时执行迁移。需要运行时状态的子命令走本机控制台（127.0.0.1:`port-1`）。密码一律从标准输入读一行，不放在参数里。
+`porta-server <子命令>`，直接读写同一个数据库（`DB_URL`），打开时执行迁移。需要运行时状态的子命令走本机控制台（127.0.0.1:`port-1`）。密码一律从标准输入读一行，不放在参数里。
 - `user add <name> [--admin] [--display-name …] [--email …]`、`user passwd <name>`、`user list`、`user disable|enable <name>`、`user admin <name> on|off`、`user del <name>`
 - `group add <name> [--share-devices]`、`group del <name>`、`group list`、`group member add|rm <group> <user>`
 - `ab list`、`ab create <name> --owner <user> [--note …]`、`ab rename <name> <new>`、`ab del <name>`、`ab grant <book> --user <u>|--group <g> ro|rw|full`、`ab revoke <book> --user <u>|--group <g>`
@@ -413,6 +413,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 - `import rustdesk-api <db 路径> [--dry-run]`（§15）
 - 名字校验：用户名、组名、簿名不能为空；用户名最长 128 字节（登录接口拒绝更长的名字）；共享簿名唯一且不能是 `My address book` 或 `Legacy address book`。
 - 命令行不新建数据库：`DB_URL` 指向的库文件不存在时报错退出（提示到服务的工作目录下运行或设置 `DB_URL`），写操作在输出末尾打印所用数据库的绝对路径。在错误目录下运行不会悄悄写进一个服务看不到的新库。
+- `relay status`、`route test`、`geo lookup`、`geo update` 不读写数据库：不要求库文件存在，也不打开它（不执行迁移），在任何目录下都能运行。
 
 ## 15. 从 rustdesk-api 导入（`src/import.rs`）
 

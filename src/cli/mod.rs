@@ -2,7 +2,7 @@
 //! Opens the same database as the server (`DB_URL`, read the same way: `.env`, `-c` INI, environment,
 //! command line; migrations run on open; a missing database is an error, not created); subcommands
 //! that write print its absolute path; subcommands that need runtime state talk to the local
-//! console (127.0.0.1:`port-1`).
+//! console (127.0.0.1:`port-1`). `relay`, `route` and `geo` never use the database and do not open it.
 
 mod manage;
 mod ops;
@@ -76,14 +76,26 @@ pub fn run(argv: Vec<String>) -> ResultType<()> {
     let db_url = crate::database::db_url();
     let changes = changes_database(&args);
     rt.block_on(async {
-        let ctx = Ctx {
-            db: crate::database::open(&db_url, false).await?,
-            console: SocketAddr::from(([127, 0, 0, 1], port - 1)),
-            porta_config: PathBuf::from(get_arg_or("porta-config", "porta.toml".to_owned())),
-            secret_key: PathBuf::from(crate::crypto::SECRET_KEY_FILE),
+        let console = SocketAddr::from(([127, 0, 0, 1], port - 1));
+        let porta_config = PathBuf::from(get_arg_or("porta-config", "porta.toml".to_owned()));
+        let mut out = match args.pos.front().map(String::as_str) {
+            // No database needed, so none is required or opened (review R2-6).
+            Some(cmd @ ("relay" | "route" | "geo")) => {
+                let cmd = cmd.to_owned();
+                args.pos.pop_front();
+                ops::runtime(console, &porta_config, &cmd, args).await?
+            }
+            _ => {
+                let ctx = Ctx {
+                    db: crate::database::open(&db_url, false).await?,
+                    console,
+                    porta_config,
+                    secret_key: PathBuf::from(crate::crypto::SECRET_KEY_FILE),
+                };
+                let stdin = std::io::stdin();
+                exec(&ctx, args, &mut stdin.lock()).await?
+            }
         };
-        let stdin = std::io::stdin();
-        let mut out = exec(&ctx, args, &mut stdin.lock()).await?;
         if changes {
             out += &format!("Database: {}\n", crate::database::db_file(&db_url)?.display());
         }
@@ -130,9 +142,8 @@ pub(super) async fn exec(ctx: &Ctx, mut args: Args, input: &mut dyn BufRead) -> 
     let cmd = args.next("command")?;
     match cmd.as_str() {
         "user" | "group" | "ab" => manage::exec(ctx, &cmd, args, input).await,
-        "device" | "strategy" | "relay" | "route" | "geo" | "stats" => {
-            ops::exec(ctx, &cmd, args).await
-        }
+        "device" | "strategy" | "stats" => ops::exec(ctx, &cmd, args).await,
+        "relay" | "route" | "geo" => ops::runtime(ctx.console, &ctx.porta_config, &cmd, args).await,
         "import" => {
             let kind = args.next("source kind")?;
             if kind != "rustdesk-api" {

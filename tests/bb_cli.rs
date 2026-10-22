@@ -209,6 +209,14 @@ async fn cli_never_creates_the_database_and_writes_name_it() {
     out.refused();
     assert!(out.all().contains(&db_path) && out.all().contains("DB_URL"), "{}", out.all());
     work.cli(&["user", "list"], "").refused();
+    // 不碰数据库的子命令不要求库存在（审查 R2-6）：报的是它们自己的错误（连不上控制台、没有 GeoIP 库），
+    // 不是库不存在。`-p 3` 让控制台地址落在 127.0.0.1:2，那里不会有服务在听。
+    let out = work.cli(&["relay", "status", "-p", "3"], "");
+    out.refused();
+    assert!(out.all().contains("Cannot reach the server console") && !out.all().contains("DB_URL"), "{}", out.all());
+    let out = work.cli(&["geo", "lookup", "1.1.1.1"], "");
+    out.refused();
+    assert!(out.all().contains("no usable dbip-city-lite") && !out.all().contains("DB_URL"), "{}", out.all());
     let left: Vec<_> = std::fs::read_dir(work.path())
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
