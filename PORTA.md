@@ -33,6 +33,7 @@
 | `src/config.rs` | `porta.toml` 解析（§5） | 骨架 |
 | `src/database.rs` | 连接池、迁移、hbbs 原有的 peer 查询 | 骨架 |
 | `src/auth.rs` | 密码哈希/校验、令牌生成/哈希/反查 | 骨架 |
+| `src/strategy.rs` | 生效选项与版本号计算（§10），设备模块和命令行共用 | 骨架 |
 | `src/crypto.rs` | 密码字段加密（§13） | 骨架 |
 | `src/api/mod.rs` | axum 路由表、通用响应和请求体解析、Bearer 认证提取器、静态说明页 | 骨架 |
 | `src/rendezvous_server.rs`、`src/kx.rs`、`src/peer.rs`、`src/common.rs` | 会合逻辑和挂钩（§6） | 会合 |
@@ -40,10 +41,10 @@
 | `src/conn_tracker.rs` | 连接结果记录与统计（§8） | 结果记录 |
 | `src/api/account.rs`、`src/api/group.rs` | 账号接口、组面板（§9.2、§11、§12.3） | 账号 |
 | `src/api/ab.rs` | 地址簿 12 个接口（§12） | 地址簿 |
-| `src/api/device.rs`、`src/api/audit.rs`、`src/strategy.rs` | sysinfo、心跳、策略、审计（§9.3、§10） | 设备 |
+| `src/api/device.rs`、`src/api/audit.rs` | sysinfo、心跳下发、审计（§9.3、§10） | 设备 |
 | `src/cli/`、`src/import.rs` | 命令行与导入（§14、§15） | 命令行 |
 
-骨架阶段为后面各模块建好空文件和函数签名（`todo!()` 只允许出现在并行模块名下的文件里，且不允许留到合并后），并行模块在签名内实现。签名需要调整时，改动方在汇报里写清楚，由集成阶段统一。
+骨架实现的 `Router`（只按配置列表轮询）和 `ConnTracker`（各挂钩方法为空操作）是能跑的最小版本，让会合模块在并行阶段就能调用和测试；路由、结果记录模块再替换内部实现，不改签名。骨架阶段为后面各模块建好空文件和函数签名（`todo!()` 只允许出现在并行模块名下的文件里，且不允许留到合并后），并行模块在签名内实现。签名需要调整时，改动方在汇报里写清楚，由集成阶段统一。
 
 依赖由骨架一次加齐，并行模块不改 `Cargo.toml`：`axum` 0.8、`argon2`、`bcrypt`、`md-5`、`sha2`、`maxminddb` 0.32（`mmap`）、`toml`、`flate2`（GeoIP 解压，之前当死依赖删了）、sqlx 补 `migrate` 特性，dev 依赖 `tower`（`ServiceExt::oneshot`）。版本选发布满两周的。
 
