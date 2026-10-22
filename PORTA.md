@@ -271,6 +271,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 3. **路由挂钩**：`handle_punch_hole_request` 里调 `router.select(&RouteQuery{a_ip, b_ip, b_id, a_token, conn_type}).await`；`RelayResponse` 分支和控制台 `tg` 也改调 router（`b_id` 传空串）。新增控制台命令 `gu`：让路由模块立即执行一次 GeoIP 下载/重新加载并回显结果（§14 `geo update` 用）。`io_loop` 的中继定时器分支、`Data::RelayServers` 删掉，健康检查挪进 router（笔记 02 §3.5）。控制台 `rs` 无参数时打印 `router.status_text()`。
 4. **结果记录挂钩**：H1~H5 五处调用 `tracker`（笔记 02 §4.4），只取字段、不阻塞（tracker 内部用通道异步落库）。
 5. 修掉控制台 `aur` 把中继列表清空的那一行（笔记 02 §3.4）。
+5a. 21118（WebSocket）只在 TCP 对端是回环地址时才信任 `X-Real-IP`/`X-Forwarded-For`，否则用 TCP 对端地址（原版对任何来源都信任，直连 21118 就能伪造来源 IP，影响按 IP 选中继、限流和记录；笔记 02 §5）。反向代理和 porta-server 同机部署时行为不变。
 6. 删掉 `check_software_update` 及其调用。
 7. 不改：注册规则、`UUID_MISMATCH` 逻辑、IP 限流、mask/local_ip、`test_hbbs` 自检。
 
