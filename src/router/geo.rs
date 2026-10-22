@@ -272,8 +272,8 @@ pub(crate) fn remove_parts(dir: &Path) {
     }
 }
 
-/// After a hot swap: removes the DB-IP files of other months than the loaded ones. Failures are
-/// ignored (Windows refuses while a file is mapped); the next start tries again.
+/// At server start and after a hot swap: removes the DB-IP files of other months than the loaded ones.
+/// Failures are ignored (Windows refuses while a file is mapped); the next start tries again.
 pub(crate) fn remove_old_months(dir: &Path, keep: &GeoInfo) {
     for kind in [Kind::City, Kind::Asn] {
         for (_, path) in dbip_files(dir, kind) {
