@@ -1,12 +1,15 @@
 use crate::common::*;
+use crate::conn_tracker::{
+    PunchRequest, RelayRequest, RelayResponseInfo, Reply, ReplyKind, Signal,
+};
 use crate::peer::*;
+use crate::router::RouteQuery;
 use crate::state::AppState;
 use hbb_common::{
     allow_err, bail,
     bytes::{Bytes, BytesMut},
     bytes_codec::BytesCodec,
     config,
-    futures::future::join_all,
     futures_util::{
         sink::SinkExt,
         stream::{SplitSink, StreamExt},
@@ -17,7 +20,7 @@ use hbb_common::{
         register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
-    tcp::FramedStream,
+    tcp::{Encrypt, FramedStream},
     timeout,
     tokio::{
         self,
@@ -36,7 +39,7 @@ use sodiumoxide::crypto::sign;
 use std::{
     collections::{HashMap, VecDeque},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
     time::Instant,
 };
@@ -45,21 +48,18 @@ use std::{
 enum Data {
     Msg(Box<RendezvousMessage>, SocketAddr),
     RelayServers0(String),
-    RelayServers(RelayServers),
 }
 
 const REG_TIMEOUT: i64 = 30_000;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 enum Sink {
-    TcpStream(TcpStreamSink),
+    /// With the sending half of the cipher once the client completed the KeyExchange.
+    TcpStream(TcpStreamSink, Option<Encrypt>),
     Ws(WsSink),
 }
 type Sender = mpsc::UnboundedSender<Data>;
 type Receiver = mpsc::UnboundedReceiver<Data>;
-static ROTATION_RELAY_SERVER: AtomicUsize = AtomicUsize::new(0);
-type RelayServers = Vec<String>;
-const CHECK_RELAY_TIMEOUT: u64 = 3_000;
 static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
 
 // Store punch hole requests
@@ -104,11 +104,8 @@ pub struct RendezvousServer {
     tcp_punch: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
     pm: PeerMap,
     tx: Sender,
-    relay_servers: Arc<RelayServers>,
-    relay_servers0: Arc<RelayServers>,
     rendezvous_servers: Arc<Vec<String>>,
     inner: Arc<Inner>,
-    #[allow(dead_code)]
     state: AppState,
 }
 
@@ -134,6 +131,9 @@ impl RendezvousServer {
         rmem: usize,
     ) -> ResultType<()> {
         let (key, sk) = Self::get_server_sk(key)?;
+        if sk.is_none() {
+            log::error!("No private key, so no KeyExchange: clients that have logged in will fail to connect; use `-k -` or `-k <base64 private key>`");
+        }
         let nat_port = port - 1;
         let ws_port = port + 2;
         let db = crate::database::open(&crate::database::db_url()).await?;
@@ -171,8 +171,6 @@ impl RendezvousServer {
             tcp_punch: Arc::new(Mutex::new(HashMap::new())),
             pm,
             tx: tx.clone(),
-            relay_servers: Default::default(),
-            relay_servers0: Default::default(),
             rendezvous_servers: Arc::new(rendezvous_servers),
             inner: Arc::new(Inner {
                 serial,
@@ -187,7 +185,6 @@ impl RendezvousServer {
         log::info!("mask: {:?}", rs.inner.mask);
         log::info!("local-ip: {:?}", rs.inner.local_ip);
         std::env::set_var("PORT_FOR_API", port.to_string());
-        rs.parse_relay_servers(&get_arg("relay-servers"));
         let mut listener = create_tcp_listener(bind_addr, port).await?;
         let mut listener2 = create_tcp_listener(bind_addr, nat_port).await?;
         let mut listener3 = create_tcp_listener(bind_addr, ws_port).await?;
@@ -291,23 +288,12 @@ impl RendezvousServer {
         socket: &mut FramedSocket,
         key: &str,
     ) -> LoopFailure {
-        let mut timer_check_relay = interval(Duration::from_millis(CHECK_RELAY_TIMEOUT));
         loop {
             tokio::select! {
-                _ = timer_check_relay.tick() => {
-                    if self.relay_servers0.len() > 1 {
-                        let rs = self.relay_servers0.clone();
-                        let tx = self.tx.clone();
-                        tokio::spawn(async move {
-                            check_relay_servers(rs, tx).await;
-                        });
-                    }
-                }
                 Some(data) = rx.recv() => {
                     match data {
                         Data::Msg(msg, addr) => { allow_err!(socket.send(msg.as_ref(), addr).await); }
                         Data::RelayServers0(rs) => { self.parse_relay_servers(&rs); }
-                        Data::RelayServers(rs) => { self.relay_servers = Arc::new(rs); }
                     }
                 }
                 res = socket.next() => {
@@ -561,7 +547,17 @@ impl RendezvousServer {
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
-                    if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
+                    let peer = self.pm.get_in_memory(&rf.id).await;
+                    // H5
+                    self.state.tracker.on_request_relay(RelayRequest {
+                        a_addr: try_into_v4(addr),
+                        b_id: rf.id.clone(),
+                        uuid: rf.uuid.clone(),
+                        relay_server: rf.relay_server.clone(),
+                        token: rf.token.clone(),
+                        found_in_memory: peer.is_some(),
+                    });
+                    if let Some(peer) = peer {
                         let mut msg_out = RendezvousMessage::new();
                         rf.socket_addr = AddrMangle::encode(addr).into();
                         msg_out.set_request_relay(rf);
@@ -573,6 +569,15 @@ impl RendezvousServer {
                 Some(rendezvous_message::Union::RelayResponse(mut rr)) => {
                     let addr_b = AddrMangle::decode(&rr.socket_addr);
                     rr.socket_addr = Default::default();
+                    // H4, before relay_server is rewritten
+                    self.state.tracker.on_relay_response(RelayResponseInfo {
+                        a_addr: try_into_v4(addr_b),
+                        uuid: rr.uuid.clone(),
+                        b_id: rr.id().to_owned(),
+                        b_relay: rr.relay_server.clone(),
+                        b_version: rr.version.clone(),
+                        b_has_v6: !rr.socket_addr_v6.is_empty(),
+                    });
                     let id = rr.id();
                     if !id.is_empty() {
                         let pk = self.get_pk(&rr.version, id.to_owned()).await;
@@ -584,7 +589,19 @@ impl RendezvousServer {
                             // https://github.com/rustdesk/rustdesk-server/issues/24
                             rr.relay_server = self.inner.local_ip.clone();
                         } else if rr.relay_server == self.inner.local_ip {
-                            rr.relay_server = self.get_relay_server(addr.ip(), addr_b.ip());
+                            // addr is B (the controlled side), addr_b is A
+                            rr.relay_server = self
+                                .state
+                                .router
+                                .select(&RouteQuery {
+                                    a_ip: try_into_v4(addr_b).ip(),
+                                    b_ip: try_into_v4(addr).ip(),
+                                    b_id: "",
+                                    a_token: "",
+                                    conn_type: 0,
+                                })
+                                .await
+                                .relay;
                         }
                     }
                     msg_out.set_relay_response(rr);
@@ -685,11 +702,23 @@ impl RendezvousServer {
             &addr_a,
             &addr
         );
+        // H2
+        self.state.tracker.on_reply(Reply {
+            a_addr: try_into_v4(addr_a),
+            kind: ReplyKind::PunchHoleSent,
+            b_id: phs.id.clone(),
+            b_relay: phs.relay_server.clone(),
+            b_nat_type: phs.nat_type.value(),
+            b_version: phs.version.clone(),
+            b_has_v6: !phs.socket_addr_v6.is_empty(),
+        });
         let mut msg_out = RendezvousMessage::new();
         let mut p = PunchHoleResponse {
             socket_addr: AddrMangle::encode(addr).into(),
             pk: self.get_pk(&phs.version, phs.id).await,
             relay_server: phs.relay_server.clone(),
+            socket_addr_v6: phs.socket_addr_v6,
+            upnp_port: phs.upnp_port,
             ..Default::default()
         };
         if let Ok(t) = phs.nat_type.enum_value() {
@@ -719,11 +748,22 @@ impl RendezvousServer {
             &addr_a,
             &addr
         );
+        // H3
+        self.state.tracker.on_reply(Reply {
+            a_addr: try_into_v4(addr_a),
+            kind: ReplyKind::LocalAddr,
+            b_id: la.id.clone(),
+            b_relay: la.relay_server.clone(),
+            b_nat_type: 0,
+            b_version: la.version.clone(),
+            b_has_v6: !la.socket_addr_v6.is_empty(),
+        });
         let mut msg_out = RendezvousMessage::new();
         let mut p = PunchHoleResponse {
             socket_addr: la.local_addr.clone(),
             pk: self.get_pk(&la.version, la.id).await,
             relay_server: la.relay_server,
+            socket_addr_v6: la.socket_addr_v6,
             ..Default::default()
         };
         p.set_is_local(true);
@@ -745,8 +785,27 @@ impl RendezvousServer {
         ws: bool,
     ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
         let mut ph = ph;
+        // H1: one record per request, taken before `ph` is changed or moved
+        let mut track = PunchRequest {
+            a_addr: try_into_v4(addr),
+            ws,
+            token: ph.token.clone(),
+            a_version: ph.version.clone(),
+            b_id: ph.id.clone(),
+            b_addr: None,
+            conn_type: ph.conn_type.value(),
+            nat_type: ph.nat_type.value(),
+            force_relay: ph.force_relay,
+            has_v6: !ph.socket_addr_v6.is_empty(),
+            udp_port: ph.udp_port,
+            signal: Signal::FailLicense,
+            server_forced_relay: false,
+            relay_offered: String::new(),
+            route_reason: "",
+        };
         if !key.is_empty() && ph.licence_key != key {
             log::warn!("Authentication failed from {} for peer {} - invalid key", addr, ph.id);
+            self.state.tracker.on_punch_request(track);
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
                 failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),
@@ -765,7 +824,10 @@ impl RendezvousServer {
                 let r = peer.read().await;
                 (r.last_reg_time.elapsed().as_millis() as i64, r.socket_addr)
             };
+            track.b_addr = Some(try_into_v4(peer_addr));
             if elapsed >= REG_TIMEOUT {
+                track.signal = Signal::FailOffline;
+                self.state.tracker.on_punch_request(track);
                 let mut msg_out = RendezvousMessage::new();
                 msg_out.set_punch_hole_response(PunchHoleResponse {
                     failure: punch_hole_response::Failure::OFFLINE.into(),
@@ -785,13 +847,28 @@ impl RendezvousServer {
             let mut msg_out = RendezvousMessage::new();
             let peer_is_lan = self.is_lan(peer_addr);
             let is_lan = self.is_lan(addr);
-            let mut relay_server = self.get_relay_server(addr.ip(), peer_addr.ip());
-            if ALWAYS_USE_RELAY.load(Ordering::SeqCst) || (peer_is_lan ^ is_lan) {
+            let route = self
+                .state
+                .router
+                .select(&RouteQuery {
+                    a_ip: try_into_v4(addr).ip(),
+                    b_ip: try_into_v4(peer_addr).ip(),
+                    b_id: &id,
+                    a_token: &ph.token,
+                    conn_type: ph.conn_type.value(),
+                })
+                .await;
+            let mut relay_server = route.relay;
+            let forced_relay = ALWAYS_USE_RELAY.load(Ordering::SeqCst) || (peer_is_lan ^ is_lan);
+            if forced_relay {
                 if peer_is_lan {
                     // https://github.com/rustdesk/rustdesk-server/issues/24
                     relay_server = self.inner.local_ip.clone()
                 }
                 ph.nat_type = NatType::SYMMETRIC.into(); // will force relay
+                // B would punch v6 beside the relay and A race the two (note 02 §6.4)
+                ph.socket_addr_v6 = Default::default();
+                ph.force_relay = true;
             }
             let same_intranet: bool = !ws
                 && (peer_is_lan && is_lan || {
@@ -802,6 +879,10 @@ impl RendezvousServer {
                     }
                 });
             let socket_addr = AddrMangle::encode(addr).into();
+            track.server_forced_relay = forced_relay;
+            track.relay_offered = relay_server.clone();
+            track.route_reason = route.reason;
+            // udp_port and the WebRTC offer are not forwarded (PORTA.md §6.2)
             if same_intranet {
                 log::debug!(
                     "Fetch local addr {:?} {:?} request from {:?}",
@@ -809,9 +890,11 @@ impl RendezvousServer {
                     peer_addr,
                     addr
                 );
+                track.signal = Signal::FetchLocalAddr;
                 msg_out.set_fetch_local_addr(FetchLocalAddr {
                     socket_addr,
                     relay_server,
+                    socket_addr_v6: ph.socket_addr_v6,
                     ..Default::default()
                 });
             } else {
@@ -821,15 +904,21 @@ impl RendezvousServer {
                     peer_addr,
                     addr
                 );
+                track.signal = Signal::PunchHole;
                 msg_out.set_punch_hole(PunchHole {
                     socket_addr,
                     nat_type: ph.nat_type,
                     relay_server,
+                    force_relay: ph.force_relay,
+                    socket_addr_v6: ph.socket_addr_v6,
                     ..Default::default()
                 });
             }
+            self.state.tracker.on_punch_request(track);
             Ok((msg_out, Some(peer_addr)))
         } else {
+            track.signal = Signal::FailIdNotExist;
+            self.state.tracker.on_punch_request(track);
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
                 failure: punch_hole_response::Failure::ID_NOT_EXIST.into(),
@@ -881,7 +970,11 @@ impl RendezvousServer {
         if let Some(sink) = sink.as_mut() {
             if let Ok(bytes) = msg.write_to_bytes() {
                 match sink {
-                    Sink::TcpStream(s) => {
+                    Sink::TcpStream(s, enc) => {
+                        let bytes = match enc {
+                            Some(enc) => enc.enc(&bytes),
+                            None => bytes,
+                        };
                         allow_err!(s.send(Bytes::from(bytes)).await);
                     }
                     Sink::Ws(ws) => {
@@ -968,20 +1061,10 @@ impl RendezvousServer {
         true
     }
 
-    fn parse_relay_servers(&mut self, relay_servers: &str) {
-        let rs = get_servers(relay_servers, "relay-servers");
-        self.relay_servers0 = Arc::new(rs);
-        self.relay_servers = self.relay_servers0.clone();
-    }
-
-    fn get_relay_server(&self, _pa: IpAddr, _pb: IpAddr) -> String {
-        if self.relay_servers.is_empty() {
-            return "".to_owned();
-        } else if self.relay_servers.len() == 1 {
-            return self.relay_servers[0].clone();
-        }
-        let i = ROTATION_RELAY_SERVER.fetch_add(1, Ordering::SeqCst) % self.relay_servers.len();
-        self.relay_servers[i].clone()
+    fn parse_relay_servers(&self, relay_servers: &str) {
+        self.state
+            .router
+            .set_configured(crate::config::parse_relay_list(relay_servers));
     }
 
     async fn check_cmd(&self, cmd: &str) -> String {
@@ -994,7 +1077,7 @@ impl RendezvousServer {
                 res = format!(
                     "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
                     "relay-servers(rs) <separated by ,>",
-                    "reload-geo(rg)",
+                    "geo-update(gu)",
                     "ip-blocker(ib) [<ip>|<number>] [-]",
                     "ip-changes(ic) [<id>|<number>] [-]",
                     "punch-requests(pr) [<number>] [-]",
@@ -1006,10 +1089,11 @@ impl RendezvousServer {
                 if let Some(rs) = fds.next() {
                     self.tx.send(Data::RelayServers0(rs.to_owned())).ok();
                 } else {
-                    for ip in self.relay_servers.iter() {
-                        let _ = writeln!(res, "{ip}");
-                    }
+                    res = self.state.router.status_text();
                 }
+            }
+            Some("geo-update" | "gu") => {
+                res = self.state.router.geo_update().await;
             }
             Some("ip-blocker" | "ib") => {
                 let mut lock = IP_BLOCKER.lock().await;
@@ -1122,7 +1206,6 @@ impl RendezvousServer {
                     } else {
                         ALWAYS_USE_RELAY.store(false, Ordering::SeqCst);
                     }
-                    self.tx.send(Data::RelayServers0(rs.to_owned())).ok();
                 } else {
                     let _ = writeln!(
                         res,
@@ -1134,12 +1217,13 @@ impl RendezvousServer {
             Some("test-geo" | "tg") => {
                 if let Some(rs) = fds.next() {
                     if let Ok(a) = rs.parse::<IpAddr>() {
+                        let a = a.to_canonical();
                         if let Some(rs) = fds.next() {
                             if let Ok(b) = rs.parse::<IpAddr>() {
-                                res = format!("{:?}", self.get_relay_server(a, b));
+                                res = self.state.router.test(a, b.to_canonical()).await;
                             }
                         } else {
-                            res = format!("{:?}", self.get_relay_server(a, a));
+                            res = self.state.router.test(a, a).await;
                         }
                     }
                 }
@@ -1210,27 +1294,7 @@ impl RendezvousServer {
         if ws {
             use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
             let callback = |req: &Request, response: Response| {
-                let headers = req.headers();
-                // X-Real-IP / X-Forwarded-For are trusted as-is so that the real
-                // client IP is preserved when the WebSocket port runs behind a
-                // reverse proxy (WSS). They are NOT validated: anyone who can reach
-                // this port directly can spoof an arbitrary IP, bypassing IP-based
-                // rate limiting / blocking and corrupting logged IPs. Do not expose
-                // the WebSocket port directly to untrusted networks; only the
-                // reverse proxy, which overwrites these headers, should be able to
-                // connect to it.
-                // https://github.com/rustdesk/rustdesk-server/issues/634
-                let real_ip = headers
-                    .get("X-Real-IP")
-                    .or_else(|| headers.get("X-Forwarded-For"))
-                    .and_then(|header_value| header_value.to_str().ok());
-                if let Some(ip) = real_ip {
-                    if ip.contains('.') {
-                        addr = format!("{ip}:0").parse().unwrap_or(addr);
-                    } else {
-                        addr = format!("[{ip}]:0").parse().unwrap_or(addr);
-                    }
-                }
+                addr = ws_client_addr(addr, req.headers());
                 Ok(response)
             };
             let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
@@ -1244,9 +1308,47 @@ impl RendezvousServer {
                 }
             }
         } else {
-            let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
-            sink = Some(Sink::TcpStream(a));
-            while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
+            let (mut a, mut b) = Framed::new(stream, BytesCodec::new()).split();
+            // KeyExchange (note 02 §6.2): offer first; the client's first frame either answers
+            // it or is a plaintext message from a client that skips the offer.
+            let mut offer = None;
+            if let Some(sk) = &self.inner.sk {
+                let (o, msg) = crate::kx::Offer::new(sk)?;
+                a.send(Bytes::from(msg.write_to_bytes()?)).await?;
+                offer = Some(o);
+            }
+            sink = Some(Sink::TcpStream(a, None));
+            let mut dec: Option<Encrypt> = None;
+            while let Ok(Some(Ok(mut bytes))) = timeout(30_000, b.next()).await {
+                if let Some(offer) = offer.take() {
+                    if let Ok(RendezvousMessage {
+                        union: Some(rendezvous_message::Union::KeyExchange(ex)),
+                        ..
+                    }) = RendezvousMessage::parse_from_bytes(&bytes)
+                    {
+                        if ex.keys.len() == 2 {
+                            match offer.accept(&ex) {
+                                Ok(enc) => {
+                                    if let Some(Sink::TcpStream(_, e)) = sink.as_mut() {
+                                        *e = Some(enc.clone());
+                                    }
+                                    dec = Some(enc);
+                                    continue;
+                                }
+                                Err(err) => {
+                                    log::debug!("Key exchange with {:?} failed: {}", addr, err);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(dec) = dec.as_mut() {
+                    if let Err(err) = dec.dec(&mut bytes) {
+                        log::debug!("Tcp connection from {:?}: {}", addr, err);
+                        break;
+                    }
+                }
                 if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
                     break;
                 }
@@ -1331,31 +1433,28 @@ impl RendezvousServer {
     }
 }
 
-async fn check_relay_servers(rs0: Arc<RelayServers>, tx: Sender) {
-    let mut futs = Vec::new();
-    let rs = Arc::new(Mutex::new(Vec::new()));
-    for x in rs0.iter() {
-        let mut host = x.to_owned();
-        if !host.contains(':') {
-            host = format!("{}:{}", host, config::RELAY_PORT);
+/// The client address of a WebSocket (21118) connection from TCP peer `addr`.
+/// X-Real-IP / X-Forwarded-For keep the real client IP behind a reverse proxy (WSS) on the
+/// same host. They are only trusted from a loopback peer: anyone reaching this port directly
+/// could spoof an arbitrary IP otherwise, which would steer relay selection and bypass
+/// IP-based limits (PORTA.md §6.5a).
+/// https://github.com/rustdesk/rustdesk-server/issues/634
+fn ws_client_addr(addr: SocketAddr, headers: &tungstenite::http::HeaderMap) -> SocketAddr {
+    if !try_into_v4(addr).ip().is_loopback() {
+        return addr;
+    }
+    let real_ip = headers
+        .get("X-Real-IP")
+        .or_else(|| headers.get("X-Forwarded-For"))
+        .and_then(|header_value| header_value.to_str().ok());
+    if let Some(ip) = real_ip {
+        if ip.contains('.') {
+            return format!("{ip}:0").parse().unwrap_or(addr);
+        } else {
+            return format!("[{ip}]:0").parse().unwrap_or(addr);
         }
-        let rs = rs.clone();
-        let x = x.clone();
-        futs.push(tokio::spawn(async move {
-            if FramedStream::new(&host, None, CHECK_RELAY_TIMEOUT)
-                .await
-                .is_ok()
-            {
-                rs.lock().await.push(x);
-            }
-        }));
     }
-    join_all(futs).await;
-    log::debug!("check_relay_servers");
-    let rs = std::mem::take(&mut *rs.lock().await);
-    if !rs.is_empty() {
-        tx.send(Data::RelayServers(rs)).ok();
-    }
+    addr
 }
 
 // temp solution to solve udp socket failure
@@ -1468,5 +1567,321 @@ mod tests {
             assert_eq!(lock.front().unwrap().to_id, format!("peer{}", max % 31));
             assert_eq!(lock.back().unwrap().to_id, format!("peer{}", (max * 2 - 1) % 31));
         }
+    }
+
+    // ---- Loopback rendezvous tests: a real 21116/TCP listener, clients written after
+    // rustdesk:src/common.rs (`key_exchange`, the `rendezvous_stub` tests). ----
+
+    const RELAY: &str = "relay.example:21117";
+
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Client {
+        /// Skips the offer and talks in the clear (not logged in, or from before the exchange).
+        Plain,
+        /// Answers the offer the way clients from before version 1 do.
+        V0,
+        V1,
+    }
+
+    struct Harness {
+        _app: crate::testutil::TestApp,
+        rs: RendezvousServer,
+        rx: Receiver,
+        addr: SocketAddr,
+        server_pk: sign::PublicKey,
+    }
+
+    async fn harness(with_sk: bool, mask: Option<Ipv4Network>) -> Harness {
+        let app = crate::testutil::app().await;
+        app.state.router.set_configured(vec![RELAY.to_owned()]);
+        let (server_pk, sk) = sign::gen_keypair();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rs = RendezvousServer {
+            tcp_punch: Default::default(),
+            pm: app.state.pm.clone(),
+            tx,
+            rendezvous_servers: Default::default(),
+            inner: Arc::new(Inner {
+                serial: 0,
+                version: String::new(),
+                software_url: String::new(),
+                mask,
+                local_ip: String::new(),
+                sk: with_sk.then_some(sk),
+            }),
+            state: app.state.clone(),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = rs.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, peer)) = listener.accept().await {
+                server.handle_listener(stream, peer, "", false).await;
+            }
+        });
+        Harness {
+            _app: app,
+            rs,
+            rx,
+            addr,
+            server_pk,
+        }
+    }
+
+    impl Harness {
+        /// A connection to 21116/TCP, after the key exchange unless `Plain`.
+        async fn connect(&self, client: Client) -> FramedStream {
+            let stream = TcpStream::connect(self.addr).await.unwrap();
+            let local = stream.local_addr().unwrap();
+            let mut conn = FramedStream::from(stream, local);
+            if client != Client::Plain {
+                let offer = conn.next_timeout(3000).await.unwrap().unwrap();
+                let offer = RendezvousMessage::parse_from_bytes(&offer).unwrap();
+                let (answer, enc) =
+                    crate::kx::tests::client_answer(&offer, &self.server_pk, client == Client::V0);
+                let mut msg = RendezvousMessage::new();
+                msg.set_key_exchange(answer);
+                conn.send(&msg).await.unwrap();
+                conn.2 = Some(enc);
+            }
+            conn
+        }
+
+        /// B registered from `addr` just now.
+        async fn online(&self, id: &str, addr: &str) {
+            let peer = self.rs.pm.get_or(id).await;
+            let mut w = peer.write().await;
+            w.socket_addr = addr.parse().unwrap();
+            w.last_reg_time = Instant::now();
+        }
+
+        /// What hbbs sends to B over UDP.
+        async fn to_b(&mut self) -> (RendezvousMessage, SocketAddr) {
+            match timeout(3000, self.rx.recv()).await.unwrap().unwrap() {
+                Data::Msg(msg, addr) => (*msg, addr),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    /// The next message other than the server's KeyExchange offer (`get_next_nonkeyexchange_msg`).
+    async fn recv(conn: &mut FramedStream) -> RendezvousMessage {
+        loop {
+            let bytes = conn.next_timeout(3000).await.unwrap().unwrap();
+            let msg = RendezvousMessage::parse_from_bytes(&bytes).unwrap();
+            if !matches!(msg.union, Some(rendezvous_message::Union::KeyExchange(_))) {
+                return msg;
+            }
+        }
+    }
+
+    fn mangle(addr: &str) -> Bytes {
+        AddrMangle::encode(addr.parse().unwrap()).into()
+    }
+
+    fn punch_request(id: &str) -> RendezvousMessage {
+        let mut msg = RendezvousMessage::new();
+        msg.set_punch_hole_request(PunchHoleRequest {
+            id: id.to_owned(),
+            nat_type: NatType::ASYMMETRIC.into(),
+            token: "token".to_owned(),
+            version: "1.4.2".to_owned(),
+            udp_port: 1234,
+            socket_addr_v6: mangle("[2001:db8::a]:40001"),
+            webrtc_sdp_offer: "offer".to_owned(),
+            ..Default::default()
+        });
+        msg
+    }
+
+    /// B answers over a fresh connection in the clear, without reading (as clients do).
+    async fn b_sends(h: &Harness, msg: RendezvousMessage) -> SocketAddr {
+        let stream = TcpStream::connect(h.addr).await.unwrap();
+        let local = stream.local_addr().unwrap();
+        let mut conn = FramedStream::from(stream, local);
+        conn.send(&msg).await.unwrap();
+        // Keep it open until the server has read it.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            drop(conn);
+        });
+        local
+    }
+
+    #[hbb_common::tokio::test]
+    async fn key_exchange_then_messages() {
+        let h = harness(true, None).await;
+        for client in [Client::Plain, Client::V0, Client::V1] {
+            let mut conn = h.connect(client).await;
+            assert_eq!(conn.is_secured(), client != Client::Plain);
+            let mut msg = RendezvousMessage::new();
+            msg.set_test_nat_request(TestNatRequest::new());
+            conn.send(&msg).await.unwrap();
+            let Some(rendezvous_message::Union::TestNatResponse(res)) = recv(&mut conn).await.union
+            else {
+                panic!("{client:?}: expected TestNatResponse");
+            };
+            assert_eq!(res.port, conn.local_addr().port() as i32, "{client:?}");
+            // Unknown peer: the failure comes back on the same (encrypted or plain) stream.
+            let mut conn = h.connect(client).await;
+            conn.send(&punch_request("nobody")).await.unwrap();
+            let Some(rendezvous_message::Union::PunchHoleResponse(res)) = recv(&mut conn).await.union
+            else {
+                panic!("{client:?}: expected PunchHoleResponse");
+            };
+            assert_eq!(res.failure, punch_hole_response::Failure::ID_NOT_EXIST.into());
+        }
+    }
+
+    #[hbb_common::tokio::test]
+    async fn no_private_key_no_offer() {
+        let h = harness(false, None).await;
+        let mut conn = h.connect(Client::Plain).await;
+        let mut msg = RendezvousMessage::new();
+        msg.set_test_nat_request(TestNatRequest::new());
+        conn.send(&msg).await.unwrap();
+        // The first frame is the answer itself.
+        let bytes = conn.next_timeout(3000).await.unwrap().unwrap();
+        let msg = RendezvousMessage::parse_from_bytes(&bytes).unwrap();
+        assert!(matches!(
+            msg.union,
+            Some(rendezvous_message::Union::TestNatResponse(_))
+        ));
+    }
+
+    #[hbb_common::tokio::test]
+    async fn punch_hole_forwards_v6_both_ways() {
+        let mut h = harness(true, None).await;
+        h.online("B1", "8.8.8.8:5000").await;
+        for client in [Client::Plain, Client::V0, Client::V1] {
+            let mut a = h.connect(client).await;
+            a.send(&punch_request("B1")).await.unwrap();
+            let (msg, to) = h.to_b().await;
+            assert_eq!(to, "8.8.8.8:5000".parse().unwrap());
+            let Some(rendezvous_message::Union::PunchHole(ph)) = msg.union else {
+                panic!("{client:?}: expected PunchHole");
+            };
+            assert_eq!(AddrMangle::decode(&ph.socket_addr), a.local_addr());
+            assert_eq!(ph.socket_addr_v6, mangle("[2001:db8::a]:40001"));
+            assert!(!ph.force_relay);
+            assert_eq!(ph.nat_type, NatType::ASYMMETRIC.into());
+            assert_eq!(ph.relay_server, RELAY);
+            // Not forwarded: UDP punching and WebRTC.
+            assert_eq!(ph.udp_port, 0);
+            assert!(ph.webrtc_sdp_offer.is_empty());
+
+            let mut sent = RendezvousMessage::new();
+            sent.set_punch_hole_sent(PunchHoleSent {
+                socket_addr: ph.socket_addr.clone(),
+                id: "B1".to_owned(),
+                relay_server: RELAY.to_owned(),
+                nat_type: NatType::ASYMMETRIC.into(),
+                version: "1.4.2".to_owned(),
+                upnp_port: 7,
+                socket_addr_v6: mangle("[2001:db8::b]:40002"),
+                webrtc_sdp_answer: "answer".to_owned(),
+                ..Default::default()
+            });
+            let b_addr = b_sends(&h, sent).await;
+            let Some(rendezvous_message::Union::PunchHoleResponse(res)) = recv(&mut a).await.union
+            else {
+                panic!("{client:?}: expected PunchHoleResponse");
+            };
+            assert_eq!(AddrMangle::decode(&res.socket_addr), b_addr);
+            assert_eq!(res.socket_addr_v6, mangle("[2001:db8::b]:40002"));
+            assert_eq!(res.upnp_port, 7);
+            assert_eq!(res.relay_server, RELAY);
+            assert!(!res.pk.is_empty());
+        }
+    }
+
+    #[hbb_common::tokio::test]
+    async fn forced_relay_clears_v6() {
+        // A (loopback) inside the mask, B outside: hbbs forces the relay.
+        let mut h = harness(true, Some("127.0.0.0/8".parse().unwrap())).await;
+        h.online("B1", "8.8.8.8:5000").await;
+        let mut a = h.connect(Client::V1).await;
+        a.send(&punch_request("B1")).await.unwrap();
+        let (msg, _) = h.to_b().await;
+        let Some(rendezvous_message::Union::PunchHole(ph)) = msg.union else {
+            panic!("expected PunchHole");
+        };
+        assert!(ph.socket_addr_v6.is_empty());
+        assert!(ph.force_relay);
+        assert_eq!(ph.nat_type, NatType::SYMMETRIC.into());
+        assert_eq!(ph.relay_server, RELAY);
+    }
+
+    #[hbb_common::tokio::test]
+    async fn fetch_local_addr_forwards_v6() {
+        // Same public IP as A: B is asked for its local address.
+        let mut h = harness(true, None).await;
+        h.online("B1", "127.0.0.1:5000").await;
+        let mut a = h.connect(Client::V1).await;
+        a.send(&punch_request("B1")).await.unwrap();
+        let (msg, _) = h.to_b().await;
+        let Some(rendezvous_message::Union::FetchLocalAddr(fla)) = msg.union else {
+            panic!("expected FetchLocalAddr");
+        };
+        assert_eq!(fla.socket_addr_v6, mangle("[2001:db8::a]:40001"));
+        assert_eq!(fla.relay_server, RELAY);
+
+        let mut la = RendezvousMessage::new();
+        la.set_local_addr(LocalAddr {
+            socket_addr: fla.socket_addr.clone(),
+            local_addr: mangle("192.168.1.2:21118"),
+            relay_server: RELAY.to_owned(),
+            id: "B1".to_owned(),
+            version: "1.4.2".to_owned(),
+            socket_addr_v6: mangle("[2001:db8::b]:40002"),
+            ..Default::default()
+        });
+        b_sends(&h, la).await;
+        let Some(rendezvous_message::Union::PunchHoleResponse(res)) = recv(&mut a).await.union else {
+            panic!("expected PunchHoleResponse");
+        };
+        assert!(res.is_local());
+        assert_eq!(AddrMangle::decode(&res.socket_addr), "192.168.1.2:21118".parse().unwrap());
+        assert_eq!(res.socket_addr_v6, mangle("[2001:db8::b]:40002"));
+    }
+
+    #[test]
+    fn ws_forwarded_headers_only_from_loopback() {
+        let mut headers = tungstenite::http::HeaderMap::new();
+        headers.insert("X-Forwarded-For", "203.0.113.9".parse().unwrap());
+        let direct: SocketAddr = "198.51.100.1:5000".parse().unwrap();
+        assert_eq!(ws_client_addr(direct, &headers), direct);
+        let mapped: SocketAddr = "[::ffff:198.51.100.1]:5000".parse().unwrap();
+        assert_eq!(ws_client_addr(mapped, &headers), mapped);
+        for proxy in ["127.0.0.1:5000", "[::1]:5000", "[::ffff:127.0.0.1]:5000"] {
+            assert_eq!(
+                ws_client_addr(proxy.parse().unwrap(), &headers),
+                "203.0.113.9:0".parse().unwrap(),
+                "{proxy}"
+            );
+        }
+        headers.insert("X-Real-IP", "2001:db8::1".parse().unwrap());
+        assert_eq!(
+            ws_client_addr("127.0.0.1:5000".parse().unwrap(), &headers),
+            "[2001:db8::1]:0".parse().unwrap()
+        );
+        assert_eq!(
+            ws_client_addr("127.0.0.1:5000".parse().unwrap(), &Default::default()),
+            "127.0.0.1:5000".parse().unwrap()
+        );
+    }
+
+    #[hbb_common::tokio::test]
+    async fn console_commands_use_the_router() {
+        let h = harness(true, None).await;
+        assert!(h.rs.check_cmd("rs").await.contains(RELAY));
+        h.rs.parse_relay_servers(" r1:21117, r2 ,r1:21117,");
+        let status = h.rs.check_cmd("rs").await;
+        assert!(status.contains("r1:21117") && status.contains("r2") && !status.contains(RELAY));
+        let test = h.rs.check_cmd("tg 1.1.1.1 ::ffff:2.2.2.2").await;
+        assert!(test.contains("r1:21117") || test.contains("r2"), "{test}");
+        // aur no longer touches the relay list
+        assert_eq!(h.rs.check_cmd("aur N").await, "");
+        assert_eq!(h.rs.check_cmd("rs").await, status);
     }
 }
