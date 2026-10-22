@@ -43,7 +43,9 @@
 | `src/api/device.rs`、`src/api/audit.rs`、`src/strategy.rs` | sysinfo、心跳、策略、审计（§9.3、§10） | 设备 |
 | `src/cli/`、`src/import.rs` | 命令行与导入（§14、§15） | 命令行 |
 
-骨架阶段为后面各模块建好空文件和函数签名（`todo!()` 不允许留到合并后），并行模块在签名内实现。签名需要调整时，改动方在汇报里写清楚，由集成阶段统一。
+骨架阶段为后面各模块建好空文件和函数签名（`todo!()` 只允许出现在并行模块名下的文件里，且不允许留到合并后），并行模块在签名内实现。签名需要调整时，改动方在汇报里写清楚，由集成阶段统一。
+
+依赖由骨架一次加齐，并行模块不改 `Cargo.toml`：`axum` 0.8、`argon2`、`bcrypt`、`md-5`、`sha2`、`maxminddb` 0.32（`mmap`）、`toml`、`flate2`（GeoIP 解压，之前当死依赖删了）、sqlx 补 `migrate` 特性，dev 依赖 `tower`（`ServiceExt::oneshot`）。版本选发布满两周的。
 
 删掉：`src/mod.rs`（孤儿文件）、`database::tests::test_insert`（出错不报、等于空跑，`peer_roundtrip` 已覆盖）、`common::check_software_update`（向 RustDesk 官方外呼）。
 
@@ -305,7 +307,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 `GET /api/login-options`、`POST /api/login`（只做 `type=account`）、`POST /api/currentUser`、`POST /api/logout`。见 §11。
 
 ### 9.3 设备上报（`device.rs`、`audit.rs`）
-`POST /api/sysinfo`、`POST /api/heartbeat`、`POST /api/audit/conn`、`POST /api/audit/file`、`POST /api/audit/alarm`。不带认证（兼容债务），做弱校验：hbbs 的 `peer` 表里有这个 id 时，要求 `base64(peer.uuid) == body.uuid`（编码和客户端 `encode64` 一致），不符时 sysinfo 回 403 空 body（客户端 120 秒后重试）、心跳回 `{}`、审计回 200 空 body 但不入库；`peer` 表里没有时照常接受。
+`POST /api/sysinfo`、`POST /api/heartbeat`、`POST /api/audit/conn`、`POST /api/audit/file`、`POST /api/audit/alarm`。不带认证（兼容债务），做弱校验：body 里有 `uuid`、且 hbbs 的 `peer` 表里有这个 id 时，要求 `base64(peer.uuid) == body.uuid`（编码和客户端 `encode64` 一致），不符时 sysinfo 回 403 空 body（客户端 120 秒后重试）、心跳回 `{}`、审计回 200 空 body 但不入库；`peer` 表里没有这个 id 时照常接受。控制端会话结束写备注那条 `/api/audit/conn` 只带 `id`、`session_id`、`note`，没有 uuid 和 nonce（笔记 03 §5.2），不做 uuid 校验、不按 nonce 去重，按 `session_id` 更新对应记录的 `note`。
 
 ### 9.4 其他
 - `GET /`：静态说明页（HTML）：服务名 Porta、源代码地址（AGPL-3.0 第 13 条：链接到公开仓库）、"IP Geolocation by DB-IP" 署名并链接 https://db-ip.com 。客户端"在 Web 控制台管理"菜单打开的就是这里。
@@ -316,6 +318,8 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 - 生效选项 = 全局（`scope='*'`）⊕ 设备（`scope=<id>`，同键覆盖）。
 - 版本号 `rev`：对（生效选项按键排序的规范 JSON、全局 epoch、设备 epoch）做 sha256，取前 8 字节转 `i64` 后与 `i64::MAX` 按位与，结果为 0 时取 1。任何生效选项变化或 epoch 递增都会换版本；不用自增计数器。
 - 下发规则（笔记 01 §2.2）：**仅当 `req.modified_at != rev` 时**，响应同时带 `"modified_at": rev` 和 `"strategy": {"config_options": {…全部生效选项…}}`；否则两者都不带。值一律是字符串，不给 null。这样"设备首次接入或策略变更时清一次 `relay-server`"自然成立，之后用户在本地改了也不会每次被覆盖。
+- 客户端是**增量合并**：只改下发里出现的键，空值表示删键（笔记 01 §3）。所以"撤销"一个推过的键不能删行，要把值写成 `''`（墓碑，下发时客户端删掉这个键）。删掉设备级的同名行，生效值回到全局值；全局也没有这个键时，客户端上的旧值不会被清掉。
+- 设备级值为 `''` 时照样覆盖全局值（也就是让这台设备删掉这个键）。
 - 设备还没有 sysinfo（`device.sysinfo = ''`）时响应带 `"sysinfo": true`。
 - 每次心跳更新 `device.last_seen_at`、`ver`、`last_ip`；设备行不存在就建。
 - sysinfo：存原文，拆出 `hostname`、`username`、`os`、`version`；`client_type` 第一期一律 `rustdesk`（Porta 客户端以后在上报里加专门的键来区分，见笔记 01 §6）。
@@ -325,7 +329,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 - 密码：argon2id（`argon2` crate 默认参数）。校验时按前缀识别 `$argon2id$`、`$2a$/$2b$/$2y$`（bcrypt）、`md5:`（rustdesk-api 旧格式 `md5(明文+"rustdesk-api")`，笔记 05 §3）；旧格式校验通过后当场改存 argon2id。`password_hash = ''` 的账号不能密码登录。
 - 令牌：32 字节随机数的 base64url（无填充），库里只存 sha256 hex。没有过期时间；登出、改密码、禁用账号时删掉该用户的令牌（登出只删当前这个）。每次使用更新 `last_used_at`。
 - 登录时把请求体里的设备 `id`/`uuid` 记进令牌行，并把 `device.user_id` 设成这个用户（设备行不存在就建）；登出时若 `device.user_id` 是本人则清空。
-- 登录失败限流：同一用户名或同一来源 IP 15 分钟内失败 5 次后，15 分钟内直接拒绝（回 `{"error": "…"}`）。
+- 登录失败限流：只按用户名，15 分钟内失败 5 次后，15 分钟内直接拒绝（回 `{"error": "…"}`）。不按来源 IP 限：API 在反向代理后面时看到的全是代理地址，按 IP 限会把所有人一起锁住。
 - `auth::token_owner(token) -> Option<(user_id, user_name, device_id)>` 给会合模块用。
 
 ## 12. 地址簿、权限、用户组（`ab.rs`、`group.rs`）
@@ -364,7 +368,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 - `group add <name> [--share-devices]`、`group del <name>`、`group list`、`group member add|rm <group> <user>`
 - `ab list`、`ab create <name> --owner <user> [--note …]`、`ab rename <name> <new>`、`ab del <name>`、`ab grant <book> --user <u>|--group <g> ro|rw|full`、`ab revoke <book> --user <u>|--group <g>`
 - `device list [--legacy]`：id、主机名、账号、客户端类型和版本、最后上报时间；`--legacy` 只列原版客户端（退出兼容时用）
-- `strategy show [<device>]`、`strategy set <device|'*'> <key> <value>`、`strategy unset <device|'*'> <key>`、`strategy repush <device|'*'>`（递增 epoch）
+- `strategy show [<device>]`（列出生效选项和 rev）、`strategy set <device|'*'> <key> <value>`、`strategy unset <device|'*'> <key>`（写成墓碑 `''`，让客户端删掉这个键）、`strategy forget <device|'*'> <key>`（删行，不再下发这个键；设备级删掉后回到全局值）、`strategy repush <device|'*'>`（递增 epoch）
 - `device pin-relay <device> <host|none>`
 - `relay status`（控制台 `rs`）、`route test <ipA> <ipB>`（控制台 `tg`）
 - `geo lookup <ip>`（直接读本地 mmdb：国家、经纬度、ASN、运营商组）、`geo update`（立即下载）
