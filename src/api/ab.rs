@@ -166,10 +166,18 @@ pub(crate) async fn peers(
     let mut data = Vec::with_capacity(rows.len());
     for (id, fields, tags, secret) in rows {
         let mut peer: Map<String, Value> = serde_json::from_str(&fields).map_err(ApiError::internal)?;
-        peer.insert("id".to_owned(), Value::String(id));
+        peer.insert("id".to_owned(), Value::String(id.clone()));
         peer.insert("tags".to_owned(), serde_json::from_str(&tags).map_err(ApiError::internal)?);
-        if !secret.is_empty() {
-            peer.insert(secret_key.to_owned(), Value::String(state.secret.decrypt(&secret)?));
+        // A value that does not decrypt (lost or replaced porta_secret.key, corrupt row) only loses
+        // that password: the key is omitted ("no saved password") and the rest of the book still lists.
+        match state.secret.decrypt(&secret) {
+            Ok(plain) if !plain.is_empty() => {
+                peer.insert(secret_key.to_owned(), Value::String(plain));
+            }
+            Ok(_) => {}
+            Err(err) => {
+                hbb_common::log::warn!("Address book {guid}, peer {id}: {secret_key} omitted: {err}")
+            }
         }
         data.push(Value::Object(peer));
     }
@@ -868,6 +876,51 @@ mod tests {
         let peers = list_peers(&t.app, &token, &book).await;
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0]["id"], "2");
+    }
+
+    #[tokio::test]
+    async fn undecryptable_secret_only_drops_that_key() {
+        let t = testutil::app().await;
+        let db = &t.state.db;
+        let (uid, token) = testutil::create_user(db, "alice", "", false).await;
+        let personal = personal_guid(&t.app, &token).await;
+        let shared = shared_book(db, "S", uid).await;
+        for (book, body) in [
+            (&personal, r#"{"id":"1","alias":"a","hash":"h1"}"#),
+            (&personal, r#"{"id":"2","alias":"b","hash":"h2"}"#),
+            (&shared, r#"{"id":"1","password":"p1"}"#),
+            (&shared, r#"{"id":"2","password":"p2"}"#),
+        ] {
+            write_ok(&t.app, "POST", &format!("/api/ab/peer/add/{book}"), &token, body).await;
+        }
+        // Peer 2 of each book: encrypted with another key (a replaced porta_secret.key), or corrupt.
+        let other = crate::crypto::SecretBox::load_or_create(&t.dir.path().join("other.key")).unwrap();
+        sqlx::query("update ab_peer set hash_enc = ? where ab_guid = ? and id = '2'")
+            .bind(other.encrypt("h2"))
+            .bind(&personal)
+            .execute(db)
+            .await
+            .unwrap();
+        sqlx::query("update ab_peer set password_enc = 'sb1:AAAA' where ab_guid = ? and id = '2'")
+            .bind(&shared)
+            .execute(db)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            list_peers(&t.app, &token, &personal).await,
+            vec![
+                serde_json::json!({"id": "1", "tags": [], "alias": "a", "hash": "h1"}),
+                serde_json::json!({"id": "2", "tags": [], "alias": "b"}),
+            ]
+        );
+        assert_eq!(
+            list_peers(&t.app, &token, &shared).await,
+            vec![
+                serde_json::json!({"id": "1", "tags": [], "password": "p1"}),
+                serde_json::json!({"id": "2", "tags": []}),
+            ]
+        );
     }
 
     #[tokio::test]
