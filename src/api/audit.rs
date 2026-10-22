@@ -49,6 +49,11 @@ pub(crate) const TABLES: [&str; 3] = ["audit_conn", "audit_file", "audit_alarm"]
 /// 4.6 KB (253 + 4096). 20,000 × (9.5 + 8.8 + 4.6) KB ≈ 0.46 GB for the three together; freed pages
 /// are reused, so the file stays there. Real rows are a few hundred bytes (20,000 ≈ 6 MB a table).
 const MAX_ROWS: i64 = 20_000;
+/// Records of a session the controller's note updates, the newest first. One session id is shared
+/// by the remote desktop connection and those opened from its toolbar (file transfer, camera, TCP
+/// tunnel, terminal: rustdesk@bd92623:src/client.rs `ConnToken`), each again after a reconnect;
+/// with more than this many reconnects the oldest records go without the note.
+const NOTE_ROWS: i64 = 8;
 /// Rows created longer ago than this are deleted by the hourly purge.
 const RETENTION_SECS: i64 = 180 * 24 * 3600;
 /// Rows the retention purge deletes per statement: each statement holds the write lock (shared
@@ -277,15 +282,19 @@ pub(crate) async fn conn(State(state): State<AppState>, ClientIp(ip): ClientIp, 
     }
     let db = &state.db;
     if let (Some(note), None) = (&req.note, &req.uuid) {
-        // Session note: no identity to check; updates every record of the session (remote desktop
-        // and file transfer share one session id), none matching is ignored. Never inserts, so it
-        // cannot add rows.
-        return match sqlx::query("update audit_conn set note = ? where device_id = ? and session_id = ?")
-            .bind(note)
-            .bind(&req.id)
-            .bind(req.session_id.to_string())
-            .execute(db)
-            .await
+        // Session note: no identity to check; updates the newest `NOTE_ROWS` records of the session,
+        // none matching is ignored. Never inserts, so it cannot add rows; the limit bounds what one
+        // request rewrites (review D-5: anyone can make up 20,000 rows of one session).
+        return match sqlx::query(
+            "update audit_conn set note = ?1 where id in
+               (select id from audit_conn where device_id = ?2 and session_id = ?3 order by id desc limit ?4)",
+        )
+        .bind(note)
+        .bind(&req.id)
+        .bind(req.session_id.to_string())
+        .bind(NOTE_ROWS)
+        .execute(db)
+        .await
         {
             Ok(_) => ok_empty(),
             Err(err) => ok_internal(err),
@@ -873,5 +882,56 @@ mod tests {
         // A note with a uuid is a normal report and goes through the weak check (here: authed, mismatched).
         ok(&t.app, "/api/audit/conn", json!({"id": "111", "uuid": base64::encode(b"x"), "conn_id": 9, "session_id": 5, "note": "y"})).await;
         assert_eq!(rows().await.len(), 3);
+    }
+
+    /// Review D-5: the unauthenticated note rewrites at most `NOTE_ROWS` records, the newest, however
+    /// many a made-up device piled up in one session; picking them is a range on an index.
+    #[tokio::test]
+    async fn note_updates_only_the_newest_records() {
+        let t = testutil::app().await;
+        let db = &t.state.db;
+        // MAX_ROWS records of one session with a 4 KB auth each (rewriting them all took ~1 s), and
+        // as many of the same session id under another device.
+        let auth = "a".repeat(MAX_TEXT_LEN);
+        for device in ["111", "999"] {
+            sqlx::query(
+                "with recursive n(i) as (select 1 union all select i + 1 from n where i < ?)
+                 insert into audit_conn(device_id, conn_id, session_id, auth, created_at) select ?, i, '7', ?, 0 from n",
+            )
+            .bind(MAX_ROWS)
+            .bind(device)
+            .bind(&auth)
+            .execute(db)
+            .await
+            .unwrap();
+        }
+        let newest: Vec<i64> = sqlx::query_scalar("select id from audit_conn where device_id = '111' order by id desc limit ?")
+            .bind(NOTE_ROWS)
+            .fetch_all(db)
+            .await
+            .unwrap();
+        // A device of the session, then one that has none of its records.
+        for id in ["111", "222"] {
+            let start = Instant::now();
+            ok(&t.app, "/api/audit/conn", json!({"id": id, "session_id": 7, "note": "n".repeat(MAX_TEXT_LEN)})).await;
+            let took = start.elapsed();
+            eprintln!("note for {id}: {took:?}");
+            let noted: Vec<i64> = sqlx::query_scalar("select id from audit_conn where note != '' order by id desc")
+                .fetch_all(db)
+                .await
+                .unwrap();
+            assert_eq!(noted, newest, "{id}");
+            assert!(took < Duration::from_millis(200), "note for {id} took {took:?}");
+        }
+
+        let sql = "update audit_conn set note = 'x' where id in
+                     (select id from audit_conn where device_id = '1' and session_id = '7' order by id desc limit 8)";
+        let plan = crate::api::device::query_plan(db, sql).await;
+        eprintln!("note: {plan:?}");
+        assert!(
+            plan.iter().any(|l| l == "SEARCH audit_conn USING COVERING INDEX audit_conn_session_dev (session_id=? AND device_id=?)"),
+            "{plan:?}"
+        );
+        assert!(!plan.iter().any(|l| l.starts_with("SCAN") || l.contains("TEMP B-TREE")), "{plan:?}");
     }
 }

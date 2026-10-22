@@ -354,13 +354,13 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 - 审计字段限长：超长的值按 UTF-8 字符边界截断后入库，照样回 200 空 body（不回 400）。`audit_conn` 的 `ip` ≤ 64 字节、`peer_id` ≤ 253、`peer_name` ≤ 256、`note` ≤ 4 KB（不认证的备注请求也一样）、`auth` 只存已知字段 `primary_auth`、`two_factor`（整数）和 `conn_audit_ref`（字符串），序列化后 ≤ 4 KB（超出就截断文本）；请求体里的其他键不展开、不保存（审查 C-9：用通配 map 收"其余字段"时，2 MB 的数字数组在任何身份校验之前就展开成约 80 MB），`peer` 只取前两个元素；`audit_file` 的 `peer_id` ≤ 253、`path`、`info` 各 ≤ 4 KB；`audit_alarm` 的 `info` ≤ 4 KB。`device_id` 就是校验过的 id（≤ 253）。
 - 审计表行数上限：三张表各最多 2 万行，每次插入前删掉 id 比最新一行小 2 万 - 1 及以上的行（主键上的范围删除）。不放进每小时的清理：审计上报只按来源限速，合计没有上界，一小时内能写进的行数也没有。实测最坏一行（文本列都到上限，SQLite 4 KB 页，含索引）：`audit_conn` 约 9.5 KB、`audit_file` 约 8.8 KB、`audit_alarm` 约 4.6 KB，2 万 ×（9.5 + 8.8 + 4.6）KB ≈ 0.46 GB。另外每小时删掉 `created_at` 早于 180 天的行：走迁移 0002 的 `created_at` 索引，每条语句最多删 1000 行，删完为止（审查 C-16：`created_at` 排在 4 KB 文本列之后，没有索引时每次清理都要在写锁里读遍三张表的溢出页）。
 
-唯一免校验的是控制端会话结束写备注那条 `/api/audit/conn`：判别条件是"有 `note` 键且没有 `uuid` 键"（不能用"没有 nonce"判别，1.4.x 的审计都不带 nonce）。它只更新已有记录、从不插入新行，所以不会增加行数。
+唯一免校验的是控制端会话结束写备注那条 `/api/audit/conn`：判别条件是"有 `note` 键且没有 `uuid` 键"（不能用"没有 nonce"判别，1.4.x 的审计都不带 nonce）。它从不插入新行，所以不会增加行数；但"只更新已有记录"本身不等于没有放大：同一 `(device_id, session_id)` 的记录谁都能造（自注册一个假 id，换着 `conn_id` 发认证成功上报，最多造满 2 万行），不限条数时一条 4 KB 的备注请求要在写锁里把 2 万行整行重写一遍（实测约 1 秒、WAL 涨 177 MB，审查 D-5）。所以一条备注最多改该会话最新的 8 条记录（`NOTE_ROWS`），挑这 8 条走迁移 0003 的 `(session_id, device_id)` 索引，精确范围倒序读 8 条就停，同一 session_id 挂在别的设备下的记录不会被逐行检查。8 的依据：一个会话 id 由远程桌面连接和从它工具栏开出的文件传输、摄像头、TCP 隧道、终端共用（rustdesk@bd92623:src/client.rs `ConnToken`），每条连接重连一次多一条记录；代价是重连很多次的会话，较早的记录拿不到备注。这条路径仍然不认证，上限只是把一条请求的写入量封顶。
 
 `audit_conn` 的关联规则：
 - `action:"new"`：插入一行，`session_id` 存 `''`。
 - 认证成功（没有 action）：找 `device_id = body.id`、`conn_id = body.conn_id`、`closed_at IS NULL` 的记录里 id 最大的一条，更新 `peer_id`、`peer_name`、`conn_type`、`session_id`（u64 十进制字符串）、`auth`、`authed_at`；找不到就新插一条（`created_at = authed_at = now`）。
 - `action:"close"`：同样的条件找到后写 `closed_at`，找不到就忽略。
-- 备注：按 `device_id = body.id` 且 `session_id = body.session_id` 更新所有匹配记录的 `note`（同一会话可能有远程桌面和文件传输两条），一条都匹配不到就忽略。
+- 备注：按 `device_id = body.id` 且 `session_id = body.session_id` 找匹配记录，更新其中 id 最大的 8 条的 `note`（同一会话可能有远程桌面、文件传输等几条，见上），一条都匹配不到就忽略。
 
 ### 9.4 其他
 - `GET /`：静态说明页（HTML）：服务名 Porta、源代码地址（AGPL-3.0 第 13 条：链接到公开仓库）、"IP Geolocation by DB-IP" 署名并链接 https://db-ip.com 。客户端"在 Web 控制台管理"菜单打开的就是这里。
