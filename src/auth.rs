@@ -6,6 +6,7 @@ use argon2::{
 };
 use hbb_common::{anyhow::anyhow, log, rand::RngCore, ResultType};
 use md5::{Digest as _, Md5};
+use once_cell::sync::Lazy;
 use sha2::Sha256;
 use sqlx::SqlitePool;
 
@@ -28,7 +29,9 @@ pub fn hash_password(plain: &str) -> ResultType<String> {
 }
 
 /// Recognizes `$argon2id$…`, bcrypt (`$2a$`/`$2b$`/`$2y$`) and rustdesk-api's `md5:<hex>`
-/// (`md5(plain + "rustdesk-api")`, note 05 §3). An empty hash never matches.
+/// (`md5(plain + "rustdesk-api")`, note 05 §3). An empty hash (also what login passes for an
+/// unknown user) never matches, but still costs one argon2id check against [`DUMMY_HASH`], so the
+/// response time does not tell whether a user name exists or can log in with a password.
 pub fn verify_password(plain: &str, stored: &str) -> PasswordCheck {
     let ok = |b: bool, upgrade: bool| match (b, upgrade) {
         (false, _) => PasswordCheck::Mismatch,
@@ -59,9 +62,15 @@ pub fn verify_password(plain: &str, stored: &str) -> PasswordCheck {
         let digest = Md5::digest(format!("{plain}rustdesk-api").as_bytes());
         ok(to_hex(&digest) == hex.to_ascii_lowercase(), true)
     } else {
+        if let Ok(hash) = PasswordHash::new(&DUMMY_HASH) {
+            let _ = Argon2::default().verify_password(plain.as_bytes(), &hash);
+        }
         PasswordCheck::Mismatch
     }
 }
+
+/// An argon2id hash of a random password with the same parameters as [`hash_password`]; made once.
+static DUMMY_HASH: Lazy<String> = Lazy::new(|| hash_password(&new_token()).unwrap_or_default());
 
 /// 32 random bytes, base64url without padding. Only `token_hash` of it is stored.
 pub fn new_token() -> String {
@@ -138,6 +147,27 @@ mod tests {
         assert_eq!(verify_password("", ""), PasswordCheck::Mismatch);
         assert_eq!(verify_password("pw", "pw"), PasswordCheck::Mismatch);
         assert_eq!(verify_password("pw", "$argon2id$garbage"), PasswordCheck::Mismatch);
+    }
+
+    #[test]
+    fn empty_hash_costs_an_argon2_check() {
+        let real = hash_password("pw").unwrap();
+        let (dummy, real_parsed) = (PasswordHash::new(&DUMMY_HASH).unwrap(), PasswordHash::new(&real).unwrap());
+        assert_eq!(dummy.algorithm, real_parsed.algorithm);
+        assert_eq!(dummy.params.to_string(), real_parsed.params.to_string());
+        // Fastest of three, so other tests on the same cores do not decide it.
+        let fastest = |stored: &str| {
+            (0..3)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    verify_password("guess", stored);
+                    start.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+        let (empty, argon2) = (fastest(""), fastest(&real));
+        assert!(empty * 4 > argon2, "empty hash {empty:?}, argon2id {argon2:?}");
     }
 
     #[test]
