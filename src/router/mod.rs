@@ -313,11 +313,15 @@ impl Router {
     }
 
     /// Background tasks (health check, GeoIP update), spawned on the server's runtime. Server only:
-    /// removes leftover `*.part` files, loads the local GeoIP files and (dbip) removes the other months
-    /// first.
+    /// removes leftover `*.part` files (of the downloads, or of the private copies of manual files;
+    /// the operator's manual directory is never written to), loads the local GeoIP files and (dbip)
+    /// removes the other months first.
     pub fn spawn_tasks(self: &Arc<Self>) {
         let dir = Path::new(&self.cfg.geo.dir);
-        geo::remove_parts(dir);
+        match self.cfg.geo.source {
+            GeoSource::Dbip => geo::remove_parts(dir),
+            GeoSource::Manual => geo::remove_parts(Path::new(geo::COPY_DIR)),
+        }
         match geo::load(&self.cfg.geo) {
             Ok((db, info)) => {
                 self.install(db, info.clone());
@@ -491,16 +495,35 @@ fn describe(l: &Loc) -> String {
     )
 }
 
-/// `porta-server geo lookup <ip>`: reads the local mmdb files (same loader as the server) and
-/// describes country, coordinates, ASN and carrier group (built-in table plus `[routing.carriers]`,
-/// as in route decisions).
+/// `porta-server geo lookup <ip>`: reads the local mmdb files (the server's files, found the same
+/// way; writes nothing) and describes country, coordinates, ASN and carrier group (built-in table
+/// plus `[routing.carriers]`, as in route decisions).
 pub fn geo_lookup(cfg: &Config, ip: IpAddr) -> ResultType<String> {
+    match cfg.geo.source {
+        // DB-IP files are only ever replaced by renaming, so mapping them directly is safe.
+        GeoSource::Dbip => {
+            let (db, info) = geo::load(&cfg.geo)?;
+            Ok(describe_ip(cfg, &db, &info, ip))
+        }
+        // No private copy: the operator's files are read into memory.
+        GeoSource::Manual => {
+            let (db, info) = geo::load_in_memory(&cfg.geo)?;
+            Ok(describe_ip(cfg, &db, &info, ip))
+        }
+    }
+}
+
+fn describe_ip<S: AsRef<[u8]> + Send + Sync>(
+    cfg: &Config,
+    db: &geo::GeoDb<S>,
+    info: &geo::GeoInfo,
+    ip: IpAddr,
+) -> String {
     let ip = ip.to_canonical();
-    let (db, info) = geo::load(&cfg.geo)?;
     let mut out = format!("database: {info}\n");
     let Some(rec) = db.locate(ip) else {
         let _ = writeln!(out, "{ip}: not in the database");
-        return Ok(out);
+        return out;
     };
     let pos = rec.lat.zip(rec.lon).map_or("?".to_owned(), |(lat, lon)| format!("{lat},{lon}"));
     let _ = writeln!(out, "{ip}: country {} position {pos}", rec.country.as_deref().unwrap_or("?"));
@@ -512,7 +535,7 @@ pub fn geo_lookup(cfg: &Config, ip: IpAddr) -> ResultType<String> {
         }
         None => out.push_str("ASN unknown\n"),
     }
-    Ok(out)
+    out
 }
 
 /// `porta-server geo update` when the console is unreachable (server not running): download in the
