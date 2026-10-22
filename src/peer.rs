@@ -5,7 +5,6 @@ use hbb_common::{
     log,
     rendezvous_proto::*,
     tokio::sync::{Mutex, RwLock},
-    ResultType,
 };
 use serde_derive::{Deserialize, Serialize};
 use std::{collections::HashMap, collections::HashSet, net::SocketAddr, sync::Arc, time::Instant};
@@ -69,27 +68,11 @@ pub(crate) struct PeerMap {
 }
 
 impl PeerMap {
-    pub(crate) async fn new() -> ResultType<Self> {
-        let db = get_arg_opt("DB_URL").unwrap_or_else(|| {
-            let mut db = "db_v2.sqlite3".to_owned();
-            #[cfg(all(windows, not(debug_assertions)))]
-            {
-                if let Some(path) = hbb_common::config::Config::icon_path().parent() {
-                    db = format!("{}\\{}", path.to_str().unwrap_or("."), db);
-                }
-            }
-            #[cfg(not(windows))]
-            {
-                db = format!("./{db}");
-            }
-            db
-        });
-        log::info!("DB_URL={}", db);
-        let pm = Self {
+    pub(crate) fn new(db: sqlx::SqlitePool) -> Self {
+        Self {
             map: Default::default(),
-            db: database::Database::new(&db).await?,
-        };
-        Ok(pm)
+            db: database::Database::new(db),
+        }
     }
 
     #[inline]

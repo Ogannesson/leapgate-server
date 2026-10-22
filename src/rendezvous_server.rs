@@ -1,5 +1,6 @@
 use crate::common::*;
 use crate::peer::*;
+use crate::state::AppState;
 use hbb_common::{
     allow_err, bail,
     bytes::{Bytes, BytesMut},
@@ -107,6 +108,8 @@ pub struct RendezvousServer {
     relay_servers0: Arc<RelayServers>,
     rendezvous_servers: Arc<Vec<String>>,
     inner: Arc<Inner>,
+    #[allow(dead_code)]
+    state: AppState,
 }
 
 enum LoopFailure {
@@ -133,7 +136,17 @@ impl RendezvousServer {
         let (key, sk) = Self::get_server_sk(key)?;
         let nat_port = port - 1;
         let ws_port = port + 2;
-        let pm = PeerMap::new().await?;
+        let db = crate::database::open(&crate::database::db_url()).await?;
+        let cfg = crate::config::Config::from_args()?;
+        let api_listen = cfg.api.listen_addr(port)?;
+        let state = AppState::new(
+            db,
+            cfg,
+            std::path::Path::new(crate::crypto::SECRET_KEY_FILE),
+            key.clone(),
+            sk.clone(),
+        )?;
+        let pm = state.pm.clone();
         log::info!("serial={}", serial);
         let rendezvous_servers = get_servers(&get_arg("rendezvous-servers"), "rendezvous-servers");
         let mut socket = create_udp_listener(bind_addr, port, rmem).await?;
@@ -169,6 +182,7 @@ impl RendezvousServer {
                 mask,
                 local_ip,
             }),
+            state: state.clone(),
         };
         log::info!("mask: {:?}", rs.inner.mask);
         log::info!("local-ip: {:?}", rs.inner.local_ip);
@@ -184,6 +198,10 @@ impl RendezvousServer {
             listener2.local_addr()?
         );
         log::info!("Listening on websocket {}", listener3.local_addr()?);
+        let api_listener = TcpListener::bind(api_listen).await?;
+        log::info!("Listening on API {}", api_listener.local_addr()?);
+        state.spawn_tasks();
+        tokio::spawn(crate::api::serve(api_listener, state));
         let test_addr = get_arg("TEST_HBBS");
         if get_arg("ALWAYS_USE_RELAY").to_uppercase() == "Y" {
             ALWAYS_USE_RELAY.store(true, Ordering::SeqCst);

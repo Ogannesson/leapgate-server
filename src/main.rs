@@ -6,6 +6,10 @@ use hbb_common::{bail, config::RENDEZVOUS_PORT, ResultType};
 use porta_server::{common::*, *};
 
 const RMEM: usize = 0;
+/// First arguments that switch to command line management (PORTA.md §14).
+const CLI_COMMANDS: &[&str] = &[
+    "user", "group", "ab", "device", "strategy", "relay", "route", "geo", "stats", "import",
+];
 
 fn main() -> ResultType<()> {
     let _logger = Logger::try_with_env_or_str("info")?
@@ -13,6 +17,13 @@ fn main() -> ResultType<()> {
         .format(opt_format)
         .write_mode(WriteMode::Async)
         .start()?;
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv
+        .first()
+        .is_some_and(|a| CLI_COMMANDS.contains(&a.as_str()))
+    {
+        return cli::run(argv);
+    }
     let args = format!(
         "-c --config=[FILE] +takes_value 'Sets a custom config file'
         -b, --bind=[IP] 'Sets the IP address to bind to (default: all interfaces)'
@@ -23,7 +34,8 @@ fn main() -> ResultType<()> {
         -r, --relay-servers=[HOST] 'Sets the default relay servers, separated by comma'
         -M, --rmem=[NUMBER(default={RMEM})] 'Sets UDP recv buffer size, set system rmem_max first, e.g., sudo sysctl -w net.core.rmem_max=52428800. vi /etc/sysctl.conf, net.core.rmem_max=52428800, sudo sysctl –p'
         , --mask=[MASK] '[DEPRECATED] Determine if the connection comes from LAN, e.g. 192.168.0.0/16'
-        -k, --key=[KEY] 'Only allow the client with the same key'",
+        -k, --key=[KEY] 'Only allow the client with the same key'
+        , --porta-config=[FILE] 'Sets the Porta config file (default: porta.toml)'",
     );
     init_args(&args, "porta-server", "RustDesk ID/Rendezvous Server");
     let port = get_arg_or("port", RENDEZVOUS_PORT.to_string()).parse::<i32>()?;
@@ -33,7 +45,6 @@ fn main() -> ResultType<()> {
     let bind_addr = parse_bind_address(&get_arg("bind"))?;
     let rmem = get_arg("rmem").parse::<usize>().unwrap_or(RMEM);
     let serial: i32 = get_arg("serial").parse().unwrap_or(0);
-    crate::common::check_software_update();
     RendezvousServer::start_with_bind(
         bind_addr,
         port,

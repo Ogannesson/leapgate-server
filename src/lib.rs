@@ -4,3 +4,17 @@ pub mod common;
 mod database;
 mod peer;
 mod version;
+
+mod api;
+mod auth;
+pub mod cli;
+mod config;
+mod conn_tracker;
+mod crypto;
+mod import;
+mod kx;
+mod router;
+mod state;
+mod strategy;
+#[cfg(test)]
+mod testutil;

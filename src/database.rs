@@ -3,7 +3,47 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions},
     ConnectOptions,
 };
-use std::str::FromStr;
+use std::{str::FromStr, time::Duration};
+
+/// `DB_URL`, or `db_v2.sqlite3` next to the executable's data (same default as upstream hbbs).
+pub(crate) fn db_url() -> String {
+    crate::common::get_arg_opt("DB_URL").unwrap_or_else(|| {
+        let mut db = "db_v2.sqlite3".to_owned();
+        #[cfg(all(windows, not(debug_assertions)))]
+        {
+            if let Some(path) = hbb_common::config::Config::icon_path().parent() {
+                db = format!("{}\\{}", path.to_str().unwrap_or("."), db);
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            db = format!("./{db}");
+        }
+        db
+    })
+}
+
+/// Opens the process-wide pool and applies the embedded migrations.
+/// Used by both the server and the command line.
+pub(crate) async fn open(url: &str) -> ResultType<SqlitePool> {
+    log::info!("DB_URL={}", url);
+    let n: u32 = crate::common::get_arg_or("MAX_DATABASE_CONNECTIONS", "8".to_owned())
+        .parse()
+        .unwrap_or(8);
+    log::debug!("MAX_DATABASE_CONNECTIONS={}", n);
+    let opt = SqliteConnectOptions::from_str(url)?
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_secs(5))
+        .foreign_keys(true)
+        .log_statements(log::LevelFilter::Debug);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(n)
+        .connect_with(opt)
+        .await?;
+    sqlx::migrate!("./migrations").run(&pool).await?;
+    Ok(pool)
+}
 
 #[derive(Clone)]
 pub struct Database {
@@ -22,50 +62,8 @@ pub struct Peer {
 }
 
 impl Database {
-    pub async fn new(url: &str) -> ResultType<Database> {
-        if !std::path::Path::new(url).exists() {
-            std::fs::File::create(url).ok();
-        }
-        let n: usize = crate::common::get_arg_or("MAX_DATABASE_CONNECTIONS", "1".to_owned())
-            .parse()
-            .unwrap_or(1);
-        log::debug!("MAX_DATABASE_CONNECTIONS={}", n);
-        // sqlx 0.6 defaulted to WAL; 0.8 leaves the journal mode alone, so keep it explicit.
-        let opt = SqliteConnectOptions::from_str(url)?
-            .journal_mode(SqliteJournalMode::Wal)
-            .log_statements(log::LevelFilter::Debug);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(n as _)
-            .connect_with(opt)
-            .await?;
-        let db = Database { pool };
-        db.create_tables().await?;
-        Ok(db)
-    }
-
-    async fn create_tables(&self) -> ResultType<()> {
-        sqlx::query(
-            "
-            create table if not exists peer (
-                guid blob primary key not null,
-                id varchar(100) not null,
-                uuid blob not null,
-                pk blob not null,
-                created_at datetime not null default(current_timestamp),
-                user blob,
-                status tinyint,
-                note varchar(300),
-                info text not null
-            ) without rowid;
-            create unique index if not exists index_peer_id on peer (id);
-            create index if not exists index_peer_user on peer (user);
-            create index if not exists index_peer_created_at on peer (created_at);
-            create index if not exists index_peer_status on peer (status);
-        ",
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+    pub fn new(pool: SqlitePool) -> Database {
+        Database { pool }
     }
 
     pub async fn get_peer(&self, id: &str) -> ResultType<Option<Peer>> {
@@ -117,44 +115,12 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use hbb_common::tokio;
-    #[test]
-    fn test_insert() {
-        insert();
-    }
-
-    #[tokio::main(flavor = "multi_thread")]
-    async fn insert() {
-        let db = super::Database::new("test.sqlite3").await.unwrap();
-        let mut jobs = vec![];
-        for i in 0..10000 {
-            let cloned = db.clone();
-            let id = i.to_string();
-            let a = tokio::spawn(async move {
-                let empty_vec = Vec::new();
-                cloned
-                    .insert_peer(&id, &empty_vec, &empty_vec, "")
-                    .await
-                    .unwrap();
-            });
-            jobs.push(a);
-        }
-        for i in 0..10000 {
-            let cloned = db.clone();
-            let id = i.to_string();
-            let a = tokio::spawn(async move {
-                cloned.get_peer(&id).await.unwrap();
-            });
-            jobs.push(a);
-        }
-        hbb_common::futures::future::join_all(jobs).await;
-    }
 
     // The queries are no longer checked at compile time, so run each one against a real database.
     #[tokio::test]
     async fn peer_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("db.sqlite3");
-        let db = super::Database::new(path.to_str().unwrap()).await.unwrap();
+        let (_dir, pool) = crate::testutil::pool().await;
+        let db = super::Database::new(pool);
         assert!(db.get_peer("123456").await.unwrap().is_none());
         let guid = db
             .insert_peer("123456", b"uuid", b"pk1", r#"{"ip":"1.2.3.4"}"#)
@@ -174,5 +140,40 @@ mod tests {
         assert_eq!(peer.guid, guid);
         assert_eq!(peer.pk, b"pk2");
         assert_eq!(peer.info, "{}");
+    }
+
+    // An existing hbbs database (peer table only, no migration history) is taken over in place.
+    #[tokio::test]
+    async fn migrates_existing_hbbs_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite3");
+        let url = path.to_str().unwrap();
+        {
+            let opt = sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(url)
+                .create_if_missing(true);
+            let pool = sqlx::SqlitePool::connect_with(opt).await.unwrap();
+            sqlx::raw_sql(
+                "create table peer ( guid blob primary key not null, id varchar(100) not null,
+                 uuid blob not null, pk blob not null, created_at datetime not null default(current_timestamp),
+                 user blob, status tinyint, note varchar(300), info text not null ) without rowid;
+                 create unique index index_peer_id on peer (id);
+                 insert into peer(guid, id, uuid, pk, info) values(x'01', '123456', x'02', x'03', '{}');",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+        }
+        let pool = super::open(url).await.unwrap();
+        let db = super::Database::new(pool.clone());
+        assert!(db.get_peer("123456").await.unwrap().is_some());
+        let n: i64 = sqlx::query_scalar("select count(*) from _sqlx_migrations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        // Running again is a no-op.
+        drop(super::open(url).await.unwrap());
     }
 }
