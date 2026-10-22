@@ -180,16 +180,23 @@ pub(crate) fn parse_json<T: DeserializeOwned>(body: &[u8]) -> Result<T, ApiError
     serde_json::from_slice(body).map_err(|err| ApiError::bad_request(&format!("Invalid request body: {err}")))
 }
 
-/// `current`, `pageSize` (and `ab` for `/api/ab/peers`); unknown parameters (`accessible`, `status`) are ignored.
+/// `current`, `pageSize`, `status` (the group panel's user filter) and `ab` (`/api/ab/peers`);
+/// unknown parameters (`accessible`) are ignored.
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct PageQuery {
     pub current: Option<String>,
     #[serde(rename = "pageSize")]
     pub page_size: Option<String>,
+    pub status: Option<String>,
     pub ab: Option<String>,
 }
 
 impl PageQuery {
+    /// `status` as a number; missing or not a number = no filter.
+    pub fn status(&self) -> Option<i64> {
+        self.status.as_deref().and_then(|s| s.trim().parse().ok())
+    }
+
     /// `(offset, limit)` for SQL; `current` starts at 1, `pageSize` defaults to 100 and is never lowered.
     pub fn offset_limit(&self) -> (i64, i64) {
         let parse = |v: &Option<String>, default: i64| {
@@ -413,6 +420,7 @@ mod tests {
         let q = |c: Option<&str>, s: Option<&str>| PageQuery {
             current: c.map(Into::into),
             page_size: s.map(Into::into),
+            status: None,
             ab: None,
         };
         assert_eq!(q(None, None).offset_limit(), (0, 100));

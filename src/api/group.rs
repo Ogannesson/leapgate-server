@@ -2,7 +2,8 @@
 //!
 //! Visibility: an admin sees every user and every device; anyone else sees themselves plus the
 //! users sharing any `share_devices=1` group with them, and the devices owned (`device.user_id`)
-//! by those users.
+//! by those users. A `status` parameter keeps only the users with that `user.status`, and drops the
+//! devices of the users it leaves out (unowned devices stay).
 
 use super::{
     account::{UserPayload, UserRow, USER_COLUMNS},
@@ -48,7 +49,11 @@ pub(crate) async fn users(
     Query(page_query): Query<PageQuery>,
 ) -> ApiResult {
     let (offset, limit) = page_query.offset_limit();
-    let (cond, ids) = visible(&user, "id");
+    let (mut cond, mut ids) = visible(&user, "id");
+    if let Some(status) = page_query.status() {
+        cond.push_str(" and status = ?");
+        ids.push(status);
+    }
     let sql = format!("select count(*) from user where {cond}");
     let mut total = sqlx::query_scalar::<_, i64>(&sql);
     for id in &ids {
@@ -91,8 +96,13 @@ pub(crate) async fn peers(
     Query(page_query): Query<PageQuery>,
 ) -> ApiResult {
     let (offset, limit) = page_query.offset_limit();
-    let (cond, ids) = visible(&user, "d.user_id");
-    let sql = format!("select count(*) from device d where {cond}");
+    let (mut cond, mut ids) = visible(&user, "d.user_id");
+    if let Some(status) = page_query.status() {
+        // Devices have no status of their own: drop the ones owned by users `/api/users` leaves out.
+        cond.push_str(" and (u.id is null or u.status = ?)");
+        ids.push(status);
+    }
+    let sql = format!("select count(*) from device d left join user u on u.id = d.user_id where {cond}");
     let mut total = sqlx::query_scalar::<_, i64>(&sql);
     for id in &ids {
         total = total.bind(id);
@@ -246,6 +256,40 @@ mod tests {
         assert_eq!((v["total"].as_i64(), names(&v)), (Some(1), vec!["e"]));
         let v = peers(e_t).await;
         assert_eq!(v, json!({"total": 0, "data": []}));
+    }
+
+    #[tokio::test]
+    async fn status_filter() {
+        let t = testutil::app().await;
+        let db = &t.state.db;
+        let (admin, admin_t) = testutil::create_user(db, "admin", "pw", true).await;
+        let (a, a_t) = testutil::create_user(db, "a", "pw", false).await;
+        let (b, _) = testutil::create_user(db, "b", "pw", false).await;
+        group(db, "share", true, &[a, b]).await;
+        sqlx::query("update user set status = 0 where id = ?")
+            .bind(b)
+            .execute(db)
+            .await
+            .unwrap();
+        for (id, owner) in [("1", Some(a)), ("2", Some(b)), ("3", None), ("4", Some(admin))] {
+            device(db, id, owner).await;
+        }
+
+        let q = "?current=1&pageSize=100&accessible=";
+        let v = get(&t.app, &format!("/api/users{q}&status=1"), &admin_t).await;
+        assert_eq!((v["total"].as_i64(), names(&v)), (Some(2), vec!["admin", "a"]));
+        let v = get(&t.app, &format!("/api/peers{q}&status=1"), &admin_t).await;
+        assert_eq!((v["total"].as_i64(), ids(&v)), (Some(3), vec!["1", "3", "4"]), "unowned devices stay");
+        assert_eq!(names(&get(&t.app, &format!("/api/users{q}&status=0"), &admin_t).await), ["b"]);
+        assert_eq!(ids(&get(&t.app, &format!("/api/peers{q}&status=0"), &admin_t).await), ["2", "3"]);
+        // No parameter: no filter.
+        assert_eq!(names(&get(&t.app, &format!("/api/users{q}"), &admin_t).await), ["admin", "a", "b"]);
+        assert_eq!(ids(&get(&t.app, &format!("/api/peers{q}"), &admin_t).await), ["1", "2", "3", "4"]);
+
+        assert_eq!(names(&get(&t.app, &format!("/api/users{q}&status=1"), &a_t).await), ["a"]);
+        assert_eq!(ids(&get(&t.app, &format!("/api/peers{q}&status=1"), &a_t).await), ["1"]);
+        assert_eq!(names(&get(&t.app, &format!("/api/users{q}"), &a_t).await), ["a", "b"]);
+        assert_eq!(ids(&get(&t.app, &format!("/api/peers{q}"), &a_t).await), ["1", "2"]);
     }
 
     #[tokio::test]
