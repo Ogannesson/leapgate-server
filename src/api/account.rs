@@ -11,9 +11,10 @@ use serde_derive::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::{
     collections::HashMap,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+use tokio::sync::Semaphore;
 
 /// Failed logins per user name: 5 within 15 minutes lock the name for 15 minutes (§11).
 const FAIL_WINDOW: Duration = Duration::from_secs(15 * 60);
@@ -25,6 +26,8 @@ const MAX_NAME_LEN: usize = 128;
 struct FailState {
     /// Failures within the last `FAIL_WINDOW`.
     fails: Vec<Instant>,
+    /// Attempts past the limit check whose password check has not finished.
+    in_flight: usize,
     locked_until: Option<Instant>,
 }
 
@@ -32,29 +35,64 @@ lazy_static::lazy_static! {
     /// Only names of existing users, so at most one entry per user; a name's stale failures are
     /// dropped when it is next used, never by scanning the whole map.
     static ref LOGIN_FAILS: Mutex<HashMap<String, FailState>> = Default::default();
+    /// Password checks running at once: each argon2 check takes ~19 MiB and a core for tens of
+    /// milliseconds, so more than one per core only adds memory. The rest wait their turn.
+    static ref ARGON2_SLOTS: Arc<Semaphore> = Arc::new(Semaphore::new(
+        std::thread::available_parallelism().map_or(1, |n| n.get())
+    ));
 }
 
-fn is_locked(name: &str) -> bool {
-    let map = LOGIN_FAILS.lock().unwrap();
-    map.get(name)
-        .and_then(|s| s.locked_until)
-        .is_some_and(|t| t > Instant::now())
+/// A login attempt on an existing user, counted from the limit check on, so concurrent attempts
+/// cannot all pass the check before the first failure is recorded. Dropped without `finish` (an
+/// error, or the client went away) it only gives its place back.
+struct Attempt {
+    name: String,
+    matched: Option<bool>,
 }
 
-fn record_failure(name: &str) {
-    let now = Instant::now();
-    let mut map = LOGIN_FAILS.lock().unwrap();
-    let s = map.entry(name.to_owned()).or_default();
-    s.fails.retain(|t| now - *t < FAIL_WINDOW);
-    s.fails.push(now);
-    if s.fails.len() >= MAX_FAILS {
-        s.fails.clear();
-        s.locked_until = Some(now + FAIL_WINDOW);
+impl Attempt {
+    /// `None`: the name is locked, or its failures plus attempts in flight reached `MAX_FAILS`.
+    fn begin(name: &str) -> Option<Self> {
+        let now = Instant::now();
+        let mut map = LOGIN_FAILS.lock().unwrap_or_else(|e| e.into_inner());
+        let s = map.entry(name.to_owned()).or_default();
+        s.fails.retain(|t| now - *t < FAIL_WINDOW);
+        if s.locked_until.is_some_and(|t| t > now) || s.fails.len() + s.in_flight >= MAX_FAILS {
+            return None;
+        }
+        s.in_flight += 1;
+        Some(Self { name: name.to_owned(), matched: None })
+    }
+
+    /// Records the result when dropped: a failure counts, a success forgets the earlier failures.
+    fn finish(mut self, matched: bool) {
+        self.matched = Some(matched);
     }
 }
 
-fn clear_failures(name: &str) {
-    LOGIN_FAILS.lock().unwrap().remove(name);
+impl Drop for Attempt {
+    fn drop(&mut self) {
+        let now = Instant::now();
+        let mut map = LOGIN_FAILS.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(s) = map.get_mut(&self.name) else {
+            return;
+        };
+        s.in_flight -= 1;
+        match self.matched {
+            Some(true) => s.fails.clear(),
+            Some(false) => {
+                s.fails.push(now);
+                if s.fails.len() >= MAX_FAILS {
+                    s.fails.clear();
+                    s.locked_until = Some(now + FAIL_WINDOW);
+                }
+            }
+            None => {}
+        }
+        if s.in_flight == 0 && s.fails.is_empty() && !s.locked_until.is_some_and(|t| t > now) {
+            map.remove(&self.name);
+        }
+    }
 }
 
 /// The user object of login, currentUser and `/api/users` (note 03 §2.5): `name` non-empty,
@@ -145,30 +183,32 @@ pub(crate) async fn login(State(state): State<AppState>, body: Bytes) -> ApiResu
     .bind(&req.username)
     .fetch_optional(&state.db)
     .await?;
-    let exists = row.is_some();
-    if exists && is_locked(&req.username) {
-        return Err(ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "Too many failed attempts, try again later",
-        ));
-    }
+    let attempt = match row {
+        Some(_) => Some(Attempt::begin(&req.username).ok_or_else(|| {
+            ApiError::new(StatusCode::TOO_MANY_REQUESTS, "Too many failed attempts, try again later")
+        })?),
+        None => None,
+    };
     let (uid, stored, status) = row.unwrap_or_default();
-    // argon2 takes tens of milliseconds of CPU: keep it off the async workers.
+    // argon2 takes tens of milliseconds of CPU: keep it off the async workers, a few at a time.
+    // The permit moves into the task, so a client that goes away does not free it early.
+    let permit = ARGON2_SLOTS.clone().acquire_owned().await.map_err(ApiError::internal)?;
     let password = req.password.clone();
     let (check, upgraded) = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let check = auth::verify_password(&password, &stored);
         let upgraded = (check == PasswordCheck::OkNeedsUpgrade).then(|| auth::hash_password(&password));
         (check, upgraded)
     })
     .await
     .map_err(ApiError::internal)?;
-    if check == PasswordCheck::Mismatch {
-        if exists {
-            record_failure(&req.username);
-        }
+    let matched = check != PasswordCheck::Mismatch;
+    if let Some(attempt) = attempt {
+        attempt.finish(matched);
+    }
+    if !matched {
         return Err(ApiError::new(StatusCode::UNAUTHORIZED, "Wrong credentials"));
     }
-    clear_failures(&req.username);
     if status != 1 {
         return Err(ApiError::forbidden("Account disabled"));
     }
@@ -401,6 +441,54 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         let (status, _) = login_as(&t.app, "rl-erin", "pw", "", "").await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn concurrent_attempts_count_against_the_limit() {
+        let t = testutil::app().await;
+        testutil::create_user(&t.state.db, "cc-zoe", "pw", false).await;
+        let tasks: Vec<_> = (0..3 * MAX_FAILS)
+            .map(|_| {
+                let app = t.app.clone();
+                tokio::spawn(async move { login_as(&app, "cc-zoe", "bad", "", "").await.0 })
+            })
+            .collect();
+        let mut statuses = Vec::new();
+        for task in tasks {
+            statuses.push(task.await.unwrap());
+        }
+        // Only MAX_FAILS of the burst get a password check; the rest are refused up front.
+        let checked = statuses.iter().filter(|s| **s == StatusCode::UNAUTHORIZED).count();
+        let refused = statuses.iter().filter(|s| **s == StatusCode::TOO_MANY_REQUESTS).count();
+        assert_eq!((checked, refused), (MAX_FAILS, 2 * MAX_FAILS), "{statuses:?}");
+        let (status, _) = login_as(&t.app, "cc-zoe", "pw", "", "").await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn abandoned_attempt_gives_its_place_back() {
+        let name = "ab-quinn";
+        let mut attempts: Vec<_> = (0..MAX_FAILS).map(|_| Attempt::begin(name).unwrap()).collect();
+        assert!(Attempt::begin(name).is_none());
+        // E.g. the client went away during the password check: no failure is recorded.
+        attempts.pop();
+        attempts.push(Attempt::begin(name).unwrap());
+        drop(attempts);
+        assert!(!LOGIN_FAILS.lock().unwrap().contains_key(name));
+    }
+
+    #[tokio::test]
+    async fn password_checks_wait_for_a_slot() {
+        let t = testutil::app().await;
+        testutil::create_user(&t.state.db, "ps-paul", "pw", false).await;
+        let slots = std::thread::available_parallelism().map_or(1, |n| n.get()) as u32;
+        let all = ARGON2_SLOTS.clone().acquire_many_owned(slots).await.unwrap();
+        let app = t.app.clone();
+        let mut login = tokio::spawn(async move { login_as(&app, "ps-paul", "pw", "", "").await.0 });
+        let waited = tokio::time::timeout(Duration::from_millis(300), &mut login).await;
+        assert!(waited.is_err(), "login finished while every slot was taken");
+        drop(all);
+        assert_eq!(login.await.unwrap(), StatusCode::OK);
     }
 
     #[tokio::test]
