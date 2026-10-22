@@ -21,6 +21,9 @@ pub struct ApiConfig {
     /// `""` (default) = `0.0.0.0:{port-2}`, matching how clients derive the API address.
     #[serde(deserialize_with = "de_listen")]
     pub listen: Option<SocketAddr>,
+    /// Public source of this deployment, linked from `GET /` (AGPL-3.0 §13). Deployment-specific,
+    /// so it is configured rather than built in.
+    pub source_url: String,
 }
 
 impl ApiConfig {

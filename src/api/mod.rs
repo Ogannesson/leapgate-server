@@ -13,7 +13,7 @@ pub(crate) mod group;
 use crate::state::AppState;
 use axum::{
     body::Body,
-    extract::{ConnectInfo, FromRequestParts, Request},
+    extract::{ConnectInfo, FromRequestParts, Request, State},
     http::{header, request::Parts, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -28,9 +28,6 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     panic::AssertUnwindSafe,
 };
-
-/// Public source of this server, linked from `GET /` (AGPL-3.0 §13).
-pub const SOURCE_URL: &str = "https://porta.invalid/porta-server";
 
 const JSON: &str = "application/json; charset=utf-8";
 const TEXT: &str = "text/plain; charset=utf-8";
@@ -298,7 +295,14 @@ impl<S: Send + Sync> FromRequestParts<S> for ClientIp {
 // ---- Fixed routes ----
 
 /// `GET /`: the client's "manage in web console" menu opens this page (§9.4).
-async fn index() -> Response {
+async fn index(State(st): State<AppState>) -> Response {
+    let url = &st.cfg.api.source_url;
+    let source = if url.is_empty() {
+        "not configured (set <code>[api] source_url</code> in porta.toml)".to_owned()
+    } else {
+        let url = url.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;");
+        format!(r#"<a href="{url}">{url}</a>"#)
+    };
     let body = format!(
         r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -306,7 +310,7 @@ async fn index() -> Response {
 <body style="font-family:system-ui,sans-serif;max-width:40em;margin:3em auto;padding:0 1em;line-height:1.6">
 <h1>Porta</h1>
 <p>This is a Porta server. There is no web console; manage it with the <code>porta-server</code> command line.</p>
-<p>Source code (AGPL-3.0): <a href="{SOURCE_URL}">{SOURCE_URL}</a></p>
+<p>Source code (AGPL-3.0): {source}</p>
 <p><a href="https://db-ip.com">IP Geolocation by DB-IP</a></p>
 </body></html>
 "#
@@ -342,7 +346,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(ct, HTML);
         let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("Porta") && body.contains("https://db-ip.com") && body.contains(SOURCE_URL));
+        assert!(body.contains("Porta") && body.contains("https://db-ip.com") && body.contains("source_url"));
 
         let (status, ct, body) = send(&t.app, "GET", "/nope", None, "").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
