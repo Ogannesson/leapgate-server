@@ -28,8 +28,10 @@ const WRITE: i64 = 2;
 // Write limits (§12.1): any logged-in user can write their own personal book, so without them one
 // account fills the disk. Over a limit → 400 + `{"error"}`, which the client shows as a failure.
 /// Peers per book. Also sent as `max_peer_one_ab`: the client stops adding at this count itself
-/// (`Ab.isFull`, note 04 §3.2).
-const MAX_PEERS: i64 = 10_000;
+/// (`Ab.isFull`, note 04 §3.2). The client asks for the online state of a whole tab in one
+/// `OnlineRequest` on 21115, whose frames are capped at 128 KB (§6 item 8): 5000 ids of 16
+/// characters are about 90 KB, so a full book still gets its online state.
+const MAX_PEERS: i64 = 5000;
 /// Tags per book (`ab_tag` rows).
 const MAX_TAGS: i64 = 1000;
 /// A tag name, in bytes (`tag/add`, `tag/rename`, a peer's `tags`). Control characters are refused
@@ -717,7 +719,7 @@ mod tests {
 
         let (status, ct, body) = send(&t.app, "POST", "/api/ab/settings", Some(&token), "").await;
         assert_eq!((status, ct.as_str()), (StatusCode::OK, JSON));
-        assert_eq!(&body[..], br#"{"max_peer_one_ab":10000}"#);
+        assert_eq!(&body[..], br#"{"max_peer_one_ab":5000}"#);
     }
 
     #[tokio::test]

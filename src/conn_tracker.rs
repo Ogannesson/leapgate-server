@@ -42,7 +42,7 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 
 // Limits on what unauthenticated requests can make us store (review C-13). Fixed, not configurable.
 /// Versions, tokens (43 bytes) and uuids are clipped to this many bytes; ids and relay hosts to
-/// `MAX_PEER_ID_LEN`. Frames on 21116 have no size limit.
+/// `MAX_PEER_ID_LEN`. A 21116 frame can still carry far longer fields (up to 16 KB, §6 item 8).
 const MAX_TEXT_LEN: usize = 64;
 /// New rows per source per minute; more are dropped and counted. Repeats merge into one row, so a
 /// client needs a few at most; this is upstream's `RegisterPk` limit of 30 per window, doubled.

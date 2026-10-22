@@ -16,7 +16,7 @@ const BLUE: i64 = 0xFF00_00FF;
 const WHITE: i64 = 0xFFFF_FFFF;
 
 /// §12.1 的写入上限。
-const MAX_PEERS: i64 = 10_000;
+const MAX_PEERS: i64 = 5000;
 const MAX_TAGS: i64 = 1000;
 const MAX_ID: usize = 253;
 const MAX_DATA: usize = 8 << 10;
@@ -143,7 +143,7 @@ async fn personal_always_returns_guid_and_creates_book_once() {
     assert_eq!(s.personal_guid(&carol.token).await, existing);
 }
 
-/// 笔记 04 §3.2：settings 回 `{"max_peer_one_ab": N}`（整数）；§12.1：`max_peer_one_ab` 回 10000，和每本簿的设备上限一致。
+/// 笔记 04 §3.2：settings 回 `{"max_peer_one_ab": N}`（整数）；§12.1：`max_peer_one_ab` 回 5000，和每本簿的设备上限一致。
 /// §9.1 第 9 条：settings 正常实现，不回 404。
 #[tokio::test]
 async fn settings_returns_peer_limit() {
@@ -844,7 +844,7 @@ async fn tag_control_chars_and_data_node_limit() {
     put_ok(&s, &alice.token, update.clone(), r#"{"id":"n64","k0":"changed"}"#.to_owned()).await;
 }
 
-/// §12.1：每本簿最多 1 万个设备、1000 个标签。簿满后 peer/add 新 id、tag/add 新名字回 400 + error；
+/// §12.1：每本簿最多 5000 个设备、1000 个标签。簿满后 peer/add 新 id、tag/add 新名字回 400 + error；
 /// 已有的 id/名字照旧 200 空 body、不改；别的簿各算各的；删掉一个就又能加。
 #[tokio::test]
 async fn full_book_refuses_new_peers_and_tags() {
@@ -857,7 +857,7 @@ async fn full_book_refuses_new_peers_and_tags() {
     fill(&s, &book, true, MAX_PEERS - 1).await;
     fill(&s, &book, false, MAX_TAGS - 1).await;
 
-    assert_action_ok(&s.call("POST", &add, &alice.token, r#"{"id":"last","alias":"A"}"#).await, "第 1 万个设备");
+    assert_action_ok(&s.call("POST", &add, &alice.token, r#"{"id":"last","alias":"A"}"#).await, "第 5000 个设备");
     let r = s.call("POST", &tag_add, &alice.token, &format!(r#"{{"name":"last","color":{RED}}}"#)).await;
     assert_action_ok(&r, "第 1000 个标签");
 
