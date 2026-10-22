@@ -300,7 +300,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 - `outcome` 取值全集：`rejected`、`no_reply`、`relay`、`relay_or_v6`、`relay_failed`、`relay_unmatched`、`direct_lan`、`direct_tcp`、`direct_tcp_or_v6`。
 - 窗口（命名常量，标注"待实测"）：直连判定窗口 `W = max(45 秒, 6 × (reply_at − started_at) + 20 秒)`（A 的直连超时 = 打洞耗时 × 6，没有封顶；客户端的打洞耗时还包含连 hbbs 和 KeyExchange 的时间，hbbs 看不到，20 秒余量约能覆盖 3 秒，实测时要专门覆盖慢建连）；H5 匹配时要求 `RequestRelay` 落在 `reply_at + W` 以内；一条记录最多合并 3 次 `RequestRelay`（客户端最多回落 3 次），而且只在它第一次 `relay_req_at` 之后 60 秒内合并，超出的另起一条 `relay_only`；匹配到 `RequestRelay` 的记录，等最后一次 `relay_req_at` + 20 秒后才定稿，那时有 `relay_resp_at` 记 `relay`，没有记 `relay_failed`。
 - H5 没匹配到打洞记录：写一行 `signal='relay_only'`：`started_at`、`relay_req_at` 取收到的时刻；`a_ip`/`a_port` 取 A:p3；`via` 照实；`b_id = rf.id`；`conn_type`、`a_nat_type`、`a_force_relay`、`a_has_v6`、`server_forced_relay` 填 0；`a_user` 照常反查。有 `relay_resp_at` 记 `relay_unmatched`，没有记 `relay_failed`。
-- 防滥用（这些请求都不认证；常量写死，不做配置）：许可证不符（`LICENSE_MISMATCH`）的请求不记录，所以不会出现 `signal='fail_license'`；`b_id`、中继地址和 `a_device_id`（来自令牌行，登录时已限长，§11）截到 253 字节，版本号、令牌、uuid 截到 64 字节；同一来源每分钟最多新建 60 条记录（IPv4 按单个地址算，IPv6 按 /64 前缀算：一台主机至少分到一个 /64），所有来源合计每分钟最多新建 120 条，超出的丢弃并计数（被丢弃的不占两种额度）；写库队列最多 1 万条，满了丢弃并计数，这几种丢弃每分钟最多打一条 warn 日志；队列里的定稿记录成批（每批最多 1000 条）在一个事务里写入；每小时删除一次 `started_at` 早于 90 天的行，并且只保留最新的 30 万行。上限估算（实测，SQLite 4 KB 页）：最坏的一行（文本列都到截断上限，且带有效令牌、`a_user`/`a_device_id` 非空）记录约 1.6 KB，一页只放得下两行，加上 `idx_ca_b` 索引里 `b_id` 的副本，磁盘上约 2.4 KB；两次修剪之间最多新增 120 × 60 = 7200 行（另加修剪时还没定稿的几分钟记录），所以持续被灌时表最多约 30.8 万行、约 0.75 GB，删掉的页会被复用，文件停在这个大小；不带有效令牌的请求单行约 1.4 KB，约 0.43 GB。90 天删除和修剪共用一个每小时的定时器：前者是 `idx_ca_started` 上的范围删除，多数时候什么都删不到，不值得单开定时器。
+- 防滥用（这些请求都不认证；常量写死，不做配置）：许可证不符（`LICENSE_MISMATCH`）的请求不记录，所以不会出现 `signal='fail_license'`；`b_id`、中继地址和 `a_device_id`（来自令牌行，登录时已限长，§11）截到 253 字节，版本号、令牌、uuid 截到 64 字节；同一来源每分钟最多新建 60 条记录（IPv4 按单个地址算，IPv6 按 /64 前缀算：一台主机至少分到一个 /64），所有来源合计每分钟最多新建 120 条，超出的丢弃并计数（被丢弃的不占两种额度）；写库队列最多 1 万条，满了丢弃并计数，这几种丢弃每分钟最多打一条 warn 日志；队列里的定稿记录成批（每批最多 1000 条）在一个事务里写入；每小时删除一次 `started_at` 早于 90 天的行，并且只保留最新的 20 万行。上限估算（实测，SQLite 4 KB 页）：最坏的一行（文本列都到截断上限，且带有效令牌、`a_user`/`a_device_id` 非空）记录约 1.6 KB，一页只放得下两行，加上 `idx_ca_b` 索引里 `b_id` 的副本，磁盘上约 2.4 KB；两次修剪之间最多新增 120 × 60 = 7200 行（另加修剪时还没定稿的几分钟记录），所以持续被灌时表最多约 20.7 万行、约 0.5 GB，删掉的页会被复用，文件停在这个大小；不带有效令牌的请求单行约 1.4 KB，约 0.29 GB。90 天删除和修剪共用一个每小时的定时器：前者是 `idx_ca_started` 上的范围删除，多数时候什么都删不到，不值得单开定时器。审计表的保留期和 `device` 表的行数上限（§9.3）也在这个定时器里做（服务启动时先跑一次），各表删了多少行合成一条日志，什么都没删时不打。
 - 统计查询（给命令行）：按时间范围算中继回落率 = count(outcome IN (`relay`,`relay_or_v6`)) / count(outcome IN (`relay`,`relay_or_v6`,`direct_lan`,`direct_tcp`,`direct_tcp_or_v6`))；`rejected`、`no_reply`、`relay_failed`、`relay_unmatched` 不进分子分母，只在分项计数里列出。另列 `relay_offered` 非空、`b_relay` 非空且两者不相等的次数（被控端本地写死了中继）。
 
 ## 9. HTTP API 通则
@@ -322,10 +322,13 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 `GET /api/login-options`、`POST /api/login`（只做 `type=account`）、`POST /api/currentUser`、`POST /api/logout`。见 §11。`currentUser` 忽略请求体，不因请求体缺字段或解析失败回 400；只有令牌无效、过期、账号禁用时回 401。
 
 ### 9.3 设备上报（`device.rs`、`audit.rs`）
-`POST /api/sysinfo`、`POST /api/heartbeat`、`POST /api/audit/conn`、`POST /api/audit/file`、`POST /api/audit/alarm`。不带认证（兼容债务），**只接受已在 hbbs 注册过的设备**：`peer` 表里必须有这个 id，body 必须带 `uuid`，且 base64 解码后与 `peer.uuid` 逐字节相等（真实客户端的心跳、sysinfo、被控端审计总是带 uuid）。`peer` 表里没有这个 id、缺 uuid、uuid 不符，一律按不符处理：sysinfo 回 403 空 body（客户端 120 秒后重试）、心跳回 `{}`、审计回 200 空 body 但不入库。否则谁都能拿随意编的 id 无限新建 `device` 行、写审计表。
+`POST /api/sysinfo`、`POST /api/heartbeat`、`POST /api/audit/conn`、`POST /api/audit/file`、`POST /api/audit/alarm`。不带认证（兼容债务），**只接受已在 hbbs 注册过的设备**：`peer` 表里必须有这个 id，body 必须带 `uuid`，且 base64 解码后与 `peer.uuid` 逐字节相等（真实客户端的心跳、sysinfo、被控端审计总是带 uuid）。`peer` 表里没有这个 id、缺 uuid、uuid 不符，一律按不符处理：sysinfo 回 403 空 body（客户端 120 秒后重试）、心跳回 `{}`、审计回 200 空 body 但不入库。这个校验只挡住没在 hbbs 注册过的 id，挡不住刻意造设备的人：注册本身不认证，`RegisterPk` 的 id、uuid 都由请求方自定，限流在会合模块（按来源 IPv4 地址或 IPv6 /64 计数，另有全局上限）。所以 `device` 表和审计表的总量靠下面的行数上限兜住，不靠校验。
 - 真实客户端的心跳跑在向会合服务器注册的那个进程里，总是先注册再上报；首次心跳偶尔早于注册完成，回 `{}` 后下一次心跳（15 秒后）就会成功。
 - id 超过 253 字节（`MAX_PEER_ID_LEN`）或 uuid 超过 128 字节的请求直接按不符处理，不查库。
-- sysinfo 原文（请求体）超过 64 KB 时同样回 403 空 body（真实 sysinfo 只有几百字节；原文整段存进 `device.sysinfo`）。
+- sysinfo 原文（请求体）超过 8 KB 时同样回 403 空 body（真实 sysinfo 只有几百字节；原文整段存进 `device.sysinfo`）。从中拆出来另存的 `hostname`、`username`、`os`、`version` 各截到 253 字节。
+- `device` 表最多 1 万行（最坏一行约 10.5 KB，合计约 0.1 GB）：每小时的清理（§8 的定时器）发现超出时，按 `last_seen_at` 从老到新删掉超出的行数，只删没有主人（`user_id IS NULL`）、`device_policy` 里没有这个 id、`strategy_option` 里也没有 `scope` = 这个 id 的行；不符合条件的行即使超出上限也保留。这两张表和 `device` 之间没有外键，删设备行不会连带删掉策略。被删的设备再上报时，心跳重新建行，并因为 `sysinfo = ''` 重新索取 sysinfo（§10）。
+- 审计字段限长：超长的值按 UTF-8 字符边界截断后入库，照样回 200 空 body（不回 400）。`audit_conn` 的 `ip` ≤ 64 字节、`peer_id` ≤ 253、`peer_name` ≤ 256、`note` ≤ 4 KB（不认证的备注请求也一样）、`auth` 序列化后 ≤ 4 KB（超出时只留已知字段 `primary_auth`、`two_factor`、`conn_audit_ref`，还超就截断文本）；`audit_file` 的 `peer_id` ≤ 253、`path`、`info` 各 ≤ 4 KB；`audit_alarm` 的 `info` ≤ 4 KB。`device_id` 就是校验过的 id（≤ 253）。
+- 审计表行数上限：三张表各最多 2 万行，每次插入前删掉 id 比最新一行小 2 万 - 1 及以上的行（主键上的范围删除）。不放进每小时的清理：审计上报不限速，一小时内能写进的行数没有上界。实测最坏一行（文本列都到上限，SQLite 4 KB 页，含索引）：`audit_conn` 约 9.5 KB、`audit_file` 约 8.8 KB、`audit_alarm` 约 4.6 KB，2 万 ×（9.5 + 8.8 + 4.6）KB ≈ 0.46 GB。另外每小时删掉 `created_at` 早于 180 天的行。
 
 唯一免校验的是控制端会话结束写备注那条 `/api/audit/conn`：判别条件是"有 `note` 键且没有 `uuid` 键"（不能用"没有 nonce"判别，1.4.x 的审计都不带 nonce）。它只更新已有记录、从不插入新行，所以不会增加行数。
 
@@ -348,15 +351,18 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 - 设备级值为 `''` 时照样覆盖全局值（也就是让这台设备删掉这个键）。
 - 编码：`modified_at` 是 JSON 整数（i64），不能写成字符串；"值一律是字符串"只指 `config_options` 里的值。
 - `sysinfo` 键只在设备还没有 sysinfo（`device.sysinfo = ''`）时出现，值固定为 `true`；其余情况必须完全省略这个键，不能发 `false` 或 `null`（客户端只看键在不在，带了就会重传 sysinfo）。响应结构体的可选键一律用 `Option` + `skip_serializing_if`。
-- 每次心跳更新 `device.last_seen_at`、`ver`、`last_ip`；设备行不存在就建。
+- 每次心跳更新 `device.last_seen_at`、`ver`、`last_ip`；设备行不存在就建。心跳和 sysinfo 写完设备行后，`user_id` 为 NULL（含刚建的行）时按 §11 延迟补绑。
 - 客户端 IP（`last_ip` 等）：TCP 对端是回环地址时取 `X-Real-IP`，没有就取 `X-Forwarded-For` 的最后一个地址；否则直接用 TCP 对端地址；取到后规范化（§3）。反代和 porta-server 不在同一台机器的情况第一期不支持。
 - sysinfo：存原文，拆出 `hostname`、`username`、`os`、`version`；`client_type` 第一期一律 `rustdesk`（Porta 客户端以后在上报里加专门的键来区分，见笔记 01 §6）。
 
 ## 11. 账号、令牌、密码（`auth.rs`、`account.rs`）
 
 - 密码：argon2id（`argon2` crate 默认参数）。校验时按前缀识别 `$argon2id$`、`$2a$/$2b$/$2y$`（bcrypt）、`md5:`（rustdesk-api 旧格式 `md5(明文+"rustdesk-api")`，笔记 05 §3）；旧格式校验通过后当场改存 argon2id，只在库里仍是刚校验的旧哈希时才写（期间 `user passwd` 改过的不覆盖，这次登录回 401）；库里已被另一个并发登录升级成 argon2id、且本次明文能通过它时照常签令牌。`password_hash = ''` 的账号不能密码登录。
-- 令牌：32 字节随机数的 base64url（无填充），库里只存 sha256 hex。没有过期时间，但每个用户最多保留 50 条：登录时在插入新令牌的同一个事务里，删掉该用户按 `last_used_at` 降序（相同再按 rowid 降序）排在 50 名以外的令牌，也就是淘汰最久没用的（否则知道密码的人反复登录就能无限攒令牌行）；登出、改密码、禁用账号时删掉该用户的令牌（登出只删当前这个）。每次使用更新 `last_used_at`。
-- 登录时把请求体里的设备 `id`/`uuid` 记进令牌行；再做 §9.3 同样的校验：只有 `peer` 表里有这个 id 且 uuid 相符时，才把 `device.user_id` 设成这个用户（设备行不存在就建）；uuid 不符时登录照常成功但不改 `device.user_id`（防止别人把你的设备挂到自己名下）；`peer` 表里没有这个 id 时登录照常成功，不建设备行、不绑定（令牌行照样记 id/uuid）。登出时若 `device.user_id` 是本人则清空。
+- 令牌：32 字节随机数的 base64url（无填充），库里只存 sha256 hex。没有过期时间，但每个用户最多保留 50 条：登录时在插入新令牌的同一个事务里，删掉该用户按 `last_used_at` 降序（相同再按 rowid 降序）排在 50 名以外的令牌，也就是淘汰最久没用的（否则知道密码的人反复登录就能无限攒令牌行）；改密码、禁用账号时删掉该用户的全部令牌，登出删哪些见下。每次使用更新 `last_used_at`。
+- 登录时把请求体里的设备 `id`/`uuid` 记进令牌行；再做 §9.3 同样的校验：只有 `peer` 表里有这个 id 且 uuid 相符时，才把 `device.user_id` 设成这个用户（设备行不存在就建）；uuid 不符时登录照常成功但不改 `device.user_id`（防止别人把你的设备挂到自己名下）；`peer` 表里没有这个 id 时登录照常成功，不建设备行、不绑定（令牌行照样记 id/uuid）。
+- 延迟补绑：登录时还没在 hbbs 注册的设备（例如开着 stop-service 登录、之后才启动服务），由之后的心跳或 sysinfo 补上归属：请求通过 §9.3 的 uuid 校验、且 `device.user_id` 为 NULL（含刚建的行）时，取 `token` 表里 `device_id` = 这个 id、`device_uuid` = 请求里的 uuid、账号 `status = 1` 的令牌中 `last_used_at` 最新的一行，把它的 `user_id` 写进 `device.user_id`。安全性和登录时绑定相同：令牌行的 uuid 要等于刚和 `peer.uuid` 比对过的那个。已有主人的设备不改。已知边角：A 在设备上登录过、登出请求没送到，B 再登录接管后又登出，下一次心跳会把设备补绑回 A（A 的旧令牌还在）。不处理：登出时连别人的同设备令牌一起删，会让伪造 `device_id` 的人能删掉别人的令牌；归属只决定设备在组面板（§12.3）里列在谁名下，不影响策略和连接权限，而 A 本来就在这台设备上登录过，补错的后果有限。
+- 登出时删掉当前令牌，连同本人 `device_id` 相同的其他令牌（客户端只持有最新一枚，更早的已经是废令牌；留着的话下一次心跳就会把设备补绑回来）；`device_id` 为空的令牌不受影响。之后若 `device.user_id` 是本人则清空。
+- 走代理或 WebSocket 的客户端在 hbbs 注册不了（会合模块的 TCP 路径不做注册，§1），`peer` 表里没有它们，所以既不会被绑定，心跳也只拿到 `{}`，收不到策略。
 - 登录请求里的 `id` 超过 253 字节（`MAX_PEER_ID_LEN`）或 `uuid` 超过 128 字节时回 400 + `{"error": "…"}`，不写令牌行（和用户名超长一样，在查库前拒绝）。令牌行的 `device_id` 会被结果记录模块复制进每一行 `conn_attempt`（§8），不限长度时登录一次就能让之后每条连接记录都带着任意长的文本。
 - 账号可用的判定写死为 `status = 1`。
 - 登录失败限流：只按用户名，15 分钟内失败 5 次后，15 分钟内直接拒绝（回 `{"error": "…"}`）。不按来源 IP 限：API 在反向代理后面时看到的全是代理地址，按 IP 限会把所有人一起锁住。

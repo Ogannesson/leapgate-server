@@ -181,6 +181,29 @@ pub fn expected_rev(options: &BTreeMap<String, String>, global_epoch: i64, devic
     }
 }
 
+/// 在 `dir` 里起 porta-server：`-p port`、`TEST_HBBS=no`、库是 `dir/db_v2.sqlite3`，输出追加到 `dir/server.log`。
+fn spawn(dir: &tempfile::TempDir, port: u16) -> Child {
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.path().join("server.log"))
+        .unwrap();
+    Command::new(env!("CARGO_BIN_EXE_porta-server"))
+        .arg("-p")
+        .arg(port.to_string())
+        .current_dir(dir.path())
+        .env("TEST_HBBS", "no")
+        .env("DB_URL", dir.path().join("db_v2.sqlite3"))
+        .env_remove("ALWAYS_USE_RELAY")
+        .env_remove("RELAY")
+        .env_remove("KEY")
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .spawn()
+        .unwrap()
+}
+
 /// 一个真实的 porta-server 进程：临时工作目录、`-p P`、`TEST_HBBS=no`、`porta.toml` 里 `[geo] auto_update = false`。
 pub struct Server {
     pub dir: tempfile::TempDir,
@@ -207,21 +230,7 @@ impl Server {
         )
         .unwrap();
         let db_path = dir.path().join("db_v2.sqlite3");
-        let log = std::fs::File::create(dir.path().join("server.log")).unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_porta-server"))
-            .arg("-p")
-            .arg(port.to_string())
-            .current_dir(dir.path())
-            .env("TEST_HBBS", "no")
-            .env("DB_URL", &db_path)
-            .env_remove("ALWAYS_USE_RELAY")
-            .env_remove("RELAY")
-            .env_remove("KEY")
-            .stdin(Stdio::null())
-            .stdout(log.try_clone().unwrap())
-            .stderr(log)
-            .spawn()
-            .unwrap();
+        let child = spawn(&dir, port);
         let http = reqwest::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(20))
@@ -244,6 +253,14 @@ impl Server {
         };
         server.wait_ready().await;
         server
+    }
+
+    /// 停掉进程，在同一个工作目录、同一个端口上重新启动（库、密钥文件都保留）；日志接着追加。
+    pub async fn restart(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.child = spawn(&self.dir, self.port);
+        self.wait_ready().await;
     }
 
     /// API 端口在迁移完成之后才绑定（`start_with_bind`），所以能连上 P-2 就说明库已就绪。

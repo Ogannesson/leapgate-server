@@ -391,7 +391,7 @@ pub(crate) async fn current_user(
     }
 }
 
-/// `POST /api/logout`: deletes only the token used.
+/// `POST /api/logout`: deletes the token used and the user's older tokens from the same device.
 pub(crate) async fn logout(
     State(state): State<AppState>,
     user: CurrentUser,
@@ -403,6 +403,13 @@ pub(crate) async fn logout(
             .fetch_optional(&state.db)
             .await?;
     if let Some(device_id) = device_id.filter(|d| !d.is_empty()) {
+        // The client holds only its latest token, so earlier ones from this device are dead; left
+        // in place, the next heartbeat would bind the device right back to this user (§11).
+        sqlx::query("delete from token where user_id = ? and device_id = ?")
+            .bind(user.id)
+            .bind(&device_id)
+            .execute(&state.db)
+            .await?;
         sqlx::query("update device set user_id = null where id = ? and user_id = ?")
             .bind(device_id)
             .bind(user.id)
@@ -943,7 +950,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logout_deletes_only_this_token_and_unbinds() {
+    async fn logout_keeps_tokens_of_other_devices_and_unbinds() {
         let t = testutil::app().await;
         let db = &t.state.db;
         let (uid, other_token) = testutil::create_user(db, "lo-judy", "pw", false).await;

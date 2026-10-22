@@ -474,10 +474,10 @@ async fn current_user_internal_error_is_200_error() {
     check_user_payload(&r.json(), "alice", false);
 }
 
-/// §11、笔记 03 §2.4：logout 只删当前这个令牌（同一用户的其他令牌照常可用）；
-/// 若 device.user_id 是本人则清空，是别人则不动。
+/// §11、笔记 03 §2.4：logout 删当前这个令牌，连同本人在同一台设备上更早登录留下的令牌（客户端只持有最新一枚）；
+/// 本人在别的设备上的令牌照常可用；若 device.user_id 是本人则清空，是别人则不动。
 #[tokio::test]
-async fn logout_revokes_only_current_token_and_unbinds_device() {
+async fn logout_revokes_current_and_same_device_tokens_and_unbinds_device() {
     let s = Server::start().await;
     let alice = s.create_user("alice", "pw", false).await;
     let bob = s.create_user("bob", "pw", false).await;
@@ -487,16 +487,22 @@ async fn logout_revokes_only_current_token_and_unbinds_device() {
     let uuid = b64(&raw);
     let body = json!({"id": "200000001", "uuid": uuid}).to_string();
 
+    let t0 = s.login_ok("alice", "pw", "200000001", &uuid).await;
     let t1 = s.login_ok("alice", "pw", "200000001", &uuid).await;
-    let t2 = s.login_ok("alice", "pw", "200000001", &uuid).await;
+    let t2 = s.login_ok("alice", "pw", "200000003", &uuid).await;
+    let tb = s.login_ok("bob", "pw", "200000001", &b64(b"bob-uuid")).await;
     assert_eq!(s.device_user("200000001").await, Some(Some(alice)));
 
     let r = s.post("/api/logout", Some(&t1), &body).await;
     assert_eq!(r.status, 200, "{:?}", r.text());
-    assert_eq!(s.scalar_i64(&format!("select count(*) from token where token_hash = '{}'", sha256_hex(&t1))).await, 0);
-    assert_eq!(s.post("/api/currentUser", Some(&t1), &body).await.status, 401);
-    let r = s.post("/api/currentUser", Some(&t2), &body).await;
-    assert_eq!(r.status, 200, "other token must survive: {:?}", r.text());
+    for t in [&t0, &t1] {
+        assert_eq!(s.scalar_i64(&format!("select count(*) from token where token_hash = '{}'", sha256_hex(t))).await, 0);
+        assert_eq!(s.post("/api/currentUser", Some(t), &body).await.status, 401);
+    }
+    for t in [&t2, &tb] {
+        let r = s.post("/api/currentUser", Some(t), &body).await;
+        assert_eq!(r.status, 200, "token of another device or user must survive: {:?}", r.text());
+    }
     assert_eq!(s.device_user("200000001").await, Some(None), "device bound to alice must be cleared on logout");
 
     // 设备已经归 bob：alice 登出不动它。
@@ -743,7 +749,7 @@ async fn sysinfo_uuid_weak_check() {
 
 /// §9.3：设备上报只接受在 hbbs 注册过的设备。peer 表里没有这个 id、id 超过 253 字节、uuid 超过 128 字节，
 /// 都按不符处理：sysinfo 403 空 body、心跳 `{}`、审计 200 空 body，三者都不写库；
-/// sysinfo 原文超过 64 KB 也回 403 空 body。
+/// sysinfo 原文超过 8 KB 也回 403 空 body。
 #[tokio::test]
 async fn device_reports_only_from_registered_devices() {
     let s = Server::start().await;
@@ -772,15 +778,102 @@ async fn device_reports_only_from_registered_devices() {
         assert_eq!(s.count(table).await, 0, "{table}");
     }
 
-    // 注册过、uuid 相符，但 sysinfo 原文超过 64 KB：403 空 body，不写 device。
+    // 注册过、uuid 相符，但 sysinfo 原文超过 8 KB：403 空 body，不写 device；正好 8 KB 照收、原文整段存下。
     let uuid = registered(&s, "600000004").await;
-    let mut big = sysinfo_body("600000004", &uuid);
-    big["pad"] = json!("p".repeat(64 * 1024));
-    let r = s.post_json("/api/sysinfo", None, &big).await;
+    let padded = |len: usize| {
+        let mut v = sysinfo_body("600000004", &uuid);
+        v["pad"] = json!("");
+        let pad = len - v.to_string().len();
+        v["pad"] = json!("p".repeat(pad));
+        let body = v.to_string();
+        assert_eq!(body.len(), len);
+        body
+    };
+    let r = s.post("/api/sysinfo", None, &padded(8 * 1024 + 1)).await;
     assert_eq!(r.status, 403, "{:?}", r.text());
     assert!(r.body.is_empty(), "{:?}", r.text());
     assert_eq!(s.count("device").await, 0);
-    assert_eq!(s.sysinfo("600000004", &uuid).await.body, b"SYSINFO_UPDATED".to_vec());
+    let fits = padded(8 * 1024);
+    assert_eq!(s.post("/api/sysinfo", None, &fits).await.body, b"SYSINFO_UPDATED".to_vec());
+    assert_eq!(get_str(&s.rows("select sysinfo from device where id = '600000004'").await[0], "sysinfo"), fits);
+}
+
+/// §9.3：sysinfo 里拆出来另存的 hostname/username/os/version 各截到 253 字节（按 UTF-8 字符边界），原文照存。
+#[tokio::test]
+async fn sysinfo_split_fields_are_clipped() {
+    let s = Server::start().await;
+    let uuid = registered(&s, "600000005").await;
+    let mut body = sysinfo_body("600000005", &uuid);
+    body["hostname"] = json!("主".repeat(100)); // 300 字节，3 字节一个字符
+    body["username"] = json!("u".repeat(253));
+    body["os"] = json!("o".repeat(254));
+    body["version"] = json!("v".repeat(1000));
+    let r = s.post_json("/api/sysinfo", None, &body).await;
+    assert_eq!(r.body, b"SYSINFO_UPDATED".to_vec(), "{:?}", r.text());
+    let d = &s.rows("select * from device where id = '600000005'").await[0];
+    assert_eq!(get_str(d, "hostname"), "主".repeat(84));
+    assert_eq!(get_str(d, "username"), "u".repeat(253));
+    assert_eq!(get_str(d, "os"), "o".repeat(253));
+    assert_eq!(get_str(d, "version"), "v".repeat(253));
+    assert_eq!(serde_json::from_str::<Value>(get_str(d, "sysinfo")).unwrap(), body);
+}
+
+/// §11 延迟补绑：登录时设备还没在 hbbs 注册（不绑定），注册后的第一次心跳按令牌行补绑；
+/// 令牌行的 uuid 必须和心跳的 uuid 相同、账号必须启用；设备已有主人时不改。
+#[tokio::test]
+async fn late_binding_after_registration() {
+    let s = Server::start().await;
+    let alice = s.create_user("alice", "pw", false).await;
+    let bob = s.create_user("bob", "pw", false).await;
+    let carol = s.create_user("carol", "pw", false).await;
+    let raw = random_uuid_bytes();
+    let uuid = b64(&raw);
+
+    s.login_ok("alice", "pw", "610000001", &uuid).await;
+    assert_eq!(s.device_user("610000001").await, None, "not registered yet: no device row");
+    s.insert_peer("610000001", &raw).await;
+    hb_json(&s.heartbeat("610000001", &uuid, 0).await);
+    assert_eq!(s.device_user("610000001").await, Some(Some(alice)), "heartbeat must bind from the login token");
+
+    // uuid 和心跳不同的令牌、禁用账号的令牌：都不补绑。
+    s.login_ok("bob", "pw", "610000002", &b64(b"other-uuid")).await;
+    s.login_ok("carol", "pw", "610000002", &uuid).await;
+    s.exec(&format!("update user set status = 0 where id = {carol}")).await;
+    s.insert_peer("610000002", &raw).await;
+    hb_json(&s.heartbeat("610000002", &uuid, 0).await);
+    assert_eq!(s.device_user("610000002").await, Some(None));
+    // uuid 不符的心跳本身：既不建行也不补绑。
+    s.login_ok("bob", "pw", "610000003", &uuid).await;
+    s.insert_peer("610000003", &raw).await;
+    assert_eq!(hb_json(&s.heartbeat("610000003", &b64(b"forged"), 0).await), json!({}));
+    assert_eq!(s.device_user("610000003").await, None);
+
+    // 已经有主人：别人更新的令牌不改归属。
+    s.exec(&format!("update token set device_id = '610000001', device_uuid = '{uuid}' where user_id = {bob}")).await;
+    s.exec(&format!("update token set last_used_at = last_used_at + 1000 where user_id = {bob}")).await;
+    hb_json(&s.heartbeat("610000001", &uuid, 0).await);
+    assert_eq!(s.device_user("610000001").await, Some(Some(alice)));
+}
+
+/// §11：登出删掉本人在这台设备上的全部令牌，之后的心跳不会把设备补绑回来。
+#[tokio::test]
+async fn logout_is_not_undone_by_heartbeat() {
+    let s = Server::start().await;
+    let alice = s.create_user("alice", "pw", false).await;
+    let raw = random_uuid_bytes();
+    let uuid = b64(&raw);
+    // 第一次登录在注册之前，第二次在注册之后（当场绑定）。
+    s.login_ok("alice", "pw", "620000001", &uuid).await;
+    s.insert_peer("620000001", &raw).await;
+    let latest = s.login_ok("alice", "pw", "620000001", &uuid).await;
+    assert_eq!(s.device_user("620000001").await, Some(Some(alice)));
+
+    let r = s.post("/api/logout", Some(&latest), "").await;
+    assert_eq!(r.status, 200, "{:?}", r.text());
+    assert_eq!(s.device_user("620000001").await, Some(None));
+    hb_json(&s.heartbeat("620000001", &uuid, 0).await);
+    assert_eq!(s.device_user("620000001").await, Some(None), "logout must not be undone by late binding");
+    assert_eq!(s.scalar_i64("select count(*) from token where device_id = '620000001'").await, 0);
 }
 
 // ===================== §10 心跳与策略 =====================
@@ -1302,4 +1395,118 @@ async fn audit_uuid_weak_check() {
     assert_eq!(s.count("audit_conn").await, 1);
     assert_eq!(s.count("audit_file").await, 1);
     assert_eq!(s.count("audit_alarm").await, 1);
+}
+
+/// §9.3 审计字段限长：超长的截断（按 UTF-8 字符边界）后入库，照样回 200 空 body，不回 400。
+/// ip ≤ 64、peer_id ≤ 253、peer_name ≤ 256、note ≤ 4096（含不认证的备注请求）、auth 序列化后 ≤ 4096
+/// （超出时丢掉客户端不会发的键）；file 的 peer_id ≤ 253、path/info ≤ 4096；alarm 的 info ≤ 4096。
+#[tokio::test]
+async fn audit_fields_are_clipped_not_refused() {
+    let s = Server::start().await;
+    let dev = "800000008";
+    let uuid = registered(&s, dev).await;
+    let mut new = conn_new(dev, &uuid, 1800, Some(&nonce()));
+    new["ip"] = json!("1".repeat(100));
+    assert_audit_ok(&s.post_json("/api/audit/conn", None, &new).await, "new");
+    let mut auth = conn_auth(dev, &uuid, 1800, 77, 0);
+    auth["peer"] = json!(["9".repeat(300), "名".repeat(100)]);
+    auth["junk"] = json!("x".repeat(5000));
+    assert_audit_ok(&s.post_json("/api/audit/conn", None, &auth).await, "auth");
+    let note = json!({"id": dev, "session_id": 77u64, "note": "备".repeat(2000)});
+    assert_audit_ok(&s.post_json("/api/audit/conn", None, &note).await, "note");
+    let r = &audit_rows(&s, dev).await[0];
+    assert_eq!(get_str(r, "ip"), "1".repeat(64));
+    assert_eq!(get_str(r, "peer_id"), "9".repeat(253));
+    assert_eq!(get_str(r, "peer_name"), "名".repeat(85));
+    assert_eq!(get_str(r, "note"), "备".repeat(1365));
+    let stored: Value = serde_json::from_str(get_str(r, "auth")).expect("auth must stay JSON when only unknown keys are dropped");
+    assert_eq!(stored, json!({"primary_auth": 2, "two_factor": 1}));
+
+    let file = json!({"id": dev, "uuid": uuid, "peer_id": "9".repeat(300), "conn_id": 1800, "type": 0,
+                      "path": "p".repeat(5000), "is_file": true, "info": "i".repeat(5000), "nonce": nonce()});
+    assert_audit_ok(&s.post_json("/api/audit/file", None, &file).await, "file");
+    let r = &s.rows(&format!("select * from audit_file where device_id = '{dev}'")).await[0];
+    assert_eq!(get_str(r, "peer_id"), "9".repeat(253));
+    assert_eq!(get_str(r, "path"), "p".repeat(4096));
+    assert_eq!(get_str(r, "info"), "i".repeat(4096));
+    let alarm = json!({"id": dev, "uuid": uuid, "typ": 0, "info": "a".repeat(5000), "conn_id": 1800, "nonce": nonce()});
+    assert_audit_ok(&s.post_json("/api/audit/alarm", None, &alarm).await, "alarm");
+    let r = &s.rows(&format!("select * from audit_alarm where device_id = '{dev}'")).await[0];
+    assert_eq!(get_str(r, "info"), "a".repeat(4096));
+}
+
+/// §9.3 审计表行数上限：每张表最多 2 万行，每次插入前删掉 id 比最新一行小 2 万 - 1 及以上的行。
+/// 造法：直接在库里放 id 为 2、3、20001 的行，再上报一条（新行 id 20002）：id 2 被删，3 留下。
+#[tokio::test]
+async fn audit_tables_keep_newest_rows() {
+    let s = Server::start().await;
+    let dev = "800000009";
+    let uuid = registered(&s, dev).await;
+    let reports = [
+        ("audit_conn", "/api/audit/conn", conn_new(dev, &uuid, 1900, Some(&nonce()))),
+        ("audit_file", "/api/audit/file",
+         json!({"id": dev, "uuid": uuid, "peer_id": "1", "conn_id": 1900, "type": 0, "path": "", "is_file": false, "info": "{}"})),
+        ("audit_alarm", "/api/audit/alarm", json!({"id": dev, "uuid": uuid, "typ": 0, "info": "{}", "conn_id": 1900})),
+    ];
+    for (table, path, body) in reports {
+        for id in [2, 3, 20_001] {
+            let cols = if table == "audit_alarm" { "id, device_id, typ, created_at" } else { "id, device_id, conn_id, created_at" };
+            s.exec(&format!("insert into {table}({cols}) values({id}, 'x', 0, {})", now())).await;
+        }
+        assert_audit_ok(&s.post_json(path, None, &body).await, table);
+        let ids: Vec<i64> = s.rows(&format!("select id from {table} order by id")).await.iter().map(|r| get_i64(r, "id")).collect();
+        assert_eq!(ids, [3, 20_001, 20_002], "{table}");
+    }
+}
+
+/// §9.3、§10 每小时清理（服务启动时先跑一次）：审计表删掉 180 天前的行；device 表超过 1 万行时，
+/// 按 last_seen_at 从老到新淘汰没有主人、也没有 device_policy 和设备级 strategy_option 的行，其余的不动。
+#[tokio::test]
+async fn hourly_purge_runs_at_startup() {
+    let mut s = Server::start().await;
+    let old = now() - 181 * 24 * 3600;
+    let recent = now() - 24 * 3600;
+    for table in ["audit_conn", "audit_file", "audit_alarm"] {
+        let cols = if table == "audit_alarm" { "device_id, typ, created_at" } else { "device_id, conn_id, created_at" };
+        for t in [old, recent] {
+            s.exec(&format!("insert into {table}({cols}) values('x', 0, {t})")).await;
+        }
+    }
+    // 9997 行较新的，加上三台最老的（有主人、固定了中继、有设备级选项），正好 1 万行；再加两台较老的无主设备。
+    s.exec(
+        "with recursive n(i) as (select 1 union all select i + 1 from n where i < 9997)
+         insert into device(id, first_seen_at, last_seen_at) select 'bulk' || i, 0, 1000 + i from n",
+    )
+    .await;
+    let alice = s.create_user("alice", "pw", false).await;
+    for (id, seen) in [("owned", 1), ("pinned", 2), ("optioned", 3), ("old-a", 4), ("old-b", 5)] {
+        s.exec(&format!("insert into device(id, first_seen_at, last_seen_at) values('{id}', 0, {seen})")).await;
+    }
+    s.exec(&format!("update device set user_id = {alice} where id = 'owned'")).await;
+    s.exec("insert into device_policy(device_id, relay_pin) values('pinned', 'relay.example.com:21117')").await;
+    s.set_option("optioned", "allow-auto-disconnect", "Y").await;
+
+    s.restart().await;
+    // 各表删了多少行合成一条日志；这一行写出来时清理已经做完。
+    let purged = |log: String| {
+        log.lines().any(|l| ["audit_conn 1", "audit_file 1", "audit_alarm 1", "device 2"].iter().all(|x| l.contains(x)))
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !purged(s.log()) {
+        assert!(std::time::Instant::now() < deadline, "no purge log line with every table's count:\n{}", s.log());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    for table in ["audit_conn", "audit_file", "audit_alarm"] {
+        let left: Vec<i64> = s.rows(&format!("select created_at from {table}")).await.iter().map(|r| get_i64(r, "created_at")).collect();
+        assert_eq!(left, [recent], "{table}");
+    }
+    assert_eq!(s.count("device").await, 10_000);
+    for id in ["owned", "pinned", "optioned", "bulk1"] {
+        assert!(s.device_user(id).await.is_some(), "{id} must be kept");
+    }
+    for id in ["old-a", "old-b"] {
+        assert_eq!(s.device_user(id).await, None, "{id} must be evicted");
+    }
+    assert_eq!(s.scalar_i64("select count(*) from device_policy where device_id = 'pinned'").await, 1);
+    assert_eq!(s.scalar_i64("select count(*) from strategy_option where scope = 'optioned'").await, 1);
 }
