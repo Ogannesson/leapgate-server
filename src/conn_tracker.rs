@@ -52,16 +52,24 @@ const IP_WINDOW_MS: i64 = 60_000;
 /// New rows per minute from all sources together, a backstop for requests spread over many sources
 /// (review R2-4). 2 a second is far above what a personal deployment makes (a few hundred a day).
 const TOTAL_ROWS_PER_MIN: u32 = 120;
-/// The daily purge also keeps only this many newest rows, so a sustained flood stays within about
-/// 0.5 GB (a row is at most about 1 KB) instead of growing for the whole retention period.
-const MAX_ROWS: i64 = 500_000;
+/// The purge also keeps only this many newest rows, so a sustained flood has a fixed ceiling instead
+/// of growing for the whole retention period. Measured on SQLite with 4 KB pages: a worst-case row
+/// (every text column at its clip limit, `a_user`/`a_device_id` from a valid token) is a ~1.6 KB
+/// record, two to a page, plus its `idx_ca_b` entry with a copy of `b_id`: about 2.4 KB on disk.
+/// Between two purges at most `TOTAL_ROWS_PER_MIN` × 60 = 7,200 rows (plus the few minutes of
+/// attempts still open at the last purge) come on top, so the table peaks near 308,000 rows ≈
+/// 0.75 GB; freed pages are reused, so the file stays there. Without a valid token (no `a_user`,
+/// `a_device_id`) a row takes about 1.4 KB: ≈ 0.43 GB.
+const MAX_ROWS: i64 = 300_000;
 /// Finalized attempts waiting for the writer; when full, new ones are dropped and counted.
 const WRITE_QUEUE: usize = 10_000;
 /// At most this many rows per insert transaction.
 const WRITE_BATCH: usize = 1_000;
-/// Rows started longer ago than this are deleted once a day.
+/// Rows started longer ago than this are deleted by the purge.
 const RETENTION_MS: i64 = 90 * 24 * 3600 * 1000;
-const PURGE_INTERVAL: Duration = Duration::from_secs(24 * 3600);
+/// Hourly, so at most an hour of new rows comes on top of `MAX_ROWS`. The 90-day delete shares the
+/// timer: a range on `idx_ca_started` that finds nothing most hours, not worth a timer of its own.
+const PURGE_INTERVAL: Duration = Duration::from_secs(3600);
 /// Dropped records are logged at most this often.
 const DROP_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -635,7 +643,12 @@ async fn insert_row(
 ) -> ResultType<()> {
     let a = &f.attempt;
     let (a_user, a_device_id) = match owner {
-        Some((_, name, device_id)) => (Some(name), Some(device_id)),
+        Some((_, name, mut device_id)) => {
+            // From the login request, which refuses longer ids (§11); clipped here too, so the row
+            // size behind `MAX_ROWS` holds whatever the token table contains.
+            clip(&mut device_id, MAX_PEER_ID_LEN);
+            (Some(name), Some(device_id))
+        }
         None => (None, None),
     };
     let req = a.req.as_ref();
@@ -791,7 +804,7 @@ impl ConnTracker {
                 timer.tick().await;
                 match purge(&db, now_ms()).await {
                     Ok(0) => {}
-                    Ok(n) => log::info!("conn_attempt: deleted {n} rows older than 90 days"),
+                    Ok(n) => log::info!("conn_attempt: deleted {n} rows (older than 90 days or beyond the newest {MAX_ROWS})"),
                     Err(e) => log::error!("conn_attempt purge: {e}"),
                 }
             }
@@ -1482,6 +1495,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(left, ["id-3", "id-4"]);
+    }
+
+    #[tokio::test]
+    async fn write_clips_the_token_device_id() {
+        let (_dir, db) = crate::testutil::pool().await;
+        let (uid, token) = crate::testutil::create_user(&db, "alice", "pw", false).await;
+        sqlx::query("update token set device_id = ? where user_id = ?")
+            .bind("é".repeat(MAX_PEER_ID_LEN))
+            .bind(uid)
+            .execute(&db)
+            .await
+            .unwrap();
+        let mut s = TrackerState::default();
+        let mut req = punch(a1(), Signal::FailOffline);
+        req.token = token;
+        s.punch_request(req, T0);
+        insert(&db, &mut s, T0 + PAIR_MERGE_MS).await;
+        let stored: String = sqlx::query_scalar("select a_device_id from conn_attempt")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        // 2-byte chars: cut at the last char boundary within the limit.
+        assert_eq!(stored, "é".repeat(MAX_PEER_ID_LEN / 2));
     }
 
     #[tokio::test]
