@@ -322,9 +322,12 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 `GET /api/login-options`、`POST /api/login`（只做 `type=account`）、`POST /api/currentUser`、`POST /api/logout`。见 §11。`currentUser` 忽略请求体，不因请求体缺字段或解析失败回 400；只有令牌无效、过期、账号禁用时回 401。
 
 ### 9.3 设备上报（`device.rs`、`audit.rs`）
-`POST /api/sysinfo`、`POST /api/heartbeat`、`POST /api/audit/conn`、`POST /api/audit/file`、`POST /api/audit/alarm`。不带认证（兼容债务），做弱校验：hbbs 的 `peer` 表里有这个 id 时，body **必须**带 `uuid`，且 base64 解码后与 `peer.uuid` 逐字节相等（真实客户端的心跳、sysinfo、被控端审计总是带 uuid）；缺 uuid 按不符处理：sysinfo 回 403 空 body（客户端 120 秒后重试）、心跳回 `{}`、审计回 200 空 body 但不入库。`peer` 表里没有这个 id 时照常接受。
+`POST /api/sysinfo`、`POST /api/heartbeat`、`POST /api/audit/conn`、`POST /api/audit/file`、`POST /api/audit/alarm`。不带认证（兼容债务），**只接受已在 hbbs 注册过的设备**：`peer` 表里必须有这个 id，body 必须带 `uuid`，且 base64 解码后与 `peer.uuid` 逐字节相等（真实客户端的心跳、sysinfo、被控端审计总是带 uuid）。`peer` 表里没有这个 id、缺 uuid、uuid 不符，一律按不符处理：sysinfo 回 403 空 body（客户端 120 秒后重试）、心跳回 `{}`、审计回 200 空 body 但不入库。否则谁都能拿随意编的 id 无限新建 `device` 行、写审计表。
+- 真实客户端的心跳跑在向会合服务器注册的那个进程里，总是先注册再上报；首次心跳偶尔早于注册完成，回 `{}` 后下一次心跳（15 秒后）就会成功。
+- id 超过 253 字节（`MAX_PEER_ID_LEN`）或 uuid 超过 128 字节的请求直接按不符处理，不查库。
+- sysinfo 原文（请求体）超过 64 KB 时同样回 403 空 body（真实 sysinfo 只有几百字节；原文整段存进 `device.sysinfo`）。
 
-唯一免校验的是控制端会话结束写备注那条 `/api/audit/conn`：判别条件是"有 `note` 键且没有 `uuid` 键"（不能用"没有 nonce"判别，1.4.x 的审计都不带 nonce）。
+唯一免校验的是控制端会话结束写备注那条 `/api/audit/conn`：判别条件是"有 `note` 键且没有 `uuid` 键"（不能用"没有 nonce"判别，1.4.x 的审计都不带 nonce）。它只更新已有记录、从不插入新行，所以不会增加行数。
 
 `audit_conn` 的关联规则：
 - `action:"new"`：插入一行，`session_id` 存 `''`。
@@ -353,7 +356,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 
 - 密码：argon2id（`argon2` crate 默认参数）。校验时按前缀识别 `$argon2id$`、`$2a$/$2b$/$2y$`（bcrypt）、`md5:`（rustdesk-api 旧格式 `md5(明文+"rustdesk-api")`，笔记 05 §3）；旧格式校验通过后当场改存 argon2id，只在库里仍是刚校验的旧哈希时才写（期间 `user passwd` 改过的不覆盖，这次登录回 401）；库里已被另一个并发登录升级成 argon2id、且本次明文能通过它时照常签令牌。`password_hash = ''` 的账号不能密码登录。
 - 令牌：32 字节随机数的 base64url（无填充），库里只存 sha256 hex。没有过期时间；登出、改密码、禁用账号时删掉该用户的令牌（登出只删当前这个）。每次使用更新 `last_used_at`。
-- 登录时把请求体里的设备 `id`/`uuid` 记进令牌行；再做 §9.3 同样的弱校验：`peer` 表里有这个 id、且 uuid 不符时，登录照常成功但不改 `device.user_id`（防止别人把你的设备挂到自己名下）；校验通过或 `peer` 表里没有这个 id 时，把 `device.user_id` 设成这个用户（设备行不存在就建）。登出时若 `device.user_id` 是本人则清空。
+- 登录时把请求体里的设备 `id`/`uuid` 记进令牌行；再做 §9.3 同样的校验：只有 `peer` 表里有这个 id 且 uuid 相符时，才把 `device.user_id` 设成这个用户（设备行不存在就建）；uuid 不符时登录照常成功但不改 `device.user_id`（防止别人把你的设备挂到自己名下）；`peer` 表里没有这个 id 时登录照常成功，不建设备行、不绑定（令牌行照样记 id/uuid）。登出时若 `device.user_id` 是本人则清空。
 - 账号可用的判定写死为 `status = 1`。
 - 登录失败限流：只按用户名，15 分钟内失败 5 次后，15 分钟内直接拒绝（回 `{"error": "…"}`）。不按来源 IP 限：API 在反向代理后面时看到的全是代理地址，按 IP 限会把所有人一起锁住。
 - 密码校验（argon2，不存在的用户名也算一次）同时最多核数个，其余排队；排队的最多 4 × 核数个（常量写死），再来的直接回 429 + `{"error": "…"}`，不无限排队。不存在的用户名不受上面的限流，没有这个上限时，不带凭据的请求就能让正常登录无限期排在后面。

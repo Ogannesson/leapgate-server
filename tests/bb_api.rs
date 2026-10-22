@@ -92,6 +92,13 @@ fn hb_json(r: &Resp) -> Value {
     v
 }
 
+/// 在 hbbs 的 peer 表里登记一台设备（§9.3：设备上报只接受注册过的设备），返回它上报时带的 base64 uuid。
+async fn registered(s: &Server, id: &str) -> String {
+    let raw = random_uuid_bytes();
+    s.insert_peer(id, &raw).await;
+    b64(&raw)
+}
+
 /// 审计成功：200 + 空 body（§9.1.8，笔记 03 §5.1）。
 fn assert_audit_ok(r: &Resp, what: &str) {
     assert_eq!(r.status, 200, "{what}: {:?}", r.text());
@@ -381,8 +388,8 @@ async fn login_rate_limit_by_username() {
     s.login_ok("bob", "right", "123456789", &uuid).await;
 }
 
-/// §11 设备归属（弱校验同 §9.3）：peer 表里没有这个 id → device.user_id 设成登录用户（设备行不存在就建）；
-/// peer 表里有且 uuid 相符 → 同样设上；uuid 不符 → 登录照常成功，但不改 device.user_id。
+/// §11 设备归属（校验同 §9.3）：peer 表里有且 uuid 相符 → device.user_id 设成登录用户（设备行不存在就建）；
+/// peer 表里没有这个 id → 登录照常成功，不建设备行；uuid 不符 → 登录照常成功，但不改 device.user_id。
 #[tokio::test]
 async fn login_binds_device_with_weak_check() {
     let s = Server::start().await;
@@ -390,9 +397,11 @@ async fn login_binds_device_with_weak_check() {
     let bob = s.create_user("bob", "pw", false).await;
     let raw = random_uuid_bytes();
 
-    // peer 表里没有：建设备行并归给 alice。
-    s.login_ok("alice", "pw", "100000001", &b64(&raw)).await;
-    assert_eq!(s.device_user("100000001").await, Some(Some(alice)));
+    // peer 表里没有：登录成功，但不建设备行；令牌行照样记下 id。
+    let token = s.login_ok("alice", "pw", "100000001", &b64(&raw)).await;
+    assert_eq!(s.device_user("100000001").await, None);
+    let row = &s.rows(&format!("select device_id from token where token_hash = '{}'", sha256_hex(&token))).await[0];
+    assert_eq!(get_str(row, "device_id"), "100000001");
 
     // peer 表里有、uuid 相符。
     s.insert_peer("100000002", &raw).await;
@@ -455,7 +464,10 @@ async fn logout_revokes_only_current_token_and_unbinds_device() {
     let s = Server::start().await;
     let alice = s.create_user("alice", "pw", false).await;
     let bob = s.create_user("bob", "pw", false).await;
-    let uuid = b64(&random_uuid_bytes());
+    let raw = random_uuid_bytes();
+    s.insert_peer("200000001", &raw).await;
+    s.insert_peer("200000002", &raw).await;
+    let uuid = b64(&raw);
     let body = json!({"id": "200000001", "uuid": uuid}).to_string();
 
     let t1 = s.login_ok("alice", "pw", "200000001", &uuid).await;
@@ -651,12 +663,12 @@ async fn group_panel_pagination() {
 // ===================== §9.3 / §10 sysinfo =====================
 
 /// §9.1.7、§10：sysinfo 成功回纯文本 `SYSINFO_UPDATED`（逐字节，无换行无引号）、`text/plain; charset=utf-8`；
-/// peer 表里没有这个 id 也照常接受（不回 ID_NOT_FOUND）；存原文，拆出 hostname/username/os/version，
-/// uuid 存上报里的 base64，client_type 一律 rustdesk；未知字段（preset-*、以后 Porta 的键）照收。
+/// 存原文，拆出 hostname/username/os/version，uuid 存上报里的 base64，client_type 一律 rustdesk；
+/// 未知字段（preset-*、以后 Porta 的键）照收。
 #[tokio::test]
 async fn sysinfo_stores_and_answers_exactly() {
     let s = Server::start().await;
-    let uuid = b64(&random_uuid_bytes());
+    let uuid = registered(&s, "600000001").await;
     let mut body = sysinfo_body("600000001", &uuid);
     body["preset-address-book-name"] = json!("team");
     body["porta"] = json!({"ver": "0.1.0", "proto": 1});
@@ -688,7 +700,7 @@ async fn sysinfo_stores_and_answers_exactly() {
     assert_eq!(serde_json::from_str::<Value>(get_str(d, "sysinfo")).unwrap(), body2);
 }
 
-/// §9.3：peer 表里有这个 id 时，sysinfo 必须带 uuid 且 base64 解码后与 peer.uuid 逐字节相等；
+/// §9.3：sysinfo 必须带 uuid 且 base64 解码后与 peer.uuid 逐字节相等；
 /// 不符或缺 uuid → 403 + 空 body（客户端 120 秒后重试），不写 device；相符 → SYSINFO_UPDATED。
 #[tokio::test]
 async fn sysinfo_uuid_weak_check() {
@@ -712,6 +724,48 @@ async fn sysinfo_uuid_weak_check() {
     assert_eq!(s.count("device").await, 1);
 }
 
+/// §9.3：设备上报只接受在 hbbs 注册过的设备。peer 表里没有这个 id、id 超过 253 字节、uuid 超过 128 字节，
+/// 都按不符处理：sysinfo 403 空 body、心跳 `{}`、审计 200 空 body，三者都不写库；
+/// sysinfo 原文超过 64 KB 也回 403 空 body。
+#[tokio::test]
+async fn device_reports_only_from_registered_devices() {
+    let s = Server::start().await;
+    // 后两台在 peer 表里、uuid 也相符，只是长度超限。
+    let long_id = "9".repeat(254);
+    let long_id_uuid = registered(&s, &long_id).await;
+    let long_raw = vec![7u8; 99]; // base64 后 132 字节
+    s.insert_peer("600000003", &long_raw).await;
+    let cases = [
+        ("600000009".to_owned(), b64(&random_uuid_bytes())),
+        (long_id.clone(), long_id_uuid),
+        ("600000003".to_owned(), b64(&long_raw)),
+    ];
+    for (id, uuid) in &cases {
+        let r = s.sysinfo(id, uuid).await;
+        assert_eq!(r.status, 403, "sysinfo {}: {:?}", id.len(), r.text());
+        assert!(r.body.is_empty(), "{:?}", r.text());
+        assert_eq!(hb_json(&s.heartbeat(id, uuid, 0).await), json!({}), "heartbeat {}", id.len());
+        assert_audit_ok(&s.post_json("/api/audit/conn", None, &conn_new(id, uuid, 1, Some(&nonce()))).await, "conn");
+        let file = json!({"id": id, "uuid": uuid, "peer_id": "1", "conn_id": 1, "type": 0, "path": "", "is_file": false, "info": "{}"});
+        assert_audit_ok(&s.post_json("/api/audit/file", None, &file).await, "file");
+        let alarm = json!({"id": id, "uuid": uuid, "typ": 0, "info": "{}", "conn_id": 1});
+        assert_audit_ok(&s.post_json("/api/audit/alarm", None, &alarm).await, "alarm");
+    }
+    for table in ["device", "audit_conn", "audit_file", "audit_alarm"] {
+        assert_eq!(s.count(table).await, 0, "{table}");
+    }
+
+    // 注册过、uuid 相符，但 sysinfo 原文超过 64 KB：403 空 body，不写 device。
+    let uuid = registered(&s, "600000004").await;
+    let mut big = sysinfo_body("600000004", &uuid);
+    big["pad"] = json!("p".repeat(64 * 1024));
+    let r = s.post_json("/api/sysinfo", None, &big).await;
+    assert_eq!(r.status, 403, "{:?}", r.text());
+    assert!(r.body.is_empty(), "{:?}", r.text());
+    assert_eq!(s.count("device").await, 0);
+    assert_eq!(s.sysinfo("600000004", &uuid).await.body, b"SYSINFO_UPDATED".to_vec());
+}
+
 // ===================== §10 心跳与策略 =====================
 
 /// §10 完整时序（笔记 01 §2.2）：
@@ -724,8 +778,8 @@ async fn sysinfo_uuid_weak_check() {
 #[tokio::test]
 async fn heartbeat_strategy_sequence() {
     let s = Server::start().await;
-    let uuid = b64(&random_uuid_bytes());
     let id = "700000001";
+    let uuid = registered(&s, id).await;
 
     let v = hb_json(&s.heartbeat(id, &uuid, 0).await);
     let rev1 = modified_at(&v);
@@ -764,7 +818,7 @@ async fn heartbeat_strategy_sequence() {
 async fn heartbeat_override_tombstone_epoch() {
     let s = Server::start().await;
     let (a, b) = ("700000011", "700000012");
-    let (ua, ub) = (b64(&random_uuid_bytes()), b64(&random_uuid_bytes()));
+    let (ua, ub) = (registered(&s, a).await, registered(&s, b).await);
     s.set_option("*", "whitelist", "1.2.3.4").await;
 
     let va = hb_json(&s.heartbeat(a, &ua, 0).await);
@@ -823,7 +877,8 @@ async fn heartbeat_override_tombstone_epoch() {
 #[tokio::test]
 async fn heartbeat_rev_matches_formula() {
     let s = Server::start().await;
-    let (id, uuid) = ("700000021", b64(&random_uuid_bytes()));
+    let id = "700000021";
+    let uuid = registered(&s, id).await;
     let v = hb_json(&s.heartbeat(id, &uuid, 0).await);
     assert_eq!(modified_at(&v), expected_rev(&opts(&[("relay-server", "")]), 0, 0));
 
@@ -844,7 +899,8 @@ async fn heartbeat_rev_matches_formula() {
 #[tokio::test]
 async fn heartbeat_updates_device_and_client_ip() {
     let s = Server::start().await;
-    let (id, uuid) = ("700000031", b64(&random_uuid_bytes()));
+    let id = "700000031";
+    let uuid = registered(&s, id).await;
     let body = json!({"id": id, "uuid": uuid, "ver": 1004030, "conns": [1234, 1235], "modified_at": 0}).to_string();
     async fn last_ip(s: &Server) -> Vec<serde_json::Map<String, Value>> {
         let rows = s.rows("select last_ip, ver, last_seen_at from device where id = '700000031'").await;
@@ -885,8 +941,8 @@ async fn heartbeat_updates_device_and_client_ip() {
     }
 }
 
-/// §9.3：peer 表里有这个 id 时心跳必须带相符的 uuid；不符或缺 uuid → 回 `{}`（不下发策略、不要 sysinfo），不建设备行；
-/// 相符 → 正常下发。peer 表里没有这个 id → 照常接受。
+/// §9.3：心跳必须带相符的 uuid；不符或缺 uuid → 回 `{}`（不下发策略、不要 sysinfo），不建设备行；
+/// 相符 → 正常下发。peer 表里没有这个 id → 同样回 `{}`、不建设备行。
 #[tokio::test]
 async fn heartbeat_uuid_weak_check() {
     let s = Server::start().await;
@@ -906,9 +962,10 @@ async fn heartbeat_uuid_weak_check() {
     config_options(&v);
     assert!(s.device_user("700000041").await.is_some());
 
-    // peer 表里没有：照常。
+    // peer 表里没有：按不符处理。
     let v = hb_json(&s.heartbeat("700000042", &b64(b"anything"), 0).await);
-    modified_at(&v);
+    assert_eq!(v, json!({}), "unregistered id must answer {{}}");
+    assert_eq!(s.device_user("700000042").await, None, "unregistered id must not create the device");
 }
 
 // ===================== §9.3 审计 =====================
@@ -944,7 +1001,8 @@ async fn audit_rows(s: &Server, dev: &str) -> Vec<serde_json::Map<String, Value>
 #[tokio::test]
 async fn audit_conn_lifecycle() {
     let s = Server::start().await;
-    let (dev, uuid) = ("800000001", b64(&random_uuid_bytes()));
+    let dev = "800000001";
+    let uuid = registered(&s, dev).await;
     let big: u64 = 12345678901234567890;
 
     let r = s.post_json("/api/audit/conn", None, &conn_new(dev, &uuid, 1234, Some(&nonce()))).await;
@@ -990,7 +1048,8 @@ async fn audit_conn_lifecycle() {
 #[tokio::test]
 async fn audit_conn_matching_edge_cases() {
     let s = Server::start().await;
-    let (dev, uuid) = ("800000002", b64(&random_uuid_bytes()));
+    let dev = "800000002";
+    let uuid = registered(&s, dev).await;
     for _ in 0..2 {
         assert_audit_ok(&s.post_json("/api/audit/conn", None, &conn_new(dev, &uuid, 1500, Some(&nonce()))).await, "new");
     }
@@ -1059,7 +1118,8 @@ async fn audit_conn_note() {
 #[tokio::test]
 async fn audit_nonce_dedup_and_optional() {
     let s = Server::start().await;
-    let (dev, uuid) = ("800000004", b64(&random_uuid_bytes()));
+    let dev = "800000004";
+    let uuid = registered(&s, dev).await;
     let n = nonce();
 
     for _ in 0..3 {
@@ -1117,7 +1177,8 @@ async fn audit_nonce_dedup_and_optional() {
 #[tokio::test]
 async fn audit_write_failure_does_not_burn_nonce() {
     let s = Server::start().await;
-    let (dev, uuid) = ("800000005", b64(&random_uuid_bytes()));
+    let dev = "800000005";
+    let uuid = registered(&s, dev).await;
     let n = nonce();
     let body = conn_new(dev, &uuid, 1300, Some(&n));
     s.exec("alter table audit_conn rename to audit_conn_hidden").await;
@@ -1138,7 +1199,8 @@ async fn audit_write_failure_does_not_burn_nonce() {
 #[tokio::test]
 async fn audit_file_and_alarm_rows() {
     let s = Server::start().await;
-    let (dev, uuid) = ("800000006", b64(&random_uuid_bytes()));
+    let dev = "800000006";
+    let uuid = registered(&s, dev).await;
     let info = "{\"ip\":\"203.0.113.5\",\"name\":\"Bob\",\"num\":3,\"files\":[[\"a.txt\",123],[\"b\",45]]}";
     let r = s
         .post_json(
@@ -1191,8 +1253,8 @@ async fn audit_file_and_alarm_rows() {
     assert!(get_i64(&rows[0], "created_at") > 0);
 }
 
-/// §9.3：peer 表里有这个 id 时，被控端审计必须带相符的 uuid；不符或缺 uuid（且不是备注请求）→ 200 空 body 但不入库。
-/// 相符 → 入库。conn / file / alarm 都一样。
+/// §9.3：被控端审计必须带相符的 uuid；不符或缺 uuid（且不是备注请求）→ 200 空 body 但不入库。
+/// 相符 → 入库。conn / file / alarm 都一样。peer 表里没有这个 id 的情况见 `device_reports_only_from_registered_devices`。
 #[tokio::test]
 async fn audit_uuid_weak_check() {
     let s = Server::start().await;

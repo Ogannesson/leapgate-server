@@ -1,25 +1,36 @@
 //! Device reports: sysinfo and heartbeat / strategy push (PORTA.md §9.3, §10; notes 01, 03 §4).
-//! No authentication (compatibility debt); weak `uuid` check against hbbs' `peer` table.
+//! No authentication (compatibility debt); only devices registered with hbbs, checked by `uuid`.
 
 use super::{ok_json, parse_json, text, ApiResult, ClientIp};
-use crate::state::AppState;
+use crate::{peer::MAX_PEER_ID_LEN, state::AppState};
 use axum::{body::Bytes, extract::State, http::StatusCode, response::IntoResponse};
 use serde_derive::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::collections::BTreeMap;
 
-/// Weak identity check of the unauthenticated device reports (§9.3): when hbbs' `peer` table knows
-/// `id`, `uuid` must be present and decode (standard base64) to `peer.uuid` byte for byte. Unknown
-/// ids pass.
+/// Longest `uuid` (base64 text) the device reports and the login accept. Real ones are the base64
+/// of a machine id, well under this.
+pub(crate) const MAX_UUID_LEN: usize = 128;
+/// Largest sysinfo body accepted; it is stored whole as `device.sysinfo`. A real one is a few
+/// hundred bytes; without this every registered device could keep 2 MB (the body limit) there.
+const MAX_SYSINFO_LEN: usize = 64 * 1024;
+
+/// Identity check of the unauthenticated device reports and of the login's device binding (§9.3):
+/// hbbs' `peer` table must know `id` (real clients register before they report), and `uuid` must be
+/// present and decode (standard base64) to `peer.uuid` byte for byte. An id over `MAX_PEER_ID_LEN`
+/// or a uuid over `MAX_UUID_LEN` bytes fails without a query.
 pub(crate) async fn uuid_matches(db: &SqlitePool, id: &str, uuid: Option<&str>) -> Result<bool, sqlx::Error> {
+    let Some(uuid) = uuid.filter(|u| u.len() <= MAX_UUID_LEN) else {
+        return Ok(false);
+    };
+    if id.len() > MAX_PEER_ID_LEN {
+        return Ok(false);
+    }
     let known: Option<Vec<u8>> = sqlx::query_scalar("select uuid from peer where id = ?")
         .bind(id)
         .fetch_optional(db)
         .await?;
-    Ok(match known {
-        None => true,
-        Some(known) => uuid.and_then(|u| base64::decode(u).ok()) == Some(known),
-    })
+    Ok(known.is_some_and(|known| base64::decode(uuid).is_ok_and(|u| u == known)))
 }
 
 /// sysinfo body (note 01 §5.2): every value is a string; the rest of the keys are kept in the raw text.
@@ -40,7 +51,7 @@ struct SysinfoReq {
 /// `POST /api/sysinfo`: plain text `SYSINFO_UPDATED` on success, never `ID_NOT_FOUND`.
 pub(crate) async fn sysinfo(State(state): State<AppState>, body: Bytes) -> ApiResult {
     let req: SysinfoReq = parse_json(&body)?;
-    if !uuid_matches(&state.db, &req.id, req.uuid.as_deref()).await? {
+    if body.len() > MAX_SYSINFO_LEN || !uuid_matches(&state.db, &req.id, req.uuid.as_deref()).await? {
         // The client retries after 120 s.
         return Ok(StatusCode::FORBIDDEN.into_response());
     }
@@ -136,6 +147,7 @@ pub(crate) async fn heartbeat(
 
 #[cfg(test)]
 mod tests {
+    use super::{MAX_PEER_ID_LEN, MAX_SYSINFO_LEN, MAX_UUID_LEN};
     use crate::testutil::{self, send};
     use axum::http::StatusCode;
     use hbb_common::tokio;
@@ -201,11 +213,15 @@ mod tests {
         let db = &t.state.db;
         add_peer(db, "111", UUID).await;
 
-        // Unknown to hbbs: accepted, with or without uuid.
-        let (status, ct, body) = send(&t.app, "POST", "/api/sysinfo", None, &sysinfo_body("222", None, "h2")).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(ct, "text/plain; charset=utf-8");
-        assert_eq!(&body[..], b"SYSINFO_UPDATED");
+        // Unknown to hbbs: refused like a mismatch, with or without uuid, and no device row.
+        for uuid in [None, Some(b64(UUID))] {
+            let (status, _, body) =
+                send(&t.app, "POST", "/api/sysinfo", None, &sysinfo_body("222", uuid.as_deref(), "h2")).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(body.is_empty());
+        }
+        let n: i64 = sqlx::query_scalar("select count(*) from device").fetch_one(db).await.unwrap();
+        assert_eq!(n, 0);
 
         // Known id, matching uuid: stored with the raw text and split fields.
         let raw = sysinfo_body("111", Some(&b64(UUID)), "h1");
@@ -263,26 +279,86 @@ mod tests {
             }
             assert_eq!(heartbeat(&t.app, body).await, json!({}));
         }
+        // An id hbbs does not know: `{}` too (a first heartbeat racing the registration gets served
+        // 15 s later), no device row.
+        assert_eq!(heartbeat(&t.app, json!({"id": "333", "uuid": b64(b"x"), "ver": 1004020, "modified_at": 0})).await, json!({}));
         let n: i64 = sqlx::query_scalar("select count(*) from device").fetch_one(db).await.unwrap();
         assert_eq!(n, 0);
 
-        // Matching uuid, and an id hbbs does not know: both served.
-        let r = heartbeat(&t.app, json!({"id": "111", "uuid": b64(UUID), "ver": 1005010, "modified_at": 0})).await;
+        // Matching uuid: served, the device row is created.
+        let r = heartbeat(&t.app, json!({"id": "111", "uuid": b64(UUID), "ver": 1004020, "modified_at": 0})).await;
         assert!(r["modified_at"].is_i64());
-        let r = heartbeat(&t.app, json!({"id": "333", "uuid": b64(b"x"), "ver": 1004020, "modified_at": 0})).await;
-        assert!(r["modified_at"].is_i64());
-        let row: (i64, String, String) = sqlx::query_as("select ver, last_ip, uuid from device where id = '333'")
+        let row: (i64, String, String) = sqlx::query_as("select ver, last_ip, uuid from device where id = '111'")
             .fetch_one(db)
             .await
             .unwrap();
         // `send` comes from 127.0.0.1 without proxy headers.
-        assert_eq!(row, (1004020, "127.0.0.1".into(), b64(b"x")));
+        assert_eq!(row, (1004020, "127.0.0.1".into(), b64(UUID)));
+    }
+
+    #[tokio::test]
+    async fn uuid_matches_limits() {
+        let t = testutil::app().await;
+        let db = &t.state.db;
+        let matches = |id: String, uuid: Option<String>| async move {
+            super::uuid_matches(db, &id, uuid.as_deref()).await.unwrap()
+        };
+        add_peer(db, "111", UUID).await;
+        assert!(matches("111".into(), Some(b64(UUID))).await);
+        assert!(!matches("111".into(), None).await);
+        assert!(!matches("222".into(), Some(b64(UUID))).await);
+
+        // Ids up to MAX_PEER_ID_LEN bytes are looked up; longer ones fail even when hbbs has them.
+        let (fits, long) = ("i".repeat(MAX_PEER_ID_LEN), "l".repeat(MAX_PEER_ID_LEN + 1));
+        add_peer(db, &fits, UUID).await;
+        add_peer(db, &long, UUID).await;
+        assert!(matches(fits, Some(b64(UUID))).await);
+        assert!(!matches(long, Some(b64(UUID))).await);
+
+        // 96 raw bytes are 128 base64 bytes (MAX_UUID_LEN); 99 are 132.
+        let (fits, long) = (vec![7u8; 96], vec![7u8; 99]);
+        assert_eq!((b64(&fits).len(), b64(&long).len()), (MAX_UUID_LEN, MAX_UUID_LEN + 4));
+        add_peer(db, "333", &fits).await;
+        add_peer(db, "444", &long).await;
+        assert!(matches("333".into(), Some(b64(&fits))).await);
+        assert!(!matches("444".into(), Some(b64(&long))).await);
+    }
+
+    #[tokio::test]
+    async fn sysinfo_size_limit() {
+        let t = testutil::app().await;
+        let db = &t.state.db;
+        add_peer(db, "111", UUID).await;
+        // Padded to exactly `len` bytes with an extra key, which the raw text keeps.
+        let padded = |len: usize| {
+            let mut v: Value = serde_json::from_str(&sysinfo_body("111", Some(&b64(UUID)), "h")).unwrap();
+            v["pad"] = json!("");
+            let pad = len - v.to_string().len();
+            v["pad"] = json!("p".repeat(pad));
+            let body = v.to_string();
+            assert_eq!(body.len(), len);
+            body
+        };
+        let (status, _, body) = send(&t.app, "POST", "/api/sysinfo", None, &padded(MAX_SYSINFO_LEN + 1)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.is_empty());
+        let n: i64 = sqlx::query_scalar("select count(*) from device").fetch_one(db).await.unwrap();
+        assert_eq!(n, 0);
+        let raw = padded(MAX_SYSINFO_LEN);
+        let (status, _, body) = send(&t.app, "POST", "/api/sysinfo", None, &raw).await;
+        assert_eq!((status, &body[..]), (StatusCode::OK, &b"SYSINFO_UPDATED"[..]));
+        let stored: String = sqlx::query_scalar("select sysinfo from device where id = '111'")
+            .fetch_one(db)
+            .await
+            .unwrap();
+        assert_eq!(stored, raw);
     }
 
     #[tokio::test]
     async fn heartbeat_strategy_push() {
         let t = testutil::app().await;
         let db = &t.state.db;
+        add_peer(db, "dev1", UUID).await;
         let hb = |modified_at: i64| json!({"id": "dev1", "uuid": b64(UUID), "ver": 1005010, "modified_at": modified_at, "conns": [1001]});
 
         // First contact: the global relay-server tombstone, `modified_at` as a JSON number, and sysinfo asked for.

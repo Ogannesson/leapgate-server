@@ -329,6 +329,8 @@ pub(crate) async fn login(State(state): State<AppState>, body: Bytes) -> ApiResu
         return Err(ApiError::new(StatusCode::UNAUTHORIZED, "Wrong credentials"));
     }
 
+    // Only a device registered with hbbs, with a matching uuid, is bound: someone else's device is
+    // not taken over, and made-up ids add no device rows (§11).
     if !req.id.is_empty() && uuid_matches(&state.db, &req.id, Some(&req.uuid)).await? {
         sqlx::query(
             "insert into device(id, uuid, user_id, first_seen_at, last_seen_at) values(?, ?, ?, ?, ?)
@@ -458,7 +460,13 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(row, (uid, "123456789".to_owned(), "dXVpZA==".to_owned()));
-        // Not in hbbs' peer table: the device is bound.
+        // Not in hbbs' peer table: no device row is made, nothing is bound.
+        let n: i64 = sqlx::query_scalar("select count(*) from device").fetch_one(db).await.unwrap();
+        assert_eq!(n, 0);
+        // Registered with a matching uuid: the device row is made and bound.
+        t.state.pm.db.insert_peer("123456789", b"uuid", b"pk", "{}").await.unwrap();
+        let (status, _) = login_as(&t.app, "10086", "pw", "123456789", "dXVpZA==").await;
+        assert_eq!(status, StatusCode::OK);
         assert_eq!(device_owner(db, "123456789").await, Some(uid));
 
         let (status, _, body) = send(&t.app, "POST", "/api/currentUser", Some(&token), "").await;
@@ -837,7 +845,10 @@ mod tests {
         let t = testutil::app().await;
         let db = &t.state.db;
         let (uid, other_token) = testutil::create_user(db, "lo-judy", "pw", false).await;
-        let (_, v) = login_as(&t.app, "lo-judy", "pw", "222", "").await;
+        for id in ["222", "333"] {
+            t.state.pm.db.insert_peer(id, b"uuid", b"pk", "{}").await.unwrap();
+        }
+        let (_, v) = login_as(&t.app, "lo-judy", "pw", "222", "dXVpZA==").await;
         let token = v["access_token"].as_str().unwrap().to_owned();
         assert_eq!(device_owner(db, "222").await, Some(uid));
 
@@ -854,10 +865,10 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
 
         // Logging out does not clear a device that now belongs to someone else.
-        let (_, v) = login_as(&t.app, "lo-judy", "pw", "333", "").await;
+        let (_, v) = login_as(&t.app, "lo-judy", "pw", "333", "dXVpZA==").await;
         let token = v["access_token"].as_str().unwrap().to_owned();
         let (kid, _) = testutil::create_user(db, "lo-ken", "pw", false).await;
-        login_as(&t.app, "lo-ken", "pw", "333", "").await;
+        login_as(&t.app, "lo-ken", "pw", "333", "dXVpZA==").await;
         send(&t.app, "POST", "/api/logout", Some(&token), "").await;
         assert_eq!(device_owner(db, "333").await, Some(kid));
     }

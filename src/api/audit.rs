@@ -80,8 +80,8 @@ fn parse<T: DeserializeOwned>(body: &[u8]) -> Result<T, Response> {
     parse_json(body).map_err(|e| e.0)
 }
 
-/// Shared by the device-side audits: a repeated nonce is a success without writing; a failed weak
-/// check answers success without writing; the nonce is registered only after `write` succeeded, so
+/// Shared by the device-side audits: a repeated nonce is a success without writing; a failed
+/// `uuid_matches` (unregistered id or wrong uuid) answers success without writing; the nonce is registered only after `write` succeeded, so
 /// the client's retry of a failed write gets stored. No nonce (1.4.x), `""` or one longer than
 /// `MAX_NONCE_LEN`: no dedupe.
 async fn report(
@@ -144,7 +144,8 @@ pub(crate) async fn conn(State(state): State<AppState>, body: Bytes) -> Response
     let db = &state.db;
     if let (Some(note), None) = (&req.note, &req.uuid) {
         // Session note: no identity to check; updates every record of the session (remote desktop
-        // and file transfer share one session id), none matching is ignored.
+        // and file transfer share one session id), none matching is ignored. Never inserts, so it
+        // cannot add rows.
         return match sqlx::query("update audit_conn set note = ? where device_id = ? and session_id = ?")
             .bind(note)
             .bind(&req.id)
@@ -371,9 +372,17 @@ mod tests {
         assert_eq!(count(db, "audit_alarm").await, 0);
         assert_eq!(count(db, "audit_conn").await, 0);
 
-        // Matching uuid, and an id hbbs does not know: stored.
-        ok(&t.app, "/api/audit/file", file_body("111", Some(UUID), Some(&nonce()))).await;
+        // An id hbbs does not know, with or without uuid: success shape, nothing stored.
         ok(&t.app, "/api/audit/file", file_body("222", None, Some(&nonce()))).await;
+        ok(&t.app, "/api/audit/file", file_body("222", Some(UUID), Some(&nonce()))).await;
+        ok(&t.app, "/api/audit/alarm", json!({"id": "222", "uuid": base64::encode(UUID), "typ": 0, "info": "{}"})).await;
+        ok(&t.app, "/api/audit/conn", json!({"id": "222", "uuid": base64::encode(UUID), "action": "new", "conn_id": 1})).await;
+        assert_eq!(count(db, "audit_file").await, 0);
+        assert_eq!(count(db, "audit_alarm").await, 0);
+        assert_eq!(count(db, "audit_conn").await, 0);
+
+        // Matching uuid: stored.
+        ok(&t.app, "/api/audit/file", file_body("111", Some(UUID), Some(&nonce()))).await;
         let row: (String, i64, String, i64, String, bool, String) = sqlx::query_as(
             "select device_id, conn_id, peer_id, type, path, is_file, info from audit_file order by id limit 1",
         )
@@ -383,7 +392,7 @@ mod tests {
         assert_eq!(row.0, "111");
         assert_eq!((row.1, row.2.as_str(), row.3, row.4.as_str(), row.5), (1234, "999", 1, "C:\\x", false));
         assert!(row.6.starts_with("{\"ip\""));
-        assert_eq!(count(db, "audit_file").await, 2);
+        assert_eq!(count(db, "audit_file").await, 1);
 
         // Alarm with an unknown typ and without conn_id.
         ok(&t.app, "/api/audit/alarm", json!({"id": "111", "uuid": base64::encode(UUID), "typ": 42, "info": "{\"ip\":\"x\"}"})).await;
@@ -403,29 +412,30 @@ mod tests {
     async fn nonce_dedupe() {
         let t = testutil::app().await;
         let db = &t.state.db;
+        add_peer(db, "1").await;
 
         // Same nonce twice: stored once, both answered with an empty body.
         let n = nonce();
-        ok(&t.app, "/api/audit/file", file_body("1", None, Some(&n))).await;
-        ok(&t.app, "/api/audit/file", file_body("1", None, Some(&n))).await;
+        ok(&t.app, "/api/audit/file", file_body("1", Some(UUID), Some(&n))).await;
+        ok(&t.app, "/api/audit/file", file_body("1", Some(UUID), Some(&n))).await;
         assert_eq!(count(db, "audit_file").await, 1);
 
         // No nonce (1.4.x) or an empty one: never deduplicated.
-        ok(&t.app, "/api/audit/file", file_body("1", None, None)).await;
-        ok(&t.app, "/api/audit/file", file_body("1", None, None)).await;
-        ok(&t.app, "/api/audit/file", file_body("1", None, Some(""))).await;
-        ok(&t.app, "/api/audit/file", file_body("1", None, Some(""))).await;
+        ok(&t.app, "/api/audit/file", file_body("1", Some(UUID), None)).await;
+        ok(&t.app, "/api/audit/file", file_body("1", Some(UUID), None)).await;
+        ok(&t.app, "/api/audit/file", file_body("1", Some(UUID), Some(""))).await;
+        ok(&t.app, "/api/audit/file", file_body("1", Some(UUID), Some(""))).await;
         assert_eq!(count(db, "audit_file").await, 5);
 
         // A failed write answers 200 + {"error"} and does not register the nonce, so the retry is stored.
         sqlx::query("alter table audit_file rename to audit_file_away").execute(db).await.unwrap();
         let n = nonce();
-        let (status, ct, body) = send(&t.app, "POST", "/api/audit/file", None, &file_body("1", None, Some(&n)).to_string()).await;
+        let (status, ct, body) = send(&t.app, "POST", "/api/audit/file", None, &file_body("1", Some(UUID), Some(&n)).to_string()).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(ct, "application/json; charset=utf-8");
         assert_eq!(&body[..], br#"{"error":"Server error"}"#);
         sqlx::query("alter table audit_file_away rename to audit_file").execute(db).await.unwrap();
-        ok(&t.app, "/api/audit/file", file_body("1", None, Some(&n))).await;
+        ok(&t.app, "/api/audit/file", file_body("1", Some(UUID), Some(&n))).await;
         assert_eq!(count(db, "audit_file").await, 6);
     }
 
@@ -433,11 +443,12 @@ mod tests {
     async fn long_nonce_is_no_nonce() {
         let t = testutil::app().await;
         let db = &t.state.db;
+        add_peer(db, "1").await;
         // 64 bytes still deduplicates; 65 is treated as absent: stored every time, never registered.
         let (fits, long) = ("n".repeat(MAX_NONCE_LEN), "l".repeat(MAX_NONCE_LEN + 1));
         for _ in 0..2 {
-            ok(&t.app, "/api/audit/file", file_body("1", None, Some(&fits))).await;
-            ok(&t.app, "/api/audit/file", file_body("1", None, Some(&long))).await;
+            ok(&t.app, "/api/audit/file", file_body("1", Some(UUID), Some(&fits))).await;
+            ok(&t.app, "/api/audit/file", file_body("1", Some(UUID), Some(&long))).await;
         }
         assert_eq!(count(db, "audit_file").await, 3);
         assert!(!nonce_seen(&long));
