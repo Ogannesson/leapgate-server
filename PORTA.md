@@ -300,6 +300,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 - `outcome` 取值全集：`rejected`、`no_reply`、`relay`、`relay_or_v6`、`relay_failed`、`relay_unmatched`、`direct_lan`、`direct_tcp`、`direct_tcp_or_v6`。
 - 窗口（命名常量，标注"待实测"）：直连判定窗口 `W = max(45 秒, 6 × (reply_at − started_at) + 20 秒)`（A 的直连超时 = 打洞耗时 × 6，没有封顶；客户端的打洞耗时还包含连 hbbs 和 KeyExchange 的时间，hbbs 看不到，20 秒余量约能覆盖 3 秒，实测时要专门覆盖慢建连）；H5 匹配时要求 `RequestRelay` 落在 `reply_at + W` 以内；一条记录最多合并 3 次 `RequestRelay`（客户端最多回落 3 次），而且只在它第一次 `relay_req_at` 之后 60 秒内合并，超出的另起一条 `relay_only`；匹配到 `RequestRelay` 的记录，等最后一次 `relay_req_at` + 20 秒后才定稿，那时有 `relay_resp_at` 记 `relay`，没有记 `relay_failed`。
 - H5 没匹配到打洞记录：写一行 `signal='relay_only'`：`started_at`、`relay_req_at` 取收到的时刻；`a_ip`/`a_port` 取 A:p3；`via` 照实；`b_id = rf.id`；`conn_type`、`a_nat_type`、`a_force_relay`、`a_has_v6`、`server_forced_relay` 填 0；`a_user` 照常反查。有 `relay_resp_at` 记 `relay_unmatched`，没有记 `relay_failed`。
+- 防滥用（这些请求都不认证；常量写死，不做配置）：许可证不符（`LICENSE_MISMATCH`）的请求不记录，所以不会出现 `signal='fail_license'`；`b_id` 和中继地址截到 253 字节，版本号、令牌、uuid 截到 64 字节；同一来源 IP 每分钟最多新建 60 条记录，超出的丢弃并计数；写库队列最多 1 万条，满了丢弃并计数，两种丢弃每分钟最多打一条 warn 日志；队列里的定稿记录成批（每批最多 1000 条）在一个事务里写入；每天删除 `started_at` 早于 90 天的行。
 - 统计查询（给命令行）：按时间范围算中继回落率 = count(outcome IN (`relay`,`relay_or_v6`)) / count(outcome IN (`relay`,`relay_or_v6`,`direct_lan`,`direct_tcp`,`direct_tcp_or_v6`))；`rejected`、`no_reply`、`relay_failed`、`relay_unmatched` 不进分子分母，只在分项计数里列出。另列 `relay_offered` 非空、`b_relay` 非空且两者不相等的次数（被控端本地写死了中继）。
 
 ## 9. HTTP API 通则
