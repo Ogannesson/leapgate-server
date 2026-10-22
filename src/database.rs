@@ -38,11 +38,16 @@ pub(crate) async fn open(url: &str, create: bool) -> ResultType<SqlitePool> {
         .unwrap_or(8);
     log::debug!("MAX_DATABASE_CONNECTIONS={}", n);
     let opt = SqliteConnectOptions::from_str(url)?;
-    if !create && !opt.get_filename().exists() {
-        bail!(
-            "{} not found: run this from the server's working directory, or set DB_URL",
-            db_file(url)?.display()
-        );
+    if !create {
+        // Only NotFound means missing: a file we may not access (permissions) is reported as such.
+        match opt.get_filename().try_exists() {
+            Ok(true) => {}
+            Ok(false) => bail!(
+                "{} not found: run this from the server's working directory, or set DB_URL",
+                db_file(url)?.display()
+            ),
+            Err(e) => bail!("cannot access {}: {e}", db_file(url)?.display()),
+        }
     }
     let opt = opt
         .create_if_missing(create)
@@ -210,5 +215,28 @@ mod tests {
         assert_eq!(super::db_file("./x.sqlite3").unwrap(), cwd.join("x.sqlite3"));
         assert_eq!(super::db_file("sqlite://x.sqlite3").unwrap(), cwd.join("x.sqlite3"));
         assert_eq!(super::db_file(url).unwrap(), path);
+    }
+
+    // Review R2-7: a database in a directory we may not enter is not "not found"; the real error shows.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inaccessible_database_is_not_reported_missing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("locked");
+        std::fs::create_dir(&sub).unwrap();
+        let path = sub.join("db.sqlite3");
+        let url = path.to_str().unwrap();
+        drop(super::open(url, true).await.unwrap());
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let res = std::fs::metadata(&path);
+        let err = super::open(url, false).await.map(drop);
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if res.is_ok() {
+            return; // running as root: permissions do not apply
+        }
+        let err = err.unwrap_err().to_string();
+        assert!(err.starts_with(&format!("cannot access {}: ", path.display())), "{err}");
+        assert!(err.contains("ermission denied") && !err.contains("not found"), "{err}");
     }
 }
