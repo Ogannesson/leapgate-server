@@ -340,7 +340,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 - id 超过 253 字节（`MAX_PEER_ID_LEN`）或 uuid 超过 128 字节的请求直接按不符处理，不查库。
 - sysinfo 原文（请求体）超过 8 KB 时同样回 403 空 body（真实 sysinfo 只有几百字节；原文整段存进 `device.sysinfo`）。从中拆出来另存的 `hostname`、`username`、`os`、`version` 各截到 253 字节。
 - `device` 表最多 1 万行（最坏一行约 10.5 KB，合计约 0.1 GB）：每小时的清理（§8 的定时器）发现超出时，按 `last_seen_at` 从老到新删掉超出的行数，只删没有主人（`user_id IS NULL`）、`device_policy` 里没有这个 id、`strategy_option` 里也没有 `scope` = 这个 id 的行；不符合条件的行即使超出上限也保留。这两张表和 `device` 之间没有外键，删设备行不会连带删掉策略。被删的设备再上报时，心跳重新建行，并因为 `sysinfo = ''` 重新索取 sysinfo（§10）。
-- 审计字段限长：超长的值按 UTF-8 字符边界截断后入库，照样回 200 空 body（不回 400）。`audit_conn` 的 `ip` ≤ 64 字节、`peer_id` ≤ 253、`peer_name` ≤ 256、`note` ≤ 4 KB（不认证的备注请求也一样）、`auth` 序列化后 ≤ 4 KB（超出时只留已知字段 `primary_auth`、`two_factor`、`conn_audit_ref`，还超就截断文本）；`audit_file` 的 `peer_id` ≤ 253、`path`、`info` 各 ≤ 4 KB；`audit_alarm` 的 `info` ≤ 4 KB。`device_id` 就是校验过的 id（≤ 253）。
+- 审计字段限长：超长的值按 UTF-8 字符边界截断后入库，照样回 200 空 body（不回 400）。`audit_conn` 的 `ip` ≤ 64 字节、`peer_id` ≤ 253、`peer_name` ≤ 256、`note` ≤ 4 KB（不认证的备注请求也一样）、`auth` 只存已知字段 `primary_auth`、`two_factor`（整数）和 `conn_audit_ref`（字符串），序列化后 ≤ 4 KB（超出就截断文本）；请求体里的其他键不展开、不保存（审查 C-9：用通配 map 收"其余字段"时，2 MB 的数字数组在任何身份校验之前就展开成约 80 MB），`peer` 只取前两个元素；`audit_file` 的 `peer_id` ≤ 253、`path`、`info` 各 ≤ 4 KB；`audit_alarm` 的 `info` ≤ 4 KB。`device_id` 就是校验过的 id（≤ 253）。
 - 审计表行数上限：三张表各最多 2 万行，每次插入前删掉 id 比最新一行小 2 万 - 1 及以上的行（主键上的范围删除）。不放进每小时的清理：审计上报不限速，一小时内能写进的行数没有上界。实测最坏一行（文本列都到上限，SQLite 4 KB 页，含索引）：`audit_conn` 约 9.5 KB、`audit_file` 约 8.8 KB、`audit_alarm` 约 4.6 KB，2 万 ×（9.5 + 8.8 + 4.6）KB ≈ 0.46 GB。另外每小时删掉 `created_at` 早于 180 天的行。
 
 唯一免校验的是控制端会话结束写备注那条 `/api/audit/conn`：判别条件是"有 `note` 键且没有 `uuid` 键"（不能用"没有 nonce"判别，1.4.x 的审计都不带 nonce）。它只更新已有记录、从不插入新行，所以不会增加行数。

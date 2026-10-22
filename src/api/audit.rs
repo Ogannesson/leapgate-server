@@ -6,12 +6,12 @@ use super::{device::uuid_matches, ok_empty, ok_internal, parse_json};
 use crate::{conn_tracker::clip, peer::MAX_PEER_ID_LEN, state::AppState};
 use axum::{body::Bytes, extract::State, response::Response};
 use once_cell::sync::Lazy;
-use serde::de::DeserializeOwned;
-use serde_derive::Deserialize;
-use serde_json::{Map, Value};
+use serde::de::{DeserializeOwned, Deserializer, IgnoredAny, SeqAccess, Visitor};
+use serde_derive::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::{
     collections::HashSet,
+    fmt,
     future::Future,
     sync::Mutex,
     time::{Duration, Instant},
@@ -35,9 +35,6 @@ const MAX_PEER_NAME_LEN: usize = 256;
 /// characters, at most 1 KB), `audit_file.path` and `.info` (the top 10 files with their sizes),
 /// `audit_alarm.info`.
 const MAX_TEXT_LEN: usize = 4096;
-/// The `rest` keys of an authed report that known clients send (note 03 §5.2): what `auth` keeps when
-/// the whole of `rest` is over `MAX_TEXT_LEN`.
-const AUTH_KEYS: [&str; 3] = ["primary_auth", "two_factor", "conn_audit_ref"];
 
 /// The audit tables, each kept to `MAX_ROWS` rows (`make_room`) and `RETENTION_SECS` (`purge`).
 pub(crate) const TABLES: [&str; 3] = ["audit_conn", "audit_file", "audit_alarm"];
@@ -130,20 +127,57 @@ pub(crate) async fn purge(db: &SqlitePool, table: &str, now: i64) -> Result<u64,
     Ok(res.rows_affected())
 }
 
-/// `audit_conn.auth`: the rest of an authed report as JSON; over `MAX_TEXT_LEN`, only `AUTH_KEYS`
-/// are kept, and if that is still too long the text is clipped.
-fn auth_json(rest: &Map<String, Value>) -> String {
-    let mut auth = serde_json::to_string(rest).unwrap_or_default();
-    if auth.len() > MAX_TEXT_LEN {
-        let known: Map<String, Value> = rest
-            .iter()
-            .filter(|(k, _)| AUTH_KEYS.contains(&k.as_str()))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        auth = serde_json::to_string(&known).unwrap_or_default();
-        clip(&mut auth, MAX_TEXT_LEN);
-    }
+/// `audit_conn.auth`: the authed report's own keys (`Auth`) as JSON, the text clipped to `MAX_TEXT_LEN`.
+fn auth_json(req: &ConnReq) -> String {
+    let auth = Auth {
+        conn_audit_ref: req.conn_audit_ref.as_deref(),
+        primary_auth: req.primary_auth,
+        two_factor: req.two_factor,
+    };
+    let mut auth = serde_json::to_string(&auth).unwrap_or_default();
+    clip(&mut auth, MAX_TEXT_LEN);
     auth
+}
+
+/// What `audit_conn.auth` keeps: the keys known clients send with the authed report (note 03 §5.2),
+/// absent ones omitted. Declared in key order, as the map it replaces serialized them.
+#[derive(Serialize)]
+struct Auth<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conn_audit_ref: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    primary_auth: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    two_factor: Option<i64>,
+}
+
+/// The first two strings of a JSON array; later elements are skipped without being built. A
+/// `Vec<String>` would turn a 2 MB array of `""` into ~700,000 strings (~17 MB).
+#[derive(Default)]
+struct FirstTwo(Vec<String>);
+
+impl<'de> serde::Deserialize<'de> for FirstTwo {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        struct FirstTwoVisitor;
+        impl<'de> Visitor<'de> for FirstTwoVisitor {
+            type Value = FirstTwo;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("an array of strings")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<FirstTwo, A::Error> {
+                let mut kept = Vec::with_capacity(2);
+                while kept.len() < 2 {
+                    match seq.next_element::<String>()? {
+                        Some(s) => kept.push(s),
+                        None => return Ok(FirstTwo(kept)),
+                    }
+                }
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(FirstTwo(kept))
+            }
+        }
+        de.deserialize_seq(FirstTwoVisitor)
+    }
 }
 
 /// Shared by the device-side audits: a repeated nonce is a success without writing; a failed
@@ -176,7 +210,9 @@ async fn report(
 }
 
 /// `/api/audit/conn` body (note 03 §5.2): new / authed (no `action`) / close from the controlled
-/// side, or the controller's session note (`note` and no `uuid`).
+/// side, or the controller's session note (`note` and no `uuid`). Only the fields below are built;
+/// serde skips any other key without keeping it (review C-9: a flattened catch-all map turned a
+/// 2 MB body into ~80 MB of `Value`s, before any identity check).
 #[derive(Deserialize)]
 struct ConnReq {
     id: String,
@@ -193,12 +229,13 @@ struct ConnReq {
     ip: String,
     /// `[controller id, controller name]`.
     #[serde(default)]
-    peer: Vec<String>,
+    peer: FirstTwo,
     #[serde(rename = "type")]
     conn_type: Option<i64>,
-    /// The rest (`primary_auth`, `two_factor`, `conn_audit_ref`, …), kept as `audit_conn.auth`.
-    #[serde(flatten)]
-    rest: Map<String, Value>,
+    // The authed report's keys kept as `audit_conn.auth` (`Auth`).
+    conn_audit_ref: Option<String>,
+    primary_auth: Option<i64>,
+    two_factor: Option<i64>,
 }
 
 /// `POST /api/audit/conn`: new / authed / close, and the controller's session note (no uuid, no nonce).
@@ -211,7 +248,7 @@ pub(crate) async fn conn(State(state): State<AppState>, body: Bytes) -> Response
         clip(note, MAX_TEXT_LEN);
     }
     clip(&mut req.ip, MAX_IP_LEN);
-    for (field, max) in req.peer.iter_mut().zip([MAX_PEER_ID_LEN, MAX_PEER_NAME_LEN]) {
+    for (field, max) in req.peer.0.iter_mut().zip([MAX_PEER_ID_LEN, MAX_PEER_NAME_LEN]) {
         clip(field, max);
     }
     let db = &state.db;
@@ -258,10 +295,10 @@ async fn write_conn(db: &SqlitePool, req: &ConnReq) -> Result<(), sqlx::Error> {
                 .await?;
         }
         None => {
-            let peer_id = req.peer.first().map(String::as_str).unwrap_or_default();
-            let peer_name = req.peer.get(1).map(String::as_str).unwrap_or_default();
+            let peer_id = req.peer.0.first().map(String::as_str).unwrap_or_default();
+            let peer_name = req.peer.0.get(1).map(String::as_str).unwrap_or_default();
             let session_id = req.session_id.to_string();
-            let auth = auth_json(&req.rest);
+            let auth = auth_json(req);
             let updated = sqlx::query(&format!(
                 "update audit_conn set peer_id = ?, peer_name = ?, conn_type = ?, session_id = ?, auth = ?,
                    authed_at = ?
@@ -395,7 +432,7 @@ mod tests {
     use crate::testutil::{self, send};
     use axum::http::StatusCode;
     use hbb_common::tokio;
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     const UUID: &[u8] = b"8f2c1d4e-1111-2222-3333-444455556666";
 
@@ -587,15 +624,15 @@ mod tests {
         assert_eq!(row.0, "é".repeat(MAX_IP_LEN / 2));
         assert_eq!(row.1, "é".repeat(MAX_PEER_ID_LEN / 2));
         assert_eq!(row.2, "x".repeat(MAX_PEER_NAME_LEN));
-        // `rest` over the limit: the unknown key is dropped, the known ones are kept.
+        // Only the known keys are kept; the unknown one is never stored.
         assert_eq!(serde_json::from_str::<Value>(&row.3).unwrap(), json!({"primary_auth": 2, "two_factor": 1}));
         assert_eq!(row.4, "é".repeat(MAX_TEXT_LEN / 2));
 
-        // A known key alone over the limit: clipped text. Under the limit: everything is kept.
+        // A known key over the limit: clipped text. Exactly at the limit: kept whole.
         let huge = json!({"id": "111", "uuid": uuid, "conn_id": 2, "session_id": 8, "conn_audit_ref": long(MAX_TEXT_LEN), "x": 1});
         ok(&t.app, "/api/audit/conn", huge).await;
-        // `{"x":"…"}`: exactly MAX_TEXT_LEN bytes.
-        let fits = json!({"id": "111", "uuid": uuid, "conn_id": 3, "session_id": 9, "x": "y".repeat(MAX_TEXT_LEN - 8)});
+        // `{"conn_audit_ref":"…"}`: exactly MAX_TEXT_LEN bytes.
+        let fits = json!({"id": "111", "uuid": uuid, "conn_id": 3, "session_id": 9, "conn_audit_ref": "y".repeat(MAX_TEXT_LEN - 21)});
         ok(&t.app, "/api/audit/conn", fits).await;
         let auths: Vec<String> = sqlx::query_scalar("select auth from audit_conn where conn_id in (2, 3) order by conn_id")
             .fetch_all(db)
@@ -604,7 +641,8 @@ mod tests {
         assert_eq!(auths[0].len(), MAX_TEXT_LEN);
         assert!(auths[0].starts_with(r#"{"conn_audit_ref":"xxx"#));
         assert_eq!(auths[1].len(), MAX_TEXT_LEN);
-        assert_eq!(serde_json::from_str::<Value>(&auths[1]).unwrap()["x"].as_str().unwrap().len(), MAX_TEXT_LEN - 8);
+        let fits: Value = serde_json::from_str(&auths[1]).unwrap();
+        assert_eq!(fits["conn_audit_ref"].as_str().unwrap().len(), MAX_TEXT_LEN - 21);
 
         let file = json!({"id": "111", "uuid": uuid, "conn_id": 1, "peer_id": long(MAX_PEER_ID_LEN), "type": 0,
                           "path": wide(MAX_TEXT_LEN), "is_file": true, "info": long(MAX_TEXT_LEN)});
@@ -615,6 +653,28 @@ mod tests {
         ok(&t.app, "/api/audit/alarm", json!({"id": "111", "uuid": uuid, "typ": 0, "info": wide(MAX_TEXT_LEN)})).await;
         let info: String = sqlx::query_scalar("select info from audit_alarm").fetch_one(db).await.unwrap();
         assert_eq!(info, "é".repeat(MAX_TEXT_LEN / 2));
+    }
+
+    /// Review C-9: a body near the 2 MB limit, made of an unknown key's big array and a long `peer`,
+    /// parses into the known fields only: nothing holds the skipped elements (the RSS side is
+    /// `audit_conn_big_body_is_not_amplified` in tests/bb_api.rs).
+    #[test]
+    fn big_conn_body_builds_only_known_fields() {
+        let body = format!(
+            r#"{{"id":"1","junk":[{}0],"peer":["a","b"{},1,{{"x":[]}}],"primary_auth":2,"note":null}}"#,
+            "0,".repeat(400_000),
+            ",\"\"".repeat(200_000)
+        );
+        assert!(body.len() > 1_400_000 && body.len() < 2 * 1024 * 1024, "{}", body.len());
+        let req: ConnReq = serde_json::from_slice(body.as_bytes()).unwrap();
+        assert_eq!(req.peer.0, ["a", "b"]);
+        assert_eq!(req.peer.0.capacity(), 2);
+        assert_eq!(auth_json(&req), r#"{"primary_auth":2}"#);
+        // Short arrays are taken as they are.
+        for (peer, kept) in [("[]", vec![]), (r#"["a"]"#, vec!["a"])] {
+            let req: ConnReq = serde_json::from_str(&format!(r#"{{"id":"1","peer":{peer}}}"#)).unwrap();
+            assert_eq!(req.peer.0, kept);
+        }
     }
 
     /// Driven by placing rows at chosen ids: `MAX_ROWS` real inserts are not needed.

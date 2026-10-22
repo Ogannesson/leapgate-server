@@ -1459,6 +1459,41 @@ async fn audit_tables_keep_newest_rows() {
     }
 }
 
+/// §9.3、审查 C-9：`/api/audit/conn` 只解析已知字段，未知键的大数组和 `peer` 第二个以后的元素都不在内存里展开。
+/// 改之前一个约 2 MB 的数字数组请求体解析峰值约 80 MB；这里几个并发请求合计也只涨请求体本身那么多。
+/// 请求体上限以后调小时这些请求回 413，同样不会展开。
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn audit_conn_big_body_is_not_amplified() {
+    let s = Server::start().await;
+    let dev = "800000010";
+    let uuid = registered(&s, dev).await;
+    // 先发一条正常的，让服务端自己的惰性初始化算进基线。
+    assert_audit_ok(&s.post_json("/api/audit/conn", None, &conn_new(dev, &uuid, 1, None)).await, "warm-up");
+    let before = s.peak_rss_kb();
+    let zeros = format!(
+        r#"{{"id":"{dev}","uuid":"{uuid}","conn_id":2,"session_id":1,"junk":[{}0]}}"#,
+        "0,".repeat(950_000)
+    );
+    let peers = format!(
+        r#"{{"id":"{dev}","uuid":"{uuid}","conn_id":3,"session_id":1,"peer":["a","b"{}]}}"#,
+        ",\"\"".repeat(630_000)
+    );
+    assert!(zeros.len() < 2_000_000 && peers.len() < 2_000_000);
+    let (a, b, c, d) = tokio::join!(
+        s.post("/api/audit/conn", None, &zeros),
+        s.post("/api/audit/conn", None, &zeros),
+        s.post("/api/audit/conn", None, &peers),
+        s.post("/api/audit/conn", None, &peers),
+    );
+    for r in [a, b, c, d] {
+        assert!(r.status == 200 || r.status == 413, "{} {:?}", r.status, r.text());
+    }
+    let grown_mb = (s.peak_rss_kb() - before) / 1024;
+    eprintln!("peak RSS grew by {grown_mb} MB");
+    assert!(grown_mb < 40, "peak RSS grew by {grown_mb} MB for four ~1.9 MB bodies");
+}
+
 /// §9.3、§10 每小时清理（服务启动时先跑一次）：审计表删掉 180 天前的行；device 表超过 1 万行时，
 /// 按 last_seen_at 从老到新淘汰没有主人、也没有 device_policy 和设备级 strategy_option 的行，其余的不动。
 #[tokio::test]

@@ -285,6 +285,14 @@ impl Server {
         std::fs::read_to_string(self.dir.path().join("server.log")).unwrap_or_default()
     }
 
+    /// 进程的内存峰值（`/proc/<pid>/status` 的 `VmHWM`，单位 KB），只在 Linux 上有。
+    #[cfg(target_os = "linux")]
+    pub fn peak_rss_kb(&self) -> i64 {
+        let status = std::fs::read_to_string(format!("/proc/{}/status", self.child.id())).unwrap();
+        let line = status.lines().find(|l| l.starts_with("VmHWM:")).unwrap();
+        line.split_whitespace().nth(1).unwrap().parse().unwrap()
+    }
+
     pub fn path(&self, name: &str) -> PathBuf {
         self.dir.path().join(name)
     }
