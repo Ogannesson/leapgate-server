@@ -273,7 +273,18 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 5. 修掉控制台 `aur` 把中继列表清空的那一行（笔记 02 §3.4）。
 5a. 21118（WebSocket）只在 TCP 对端是回环地址时才信任 `X-Real-IP`/`X-Forwarded-For`，否则用 TCP 对端地址（原版对任何来源都信任，直连 21118 就能伪造来源 IP，影响按 IP 选中继、限流和记录；笔记 02 §5）。反向代理和 porta-server 同机部署时行为不变。
 6. 删掉 `check_software_update` 及其调用。
-7. 不改：注册规则、`UUID_MISMATCH` 逻辑、IP 限流、mask/local_ip、`test_hbbs` 自检。
+7. 注册语义不改（`UUID_MISMATCH` 逻辑、每来源每分钟 30 次和每天 300 个新 id 的限额、mask/local_ip、`test_hbbs` 自检照旧），只补边界（审查 A-1/A-5/A-10）：
+   - `RegisterPk` 进任何分支之前先校验：`pk` 必须正好 32 字节（客户端发的是 ed25519 公钥 `Config::get_key_pair().1`），`uuid` 非空且不超过 128 字节（客户端发 `get_uuid()`：机器 id，Windows/macOS 36 字节、Linux 32 字节，没有时用 32 字节公钥）；不合格的静默丢弃：不回包、不写库、不打日志。
+   - `IP_BLOCKER` 按来源计数：IPv4 按地址，IPv6 按 /64（和 §8 的 `source_key` 一致；双栈套接字上的 `::ffff:a.b.c.d` 先还原成 IPv4）。控制台 `ib <地址>` 输入任一地址都能查到它所在的来源。
+   - 全局新 id 上限：所有来源合计每分钟最多 100 个新 id（`PeerMap` 和库里都没有的 id），超出的丢弃、不回包，每分钟最多打一条 warn。已知 id 不受影响。
+   - `IP_BLOCKER`、`IP_CHANGES` 每 5 分钟清一次过期项（`io_loop` 里的定时器）：前者照控制台 `ib` 的规则（分钟窗口和天窗口都过了才删），后者删掉 360 秒前开始的记录。
+   - 日志不打 uuid/pk 原文，只打 id、来源 IP 和长度；uuid 不匹配、ip/pk 不匹配两条 warn 每分钟最多各打一条（hbb_common `throttled_log!`）。
+   - 写库仍在 `io_loop` 里做：有了上面的上限，写库次数有界。
+8. 会合端口的资源上限（审查 A-2/A-3/A-4；常量写死，不做配置）：
+   - 帧长：21116/TCP 单帧和 21118/WebSocket 单条消息、单帧最多 16 KB（最大的合法消息是带 WebRTC offer 的 `PunchHoleRequest`：新客户端不带候选，约 1 KB；老客户端带全部候选，几 KB）。21115 单帧最多 64 KB：`OnlineRequest` 客户端不分批，界面把当前标签页的全部 id 一次发出（`peers_view.dart` `_queryOnlines` → `client.rs` `query_online_states_`），10 位数字 id 每个约 12 字节，约能放 5000 个。超过帧上限的连接直接断开。
+   - `OnlineRequest.peers` 超过 8192 条（64 KB 按每个 id 至少 6 字节加 2 字节标签和长度能放下的条数）的整条丢弃，不回包。
+   - WebSocket：握手 10 秒超时；读缓冲 4 KB（tungstenite 默认每条连接预先分配 128 KB）。
+   - 并发连接：21116、21118 各最多 2048 条，21115 最多 512 条；每个端口上每个来源（IPv4 地址 / IPv6 /64）最多 32 条，回环来源只计入总数（同机反代承载所有 WSS 客户端）。超限的连接在 accept 后直接关闭，21116 上不发 KeyExchange、不做签名；每分钟最多打一条 warn。最坏情况下各端口缓冲合计约 100 MB。
 
 ## 7. 路由第一级（`src/router/`）
 

@@ -7,9 +7,16 @@ use hbb_common::{
     tokio::sync::{Mutex, RwLock},
 };
 use serde_derive::{Deserialize, Serialize};
-use std::{collections::HashMap, collections::HashSet, net::SocketAddr, sync::Arc, time::Instant};
+use std::{
+    collections::HashMap,
+    collections::HashSet,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Instant,
+};
 
-type IpBlockMap = HashMap<String, ((u32, Instant), (HashSet<String>, Instant))>;
+/// Keyed by source (`conn_tracker::source_key`: an IPv4 address or an IPv6 /64).
+pub(crate) type IpBlockMap = HashMap<IpAddr, ((u32, Instant), (HashSet<String>, Instant))>;
 type UserStatusMap = HashMap<Vec<u8>, Arc<(Option<Vec<u8>>, bool)>>;
 type IpChangesMap = HashMap<String, (Instant, HashMap<String, i32>)>;
 lazy_static::lazy_static! {
@@ -24,6 +31,27 @@ pub const IP_BLOCK_DUR: u64 = 60;
 // Same bound as the Pro server: a longer id is not a normal RustDesk id or hostname,
 // and every peer entry and punch-request record keeps its own copy.
 pub const MAX_PEER_ID_LEN: usize = 253;
+/// Longest `RegisterPk.uuid` (raw bytes) accepted (review A-1). Real clients send
+/// `hbb_common::get_uuid()`: the machine id (36 bytes on Windows/macOS, 32 on Linux) or, without
+/// one (Android/iOS), their 32-byte public key.
+pub const MAX_REG_UUID_LEN: usize = 128;
+
+/// Drops the `IP_BLOCKER` entries whose minute and day windows are both over (the console `ib` rule).
+pub(crate) fn retain_live_ip_blocks(map: &mut IpBlockMap) {
+    map.retain(|_, (a, b)| {
+        a.1.elapsed().as_secs() <= IP_BLOCK_DUR || b.1.elapsed().as_secs() <= DAY_SECONDS
+    });
+}
+
+/// Periodic cleanup of the two maps unauthenticated `RegisterPk`s add to (review A-1): the expiry
+/// rules of the console `ib`/`ic`, without `ic`'s display filter (more than one IP).
+pub(crate) async fn purge_ip_maps() {
+    retain_live_ip_blocks(&mut *IP_BLOCKER.lock().await);
+    IP_CHANGES
+        .lock()
+        .await
+        .retain(|_, v| v.0.elapsed().as_secs() < IP_CHANGE_DUR_X2);
+}
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub(crate) struct PeerInfo {
@@ -85,7 +113,14 @@ impl PeerMap {
         pk: Bytes,
         ip: String,
     ) -> register_pk_response::Result {
-        log::info!("update_pk {} {:?} {:?} {:?}", id, addr, uuid, pk);
+        // Lengths only: uuid and pk come from an unauthenticated packet (review A-5).
+        log::info!(
+            "update_pk {} {:?} uuid {} bytes, pk {} bytes",
+            id,
+            addr,
+            uuid.len(),
+            pk.len()
+        );
         let (info_str, guid) = {
             let mut w = peer.write().await;
             w.socket_addr = addr;

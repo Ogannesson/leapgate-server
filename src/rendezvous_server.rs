@@ -1,6 +1,6 @@
 use crate::common::*;
 use crate::conn_tracker::{
-    PunchRequest, RelayRequest, RelayResponseInfo, Reply, ReplyKind, Signal,
+    source_key, PunchRequest, RelayRequest, RelayResponseInfo, Reply, ReplyKind, Signal,
 };
 use crate::peer::*;
 use crate::router::RouteQuery;
@@ -26,13 +26,13 @@ use hbb_common::{
         self,
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
-        sync::{mpsc, Mutex},
+        sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore},
         time::{interval, Duration},
     },
     tokio_util::codec::Framed,
     try_into_v4,
     udp::FramedSocket,
-    AddrMangle, ResultType,
+    throttled_log, AddrMangle, ResultType,
 };
 use ipnetwork::Ipv4Network;
 use sodiumoxide::crypto::sign;
@@ -50,6 +50,120 @@ enum Data {
 }
 
 const REG_TIMEOUT: i64 = 30_000;
+
+// Limits on what unauthenticated peers can make the rendezvous ports hold (review A-1..A-5).
+// Fixed, not configurable.
+/// Largest frame on 21116/TCP and largest WebSocket message/frame on 21118. The biggest message a
+/// client sends there is `PunchHoleRequest` with a WebRTC offer: current clients trickle it without
+/// candidates (~1 KB, hbb_common `webrtc.rs` `trickle_endpoint`/`UDP_ENDPOINT_BUDGET`), older ones
+/// sent the full SDP with every candidate, a few KB in base64. Everything else is under 1 KB.
+const MAX_FRAME: usize = 16 * 1024;
+/// Largest frame on 21115, where `OnlineRequest` carries a peer list. The client does not batch it:
+/// the Flutter peer view sends every id of the open tab in one request (rustdesk
+/// `flutter/lib/common/widgets/peers_view.dart` `_queryOnlines` → `src/client.rs`
+/// `peer_online::query_online_states_`), about 12 bytes per 10-digit id, so this fits ~5,000 ids.
+const MAX_ONLINE_FRAME: usize = 64 * 1024;
+/// More ids than a `MAX_ONLINE_FRAME` frame holds when every id is at least 6 bytes (the shortest
+/// `RegisterPk` accepts, so the shortest that can be online) plus 2 bytes of tag and length. A
+/// request over it is dropped: it can only be padding (an empty id costs 2 bytes on the wire and
+/// a 24-byte `String` once parsed).
+const MAX_ONLINE_PEERS: usize = MAX_ONLINE_FRAME / 8;
+const WS_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
+/// tungstenite allocates the read buffer up front (128 KiB by default) for every connection.
+const WS_READ_BUFFER: usize = 4 * 1024;
+/// Concurrent connections on 21116 and on 21118, each; far above a personal deployment. Worst case
+/// held: ~2,048 × 16 KB on 21116, ~2,048 × (4 KB + 16 KB) on 21118.
+const MAX_CONNS: usize = 2048;
+/// Concurrent connections on 21115. One serves a single request and closes, but may hold a
+/// 64 KB frame: ~32 MB at worst.
+const MAX_ONLINE_CONNS: usize = 512;
+/// Concurrent connections per source and port; tens, so a company NAT with many machines fits.
+const MAX_CONNS_PER_SOURCE: usize = 32;
+/// New ids registered per minute from all sources together (new: neither in `PeerMap` nor in the
+/// database), a backstop for `RegisterPk`s spread over many sources; each one is a `peer` row.
+const NEW_IDS_PER_MIN: u32 = 100;
+const IP_MAPS_PURGE_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Concurrent connections on one rendezvous port (review A-4): at most `total` in all and at most
+/// `MAX_CONNS_PER_SOURCE` per source (an IPv4 address or an IPv6 /64, `source_key`). A loopback
+/// peer only counts toward the total: a reverse proxy on the same host carries every WSS client.
+#[derive(Clone)]
+struct ConnLimiter {
+    total: Arc<Semaphore>,
+    sources: SourceCounts,
+}
+
+/// Open connections per source; a source's key goes with its last connection.
+type SourceCounts = Arc<std::sync::Mutex<HashMap<IpAddr, usize>>>;
+
+/// Held for the life of one connection; gives its slots back when dropped.
+struct ConnPermit {
+    _total: OwnedSemaphorePermit,
+    source: Option<(IpAddr, SourceCounts)>,
+}
+
+impl ConnLimiter {
+    fn new(total: usize) -> Self {
+        Self {
+            total: Arc::new(Semaphore::new(total)),
+            sources: Default::default(),
+        }
+    }
+
+    fn try_acquire(&self, ip: IpAddr) -> Option<ConnPermit> {
+        let total = self.total.clone().try_acquire_owned().ok()?;
+        let ip = ip.to_canonical();
+        if ip.is_loopback() {
+            return Some(ConnPermit {
+                _total: total,
+                source: None,
+            });
+        }
+        let key = source_key(ip);
+        let mut sources = self.sources.lock().unwrap();
+        let n = sources.entry(key).or_insert(0);
+        if *n >= MAX_CONNS_PER_SOURCE {
+            return None;
+        }
+        *n += 1;
+        Some(ConnPermit {
+            _total: total,
+            source: Some((key, self.sources.clone())),
+        })
+    }
+}
+
+impl Drop for ConnPermit {
+    fn drop(&mut self) {
+        if let Some((key, sources)) = &self.source {
+            let mut sources = sources.lock().unwrap();
+            if let Some(n) = sources.get_mut(key) {
+                *n -= 1;
+                if *n == 0 {
+                    sources.remove(key);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ConnLimits {
+    tcp: ConnLimiter,
+    ws: ConnLimiter,
+    online: ConnLimiter,
+}
+
+impl Default for ConnLimits {
+    fn default() -> Self {
+        Self {
+            tcp: ConnLimiter::new(MAX_CONNS),
+            ws: ConnLimiter::new(MAX_CONNS),
+            online: ConnLimiter::new(MAX_ONLINE_CONNS),
+        }
+    }
+}
+
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 enum Sink {
@@ -106,6 +220,10 @@ pub struct RendezvousServer {
     rendezvous_servers: Arc<Vec<String>>,
     inner: Arc<Inner>,
     state: AppState,
+    conns: ConnLimits,
+    /// `(window start, new ids)`, one-minute windows (`NEW_IDS_PER_MIN`). Only the instance
+    /// running `io_loop` handles `RegisterPk`, so a plain field is enough.
+    new_ids: (Instant, u32),
 }
 
 enum LoopFailure {
@@ -174,6 +292,8 @@ impl RendezvousServer {
                 local_ip,
             }),
             state: state.clone(),
+            conns: Default::default(),
+            new_ids: (Instant::now(), 0),
         };
         log::info!("mask: {:?}", rs.inner.mask);
         log::info!("local-ip: {:?}", rs.inner.local_ip);
@@ -281,8 +401,12 @@ impl RendezvousServer {
         socket: &mut FramedSocket,
         key: &str,
     ) -> LoopFailure {
+        let mut purge_timer = interval(IP_MAPS_PURGE_INTERVAL);
         loop {
             tokio::select! {
+                _ = purge_timer.tick() => {
+                    purge_ip_maps().await;
+                }
                 Some(data) = rx.recv() => {
                     match data {
                         Data::Msg(msg, addr) => { allow_err!(socket.send(msg.as_ref(), addr).await); }
@@ -384,17 +508,39 @@ impl RendezvousServer {
                     }
                 }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
-                    if rk.uuid.is_empty() || rk.pk.is_empty() {
+                    // Before anything else (review A-1/A-5): real clients send their 32-byte
+                    // ed25519 public key (`Config::get_key_pair().1`) and `get_uuid()`. Anything
+                    // else is dropped without a reply, a write or a log line.
+                    if rk.pk.len() != sign::PUBLICKEYBYTES
+                        || rk.uuid.is_empty()
+                        || rk.uuid.len() > MAX_REG_UUID_LEN
+                    {
                         return Ok(());
                     }
                     let id = rk.id;
                     let ip = addr.ip().to_string();
                     if id.len() < 6 || id.len() > MAX_PEER_ID_LEN {
                         return send_rk_res(socket, addr, UUID_MISMATCH).await;
-                    } else if !self.check_ip_blocker(&ip, &id).await {
+                    } else if !self.check_ip_blocker(addr.ip(), &id).await {
                         return send_rk_res(socket, addr, TOO_FREQUENT).await;
                     }
-                    let peer = self.pm.get_or(&id).await;
+                    let peer = match self.pm.get(&id).await {
+                        Some(peer) => peer,
+                        None => {
+                            if !self.new_id_allowed() {
+                                throttled_log!(
+                                    Duration::from_secs(60),
+                                    warn,
+                                    "RegisterPk: over {} new ids a minute, dropped {} from {}",
+                                    NEW_IDS_PER_MIN,
+                                    id,
+                                    ip
+                                );
+                                return Ok(());
+                            }
+                            self.pm.get_or(&id).await
+                        }
+                    };
                     let (changed, ip_changed) = {
                         let peer = peer.read().await;
                         if peer.uuid.is_empty() {
@@ -402,23 +548,25 @@ impl RendezvousServer {
                         } else {
                             if peer.uuid == rk.uuid {
                                 if peer.info.ip != ip && peer.pk != rk.pk {
-                                    log::warn!(
-                                        "Peer {} ip/pk mismatch: {}/{:?} vs {}/{:?}",
+                                    throttled_log!(
+                                        Duration::from_secs(60),
+                                        warn,
+                                        "Peer {} ip/pk mismatch: {} vs {}",
                                         id,
                                         ip,
-                                        rk.pk,
-                                        peer.info.ip,
-                                        peer.pk,
+                                        peer.info.ip
                                     );
                                     drop(peer);
                                     return send_rk_res(socket, addr, UUID_MISMATCH).await;
                                 }
                             } else {
-                                log::warn!(
-                                    "Peer {} uuid mismatch: {:?} vs {:?}",
+                                throttled_log!(
+                                    Duration::from_secs(60),
+                                    warn,
+                                    "Peer {} uuid mismatch from {} ({} bytes)",
                                     id,
-                                    rk.uuid,
-                                    peer.uuid
+                                    ip,
+                                    rk.uuid.len()
                                 );
                                 drop(peer);
                                 return send_rk_res(socket, addr, UUID_MISMATCH).await;
@@ -1024,10 +1172,27 @@ impl RendezvousServer {
         Ok(())
     }
 
-    async fn check_ip_blocker(&self, ip: &str, id: &str) -> bool {
+    /// Whether a new id may enter `PeerMap` this minute (`NEW_IDS_PER_MIN`).
+    fn new_id_allowed(&mut self) -> bool {
+        let (start, n) = &mut self.new_ids;
+        if start.elapsed() >= Duration::from_secs(60) {
+            *start = Instant::now();
+            *n = 0;
+        }
+        if *n >= NEW_IDS_PER_MIN {
+            return false;
+        }
+        *n += 1;
+        true
+    }
+
+    /// Upstream's `RegisterPk` limits, counted per source: one IPv6 host holds a whole /64, so
+    /// counting full addresses let it register without limit (review A-1).
+    async fn check_ip_blocker(&self, ip: IpAddr, id: &str) -> bool {
+        let ip = source_key(ip.to_canonical());
         let mut lock = IP_BLOCKER.lock().await;
         let now = Instant::now();
-        if let Some(old) = lock.get_mut(ip) {
+        if let Some(old) = lock.get_mut(&ip) {
             let counter = &mut old.0;
             if counter.1.elapsed().as_secs() > IP_BLOCK_DUR {
                 counter.0 = 0;
@@ -1049,7 +1214,7 @@ impl RendezvousServer {
             }
             counter.1 = now;
         } else {
-            lock.insert(ip.to_owned(), ((0, now), (Default::default(), now)));
+            lock.insert(ip, ((0, now), (Default::default(), now)));
         }
         true
     }
@@ -1085,16 +1250,18 @@ impl RendezvousServer {
             }
             Some("ip-blocker" | "ib") => {
                 let mut lock = IP_BLOCKER.lock().await;
-                lock.retain(|&_, (a, b)| {
-                    a.1.elapsed().as_secs() <= IP_BLOCK_DUR
-                        || b.1.elapsed().as_secs() <= DAY_SECONDS
-                });
+                retain_live_ip_blocks(&mut lock);
                 res = format!("{}\n", lock.len());
                 let ip = fds.next();
                 let mut start = ip.map(|x| x.parse::<i32>().unwrap_or(-1)).unwrap_or(-1);
                 if start < 0 {
                     if let Some(ip) = ip {
-                        if let Some((a, b)) = lock.get(ip) {
+                        // Any address finds its source entry (an IPv6 address its /64).
+                        let ip = ip
+                            .parse::<IpAddr>()
+                            .ok()
+                            .map(|ip| source_key(ip.to_canonical()));
+                        if let Some((a, b)) = ip.and_then(|ip| lock.get(&ip)) {
                             let _ = writeln!(
                                 res,
                                 "{}/{}s {}/{}s",
@@ -1104,8 +1271,8 @@ impl RendezvousServer {
                                 b.1.elapsed().as_secs()
                             );
                         }
-                        if fds.next() == Some("-") {
-                            lock.remove(ip);
+                        if let (Some(ip), Some("-")) = (ip, fds.next()) {
+                            lock.remove(&ip);
                         }
                     } else {
                         start = 0;
@@ -1237,8 +1404,19 @@ impl RendezvousServer {
             });
             return;
         }
-        let stream = FramedStream::from(stream, addr);
+        let Some(permit) = self.conns.online.try_acquire(addr.ip()) else {
+            throttled_log!(
+                Duration::from_secs(60),
+                warn,
+                "NAT test port: too many connections, closed one from {}",
+                addr
+            );
+            return;
+        };
+        let mut stream = FramedStream::from(stream, addr);
+        stream.codec_mut().set_max_packet_length(MAX_ONLINE_FRAME);
         tokio::spawn(async move {
+            let _permit = permit;
             let mut stream = stream;
             if let Some(Ok(bytes)) = stream.next_timeout(30_000).await {
                 if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
@@ -1251,7 +1429,9 @@ impl RendezvousServer {
                             });
                             stream.send(&msg_out).await.ok();
                         }
-                        Some(rendezvous_message::Union::OnlineRequest(or)) => {
+                        Some(rendezvous_message::Union::OnlineRequest(or))
+                            if or.peers.len() <= MAX_ONLINE_PEERS =>
+                        {
                             allow_err!(rs.handle_online_request(&mut stream, or.peers).await);
                         }
                         _ => {}
@@ -1263,9 +1443,22 @@ impl RendezvousServer {
 
     async fn handle_listener(&self, stream: TcpStream, addr: SocketAddr, key: &str, ws: bool) {
         log::debug!("Tcp connection from {:?}, ws: {}", addr, ws);
+        // Closed before the KeyExchange offer (two signatures) when over the limit.
+        let limiter = if ws { &self.conns.ws } else { &self.conns.tcp };
+        let Some(permit) = limiter.try_acquire(addr.ip()) else {
+            throttled_log!(
+                Duration::from_secs(60),
+                warn,
+                "Rendezvous: too many connections, closed one from {} (ws: {})",
+                addr,
+                ws
+            );
+            return;
+        };
         let mut rs = self.clone();
         let key = key.to_owned();
         tokio::spawn(async move {
+            let _permit = permit;
             allow_err!(rs.handle_listener_inner(stream, addr, &key, ws).await);
         });
     }
@@ -1280,12 +1473,24 @@ impl RendezvousServer {
     ) -> ResultType<()> {
         let mut sink;
         if ws {
-            use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+            use tokio_tungstenite::tungstenite::{
+                handshake::server::{Request, Response},
+                protocol::WebSocketConfig,
+            };
             let callback = |req: &Request, response: Response| {
                 addr = ws_client_addr(addr, req.headers());
                 Ok(response)
             };
-            let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
+            let config = WebSocketConfig::default()
+                .read_buffer_size(WS_READ_BUFFER)
+                .max_message_size(Some(MAX_FRAME))
+                .max_frame_size(Some(MAX_FRAME));
+            // tungstenite bounds the handshake's size, not its time.
+            let ws_stream = timeout(
+                WS_HANDSHAKE_TIMEOUT_MS,
+                tokio_tungstenite::accept_hdr_async_with_config(stream, callback, Some(config)),
+            )
+            .await??;
             let (a, mut b) = ws_stream.split();
             sink = Some(Sink::Ws(a));
             while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
@@ -1296,7 +1501,9 @@ impl RendezvousServer {
                 }
             }
         } else {
-            let (mut a, mut b) = Framed::new(stream, BytesCodec::new()).split();
+            let mut codec = BytesCodec::new();
+            codec.set_max_packet_length(MAX_FRAME);
+            let (mut a, mut b) = Framed::new(stream, codec).split();
             // KeyExchange (note 02 §6.2): offer first; the client's first frame either answers
             // it or is a plaintext message from a client that skips the offer.
             let mut offer = None;
@@ -1580,6 +1787,10 @@ mod tests {
     }
 
     async fn harness(with_sk: bool, mask: Option<Ipv4Network>) -> Harness {
+        harness_with(with_sk, mask, Default::default()).await
+    }
+
+    async fn harness_with(with_sk: bool, mask: Option<Ipv4Network>, conns: ConnLimits) -> Harness {
         let app = crate::testutil::app().await;
         app.state.router.set_configured(vec![RELAY.to_owned()]);
         let (server_pk, sk) = sign::gen_keypair();
@@ -1598,6 +1809,8 @@ mod tests {
                 sk: with_sk.then_some(sk),
             }),
             state: app.state.clone(),
+            conns,
+            new_ids: (Instant::now(), 0),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1870,5 +2083,269 @@ mod tests {
         // aur no longer touches the relay list
         assert_eq!(h.rs.check_cmd("aur N").await, "");
         assert_eq!(h.rs.check_cmd("rs").await, status);
+    }
+
+    // ---- Limits on unauthenticated input (review A-1..A-5) ----
+
+    /// The `BytesCodec` header announcing `n` bytes: 1~4 bytes, the low two bits are its length - 1.
+    fn frame_head(n: usize) -> Vec<u8> {
+        let v = n << 2;
+        match n {
+            0..=0x3F => vec![v as u8],
+            0x40..=0x3FFF => (v as u16 | 1).to_le_bytes().to_vec(),
+            0x4000..=0x3F_FFFF => (v as u32 | 2).to_le_bytes()[..3].to_vec(),
+            _ => (v as u32 | 3).to_le_bytes().to_vec(),
+        }
+    }
+
+    /// Panics unless the server closes `stream` within `ms` (whatever it sent before).
+    async fn closed_within(stream: &mut TcpStream, ms: u64) {
+        let mut buf = Vec::new();
+        // Ok at EOF, Err on a reset: closed either way.
+        let _ = timeout(ms, stream.read_to_end(&mut buf))
+            .await
+            .expect("the connection is still open");
+    }
+
+    #[hbb_common::tokio::test]
+    async fn oversized_frame_closes_the_connection() {
+        let h = harness(true, None).await;
+        // A big WebRTC offer under the limit is still read and answered.
+        let mut conn = h.connect(Client::Plain).await;
+        let mut msg = punch_request("nobody");
+        msg.mut_punch_hole_request().webrtc_sdp_offer = "o".repeat(MAX_FRAME - 200);
+        let len = msg.write_to_bytes().unwrap().len();
+        assert!(len <= MAX_FRAME && len > MAX_FRAME - 200, "{len}");
+        conn.send(&msg).await.unwrap();
+        let Some(rendezvous_message::Union::PunchHoleResponse(res)) = recv(&mut conn).await.union
+        else {
+            panic!("expected PunchHoleResponse");
+        };
+        assert_eq!(res.failure, punch_hole_response::Failure::ID_NOT_EXIST.into());
+        // One byte over: refused on the header, the connection closes.
+        let mut s = TcpStream::connect(h.addr).await.unwrap();
+        s.write_all(&frame_head(MAX_FRAME + 1)).await.unwrap();
+        closed_within(&mut s, 3000).await;
+    }
+
+    /// 21115 for a non-loopback source (from loopback it is the console).
+    async fn online_port(h: &Harness) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let rs = h.rs.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                rs.handle_listener2(stream, "198.51.100.7:5000".parse().unwrap())
+                    .await;
+            }
+        });
+        addr
+    }
+
+    #[hbb_common::tokio::test]
+    async fn online_request_frame_and_id_count_limits() {
+        let h = harness(true, None).await;
+        let port = online_port(&h).await;
+        let request = |n: usize| {
+            let mut msg = RendezvousMessage::new();
+            msg.set_online_request(OnlineRequest {
+                id: "A12345".to_owned(),
+                peers: vec!["1".to_owned(); n],
+                ..Default::default()
+            });
+            msg
+        };
+        let connect = || async move {
+            let s = TcpStream::connect(port).await.unwrap();
+            let local = s.local_addr().unwrap();
+            FramedStream::from(s, local)
+        };
+        // At the id limit (3 bytes each, well under the frame limit): answered, a bit per id.
+        let mut conn = connect().await;
+        conn.send(&request(MAX_ONLINE_PEERS)).await.unwrap();
+        let Some(rendezvous_message::Union::OnlineResponse(res)) = recv(&mut conn).await.union else {
+            panic!("expected OnlineResponse");
+        };
+        assert_eq!(res.states.len(), MAX_ONLINE_PEERS / 8);
+        // One id more: dropped without an answer.
+        let mut conn = connect().await;
+        conn.send(&request(MAX_ONLINE_PEERS + 1)).await.unwrap();
+        let next = timeout(3000, conn.next()).await.expect("the connection is still open");
+        assert!(next.is_none(), "{next:?}");
+        // A frame over the limit closes the connection.
+        let mut s = TcpStream::connect(port).await.unwrap();
+        s.write_all(&frame_head(MAX_ONLINE_FRAME + 1)).await.unwrap();
+        closed_within(&mut s, 3000).await;
+    }
+
+    fn register_pk(id: &str, uuid: &[u8], pk: &[u8]) -> BytesMut {
+        let mut msg = RendezvousMessage::new();
+        msg.set_register_pk(RegisterPk {
+            id: id.to_owned(),
+            uuid: uuid.to_vec().into(),
+            pk: pk.to_vec().into(),
+            ..Default::default()
+        });
+        BytesMut::from(&msg.write_to_bytes().unwrap()[..])
+    }
+
+    async fn peer_rows(h: &Harness, id: &str) -> i64 {
+        sqlx::query_scalar("select count(*) from peer where id = ?")
+            .bind(id)
+            .fetch_one(&h.rs.state.db)
+            .await
+            .unwrap()
+    }
+
+    async fn register_reply(client: &mut FramedSocket) -> Option<register_pk_response::Result> {
+        let (bytes, _) = client.next_timeout(500).await?.unwrap();
+        match RendezvousMessage::parse_from_bytes(&bytes).unwrap().union {
+            Some(rendezvous_message::Union::RegisterPkResponse(r)) => {
+                Some(r.result.enum_value().unwrap())
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[hbb_common::tokio::test]
+    async fn register_pk_needs_a_32_byte_pk_and_a_bounded_uuid() {
+        let mut h = harness(true, None).await;
+        let mut server = FramedSocket::new("127.0.0.1:0").await.unwrap();
+        let mut client = FramedSocket::new("127.20.0.1:0").await.unwrap();
+        let from = client.local_addr().unwrap();
+        let pk = [7u8; 32];
+        let cases: [(&str, &[u8], &[u8]); 4] = [
+            ("pkshort", b"uuid", &pk[..31]),
+            ("pklong", b"uuid", &[7u8; 33]),
+            ("uuidlong", &[1u8; MAX_REG_UUID_LEN + 1], &pk),
+            ("uuidnone", b"", &pk),
+        ];
+        for (id, uuid, pk) in cases {
+            h.rs.handle_udp(&register_pk(id, uuid, pk), from, &mut server, "")
+                .await
+                .unwrap();
+            assert_eq!(register_reply(&mut client).await, None, "{id}: no reply");
+            assert!(!h.rs.pm.is_in_memory(id).await, "{id}");
+            assert_eq!(peer_rows(&h, id).await, 0, "{id}");
+        }
+        // At the bounds: registered.
+        h.rs.handle_udp(&register_pk("uuidmax", &[1u8; MAX_REG_UUID_LEN], &pk), from, &mut server, "")
+            .await
+            .unwrap();
+        assert_eq!(register_reply(&mut client).await, Some(register_pk_response::Result::OK));
+        assert!(h.rs.pm.is_in_memory("uuidmax").await);
+        assert_eq!(peer_rows(&h, "uuidmax").await, 1);
+    }
+
+    #[hbb_common::tokio::test]
+    async fn register_pk_new_ids_capped_per_minute() {
+        let mut h = harness(true, None).await;
+        let mut server = FramedSocket::new("127.0.0.1:0").await.unwrap();
+        let pk = [7u8; 32];
+        // 20 new ids from each of 6 sources (under the per-source limit): 120 in all.
+        for n in 0..120 {
+            let from = format!("127.21.0.{}:9", n / 20 + 1).parse().unwrap();
+            h.rs.handle_udp(&register_pk(&format!("newid{n}"), b"uuid", &pk), from, &mut server, "")
+                .await
+                .unwrap();
+        }
+        let mut registered = 0;
+        for n in 0..120 {
+            if h.rs.pm.is_in_memory(&format!("newid{n}")).await {
+                registered += 1;
+            }
+        }
+        assert_eq!(registered, NEW_IDS_PER_MIN);
+        assert!(h.rs.pm.is_in_memory("newid99").await && !h.rs.pm.is_in_memory("newid100").await);
+        assert_eq!(peer_rows(&h, "newid100").await, 0);
+        // Over the cap, ids the server knows still register: one only in the database too.
+        h.rs.pm.db.insert_peer("known1", b"uuid", &pk, "{}").await.unwrap();
+        let mut client = FramedSocket::new("127.21.0.7:0").await.unwrap();
+        let from = client.local_addr().unwrap();
+        for id in ["newid0", "known1"] {
+            h.rs.handle_udp(&register_pk(id, b"uuid", &pk), from, &mut server, "")
+                .await
+                .unwrap();
+            assert_eq!(register_reply(&mut client).await, Some(register_pk_response::Result::OK), "{id}");
+        }
+        h.rs.handle_udp(&register_pk("newid200", b"uuid", &pk), from, &mut server, "")
+            .await
+            .unwrap();
+        assert_eq!(register_reply(&mut client).await, None, "a new id is dropped");
+    }
+
+    #[hbb_common::tokio::test]
+    async fn ip_blocker_counts_an_ipv6_64_as_one_source() {
+        let h = harness(true, None).await;
+        let addrs: [IpAddr; 2] = ["2001:db8:a1:1::1".parse().unwrap(), "2001:db8:a1:1:ffff::2".parse().unwrap()];
+        // Alternating addresses of one /64 share upstream's budget: the first call only creates
+        // the entry, then 31 more pass.
+        let mut passed = 0;
+        while h.rs.check_ip_blocker(addrs[passed % 2], "ipblock1").await {
+            passed += 1;
+            assert!(passed < 100);
+        }
+        assert_eq!(passed, 32);
+        assert!(h.rs.check_ip_blocker("2001:db8:a1:2::1".parse().unwrap(), "ipblock1").await);
+        // An IPv4 client on the dual-stack socket counts as its IPv4 address, not as ::ffff:0:0/64.
+        let mapped: IpAddr = "::ffff:198.51.100.21".parse().unwrap();
+        assert!(h.rs.check_ip_blocker(mapped, "ipblock1").await);
+        assert!(IP_BLOCKER
+            .lock()
+            .await
+            .contains_key(&"198.51.100.21".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn conn_limiter_per_source_and_total() {
+        let l = ConnLimiter::new(MAX_CONNS_PER_SOURCE + 2);
+        let a: [IpAddr; 2] = ["2001:db8:c::1".parse().unwrap(), "2001:db8:c:0:1::1".parse().unwrap()];
+        let mut held: Vec<_> = (0..MAX_CONNS_PER_SOURCE)
+            .map(|i| l.try_acquire(a[i % 2]).unwrap())
+            .collect();
+        assert!(l.try_acquire(a[0]).is_none(), "connection N+1 from one /64");
+        // Other sources fit up to the total; loopback only counts toward the total.
+        let b = l.try_acquire("::ffff:198.51.100.1".parse().unwrap()).unwrap();
+        let lo = l.try_acquire("127.0.0.1".parse().unwrap()).unwrap();
+        assert!(l.try_acquire("198.51.100.2".parse().unwrap()).is_none(), "total");
+        drop((b, lo));
+        held.pop();
+        assert!(l.try_acquire(a[1]).is_some(), "a slot comes back when its connection ends");
+        drop(held);
+        assert!(l.sources.lock().unwrap().is_empty(), "a source's key goes with its last connection");
+    }
+
+    #[hbb_common::tokio::test]
+    async fn over_the_limit_closed_before_key_exchange() {
+        let conns = ConnLimits {
+            tcp: ConnLimiter::new(1),
+            ..Default::default()
+        };
+        let h = harness_with(true, None, conns).await;
+        let mut buf = [0u8; 1];
+        let first = {
+            let mut s = TcpStream::connect(h.addr).await.unwrap();
+            timeout(3000, s.read_exact(&mut buf)).await.unwrap().unwrap();
+            s
+        };
+        // No offer: closed before any byte (and before the two signatures).
+        let mut second = TcpStream::connect(h.addr).await.unwrap();
+        let mut got = Vec::new();
+        let _ = timeout(3000, second.read_to_end(&mut got))
+            .await
+            .expect("the connection is still open");
+        assert!(got.is_empty(), "{got:?}");
+        // The slot comes back once the first connection ends.
+        drop(first);
+        let mut offered = false;
+        for _ in 0..30 {
+            let mut s = TcpStream::connect(h.addr).await.unwrap();
+            if let Ok(Ok(_)) = timeout(500, s.read_exact(&mut buf)).await {
+                offered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(offered);
     }
 }

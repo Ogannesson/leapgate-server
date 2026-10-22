@@ -334,7 +334,7 @@ struct TrackerState {
 
 /// What `IP_ROWS_PER_MIN` counts per: an IPv4 address, or the /64 of an IPv6 address (any host
 /// gets at least a /64, so counting /128s would give one host 2^64 budgets; review R2-4).
-fn source_key(ip: IpAddr) -> IpAddr {
+pub(crate) fn source_key(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V4(_) => ip,
         IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & (u128::MAX << 64))),
