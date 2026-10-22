@@ -18,6 +18,8 @@ use std::{
 /// Failed logins per user name: 5 within 15 minutes lock the name for 15 minutes (§11).
 const FAIL_WINDOW: Duration = Duration::from_secs(15 * 60);
 const MAX_FAILS: usize = 5;
+/// Longer names are refused before the lookup, so request bodies cannot make big keys.
+const MAX_NAME_LEN: usize = 128;
 
 #[derive(Default)]
 struct FailState {
@@ -27,6 +29,8 @@ struct FailState {
 }
 
 lazy_static::lazy_static! {
+    /// Only names of existing users, so at most one entry per user; a name's stale failures are
+    /// dropped when it is next used, never by scanning the whole map.
     static ref LOGIN_FAILS: Mutex<HashMap<String, FailState>> = Default::default();
 }
 
@@ -40,10 +44,6 @@ fn is_locked(name: &str) -> bool {
 fn record_failure(name: &str) {
     let now = Instant::now();
     let mut map = LOGIN_FAILS.lock().unwrap();
-    // Forget names that neither are locked nor failed recently, so random names do not pile up.
-    map.retain(|_, s| {
-        s.locked_until.is_some_and(|t| t > now) || s.fails.last().is_some_and(|t| now - *t < FAIL_WINDOW)
-    });
     let s = map.entry(name.to_owned()).or_default();
     s.fails.retain(|t| now - *t < FAIL_WINDOW);
     s.fails.push(now);
@@ -136,11 +136,8 @@ pub(crate) async fn login(State(state): State<AppState>, body: Bytes) -> ApiResu
     if req.typ.as_deref().is_some_and(|t| t != "account") {
         return Err(ApiError::bad_request("Unsupported login type"));
     }
-    if is_locked(&req.username) {
-        return Err(ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "Too many failed attempts, try again later",
-        ));
+    if req.username.len() > MAX_NAME_LEN {
+        return Err(ApiError::bad_request("User name too long"));
     }
     let row = sqlx::query_as::<_, (i64, String, i64)>(
         "select id, password_hash, status from user where name = ?",
@@ -148,6 +145,13 @@ pub(crate) async fn login(State(state): State<AppState>, body: Bytes) -> ApiResu
     .bind(&req.username)
     .fetch_optional(&state.db)
     .await?;
+    let exists = row.is_some();
+    if exists && is_locked(&req.username) {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many failed attempts, try again later",
+        ));
+    }
     let (uid, stored, status) = row.unwrap_or_default();
     // argon2 takes tens of milliseconds of CPU: keep it off the async workers.
     let password = req.password.clone();
@@ -159,7 +163,9 @@ pub(crate) async fn login(State(state): State<AppState>, body: Bytes) -> ApiResu
     .await
     .map_err(ApiError::internal)?;
     if check == PasswordCheck::Mismatch {
-        record_failure(&req.username);
+        if exists {
+            record_failure(&req.username);
+        }
         return Err(ApiError::new(StatusCode::UNAUTHORIZED, "Wrong credentials"));
     }
     clear_failures(&req.username);
@@ -395,6 +401,42 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         let (status, _) = login_as(&t.app, "rl-erin", "pw", "", "").await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn failure_table_only_holds_existing_users() {
+        let t = testutil::app().await;
+        testutil::create_user(&t.state.db, "ft-olga", "pw", false).await;
+        let fails = |name: &str| LOGIN_FAILS.lock().unwrap().get(name).map(|s| s.fails.len());
+
+        // Unknown names, however many failures, leave nothing behind.
+        for _ in 0..MAX_FAILS + 1 {
+            let (status, _) = login_as(&t.app, "ft-nobody", "pw", "", "").await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(fails("ft-nobody"), None);
+
+        // Over-long names are refused up front; 128 bytes is still a normal (unknown) name.
+        let long = "n".repeat(MAX_NAME_LEN + 1);
+        let (status, v) = login_as(&t.app, &long, "pw", "", "").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(v["error"].is_string());
+        assert_eq!(fails(&long), None);
+        let (status, _) = login_as(&t.app, &long[1..], "pw", "", "").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // An existing user's failures older than the window are dropped when the name is next used.
+        let old = Instant::now().checked_sub(FAIL_WINDOW).unwrap();
+        LOGIN_FAILS.lock().unwrap().insert(
+            "ft-olga".to_owned(),
+            FailState { fails: vec![old; MAX_FAILS - 1], ..Default::default() },
+        );
+        let (status, _) = login_as(&t.app, "ft-olga", "bad", "", "").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(fails("ft-olga"), Some(1));
+        let (status, _) = login_as(&t.app, "ft-olga", "pw", "", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(fails("ft-olga"), None);
     }
 
     #[tokio::test]
