@@ -419,7 +419,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 
 - 只读打开 rustdesk-api 的 SQLite，按笔记 05 §8 的 SQL 读取（下面写明的地方除外）；Porta 库里已有用户时拒绝执行（只支持往空库导入一次）。`--dry-run` 只打印将导入的数量、冲突和被丢弃的数据。
 - 导入：用户、用户组和成员、个人簿、共享簿、授权规则、条目、标签、设备归属（`peers.user_id`，可选）。令牌、登录日志、审计不导入。导入在一个事务里完成，结束时打印所用密钥文件的绝对路径。
-- 用户：`username→name`、`nickname→display_name`、`email→email`、`remark→note`，avatar 丢弃。`status` 为 1 → 1，其他值（rustdesk-api 的 2=禁用）→ 0；`is_admin` 用 `CAST(is_admin AS INTEGER)`，非 0 → 1。`created_at` 按 `%Y-%m-%d %H:%M:%S%.f%:z` 解析成 unix 秒，NULL 或解析失败用导入时间；其余表的时间一律用导入时间。建立旧 user id → 新 id 的映射。
+- 用户：`username→name`、`nickname→display_name`、`email→email`、`remark→note`，avatar 丢弃。`status` 为 1 → 1，其他值（rustdesk-api 的 2=禁用）→ 0；`is_admin` 用 `CAST(is_admin AS INTEGER)`，非 0 → 1。`created_at` 按 `%Y-%m-%d %H:%M:%S%.f%:z` 解析成 unix 秒，NULL 或解析失败用导入时间；其余表的时间一律用导入时间。建立旧 user id → 新 id 的映射。用户名为空或超过 128 字节（§14，登录接口拒绝更长的名字）的用户不导入，写进报告；和其他没导入的用户一样，他们名下的个人簿、共享簿、条目、标签、授权规则一并丢弃，设备照常导入但不设归属。
 - 密码：以 `$2a$`/`$2b$`/`$2y$` 开头的原样写入；恰好 32 位 `[0-9a-f]` 的写成 `md5:` + 原值；空串写 `''`；其他无法识别的非空值写 `''`。密码为 `''` 的用户（含只能靠 OAuth/LDAP 登录的）照样导入，打印清单，提示用 `user passwd` 设密码。登录时按 §11 升级。
 - 用户组：组 = `groups` 表的行 ∪ `users.group_id` 里出现过、`groups` 表却没有的 id；后者建占位组 `rustdesk-api-group-<旧 id>`，`share_devices=0`。`groups.type=2` → `share_devices=1`。成员按 `users.group_id` 导入（每人一个组）。组名重复时第二个起追加 `-<旧 id>` 改名并打印。
 - 授权规则：**不用笔记 05 §8.3 的展开 SQL**（它把组规则展开成个人规则，违背 §12.2），换成两条，都按 MAX 去重：
