@@ -320,7 +320,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 
 ### 9.1 必须遵守（任何一条写错，原版客户端都会走错分支）
 1. **任何接口都不回 5xx**：客户端遇到 5xx 或连不上会改走 hbbs 的 TCP 代理（第一期不做），白等最长 36 秒，心跳也跟着卡住。内部错误：审计接口回 200 + `{"error":"…"}`（客户端会重试）；`/api/currentUser` 回 200 + `{"error":"…"}`（客户端收到 400 会清本地令牌、401 会全部重置，一次临时错误不能把用户登出）；其他接口回 400 + `{"error":"…"}`。
-2. 请求体一律用 `Bytes` 收、自己解析 JSON；不用 axum 的 `Json` 提取器（出错回 415/422 纯文本）。JSON 响应带 `Content-Type: application/json; charset=utf-8`；`SYSINFO_UPDATED` 用 `text/plain; charset=utf-8`；空 body 的响应（sysinfo 403、审计成功、地址簿写接口成功）不要求 Content-Type。axum 自己产生的错误也回 JSON：用错 HTTP 方法回 405 + `{"error":"Method Not Allowed"}`，请求体超过 2 MB（`Bytes` 的默认上限）回 413 + `{"error":"Request body too large"}`。
+2. 请求体一律用 `Bytes` 收、自己解析 JSON；不用 axum 的 `Json` 提取器（出错回 415/422 纯文本）。JSON 响应带 `Content-Type: application/json; charset=utf-8`；`SYSINFO_UPDATED` 用 `text/plain; charset=utf-8`；空 body 的响应（sysinfo 403、审计成功、地址簿写接口成功）不要求 Content-Type。axum 自己产生的错误也回 JSON：用错 HTTP 方法回 405 + `{"error":"Method Not Allowed"}`，请求体超过该路由的上限（§9.4）回 413 + `{"error":"Request body too large"}`，审计接口也回 413（客户端对 4xx 直接放弃、对 200 + error 会重试，同一个超大请求体重发没有意义）。
 3. 令牌无效、过期、账号禁用 → **401**（客户端据此清登录态）。
 4. `/api/login-options` 回 `[]`（没有第三方登录）。
 5. 用户信息里 `name` 必须是非空字符串；登录成功必须带 `user`；`info`、`is_admin`、`status` 不能是 null（笔记 03 §2.5）。
@@ -354,6 +354,13 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 ### 9.4 其他
 - `GET /`：静态说明页（HTML）：服务名 Porta、源代码地址（AGPL-3.0 第 13 条：链接到公开仓库）、"IP Geolocation by DB-IP" 署名并链接 https://db-ip.com 。客户端"在 Web 控制台管理"菜单打开的就是这里。
 - 其余未知路径回 404。
+- 连接保护（审查 C-9；常量写死，不做配置，`src/api/listen.rs`）：API 端口不用 `axum::serve`（它不给 hyper 设 timer，hyper 默认的 30 秒请求头超时因此不生效，实测发半个请求头的连接一直挂着），自己写 accept 循环：
+  - 并发连接最多 512 条，每个来源（IPv4 地址 / IPv6 /64）最多 32 条，回环来源只计入总数（和会合端口同一套规则，§6 第 8 条）。超限的连接在 accept 后直接关闭，不回 HTTP 响应，每分钟最多打一条 warn；客户端把它当连不上处理（会尝试 TCP 代理回退）。
+  - 请求头 10 秒内收完（从连接建立或上一个响应结束算起，所以也是 keep-alive 的空闲超时）；请求头最大 16 KB（hyper 默认约 400 KB），超出回 431。
+  - 整个请求（含收请求体）20 秒内要产生响应，超时按内部错误回：审计接口和 `/api/currentUser` 回 200 + `{"error":"Request timeout"}`，其他接口回 400 + `{"error":"Request timeout"}`。
+  - 套接字上有读或写在等、且 30 秒没有任何字节进出就断开（防止客户端不读响应，一直占着已经组好的响应体）。这个值要大于整请求超时：handler 执行期间 hyper 会挂着一个读来探测对端关闭，慢 handler 要先拿到超时响应。
+  - 请求体上限按路由：默认 16 KB（登录、登出、currentUser、sysinfo、心跳、单个标签的写接口，以及不读请求体的接口）；审计 64 KB（超长字段要截断入库，§9.3）；`peer/add`、`peer/update` 64 KB（合法的单条最大约 18 KB）；`DELETE /api/ab/tag` 256 KB（一本簿最多 1000 个标签）；`DELETE /api/ab/peer` 2 MB（客户端一次删除把全部 id 放进一个数组，满簿 5000 个 253 字节的 id 约 1.3 MB）。
+  - 默认监听地址不变（`0.0.0.0:21114`）。推荐部署：同机反向代理终结 HTTPS，防火墙不对外开 21114；直接暴露时以上保护照样生效，但每来源上限按 TCP 对端地址算。
 
 ## 10. 心跳与策略（`strategy.rs`、`device.rs`）
 
