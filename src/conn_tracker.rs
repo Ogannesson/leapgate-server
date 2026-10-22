@@ -50,9 +50,11 @@ const MAX_TEXT_LEN: usize = 64;
 const IP_ROWS_PER_MIN: u32 = 60;
 const IP_WINDOW_MS: i64 = 60_000;
 /// New rows per minute from all sources together, a backstop for requests spread over many sources
-/// (review R2-4). 10 a second is far above what a personal deployment makes (a few hundred a day) and
-/// caps the table at about 864k new rows a day.
-const TOTAL_ROWS_PER_MIN: u32 = 600;
+/// (review R2-4). 2 a second is far above what a personal deployment makes (a few hundred a day).
+const TOTAL_ROWS_PER_MIN: u32 = 120;
+/// The daily purge also keeps only this many newest rows, so a sustained flood stays within about
+/// 0.5 GB (a row is at most about 1 KB) instead of growing for the whole retention period.
+const MAX_ROWS: i64 = 500_000;
 /// Finalized attempts waiting for the writer; when full, new ones are dropped and counted.
 const WRITE_QUEUE: usize = 10_000;
 /// At most this many rows per insert transaction.
@@ -686,12 +688,24 @@ fn enqueue(tx: &mpsc::Sender<Finalized>, done: Vec<Finalized>) -> u64 {
     done.into_iter().map(|f| tx.try_send(f)).filter(|r| r.is_err()).count() as u64
 }
 
-/// Deletes the rows started before `now - RETENTION_MS`; returns how many.
+/// Deletes the rows started before `now - RETENTION_MS`, then all but the newest `MAX_ROWS`;
+/// returns how many.
 async fn purge(db: &SqlitePool, now: i64) -> ResultType<u64> {
-    let res = sqlx::query("delete from conn_attempt where started_at < ?")
+    let old = sqlx::query("delete from conn_attempt where started_at < ?")
         .bind(now - RETENTION_MS)
         .execute(db)
         .await?;
+    Ok(old.rows_affected() + trim(db, MAX_ROWS).await?)
+}
+
+/// Keeps the newest `keep` rows (by id); returns how many were deleted.
+async fn trim(db: &SqlitePool, keep: i64) -> ResultType<u64> {
+    let res = sqlx::query(
+        "delete from conn_attempt where id < (select id from conn_attempt order by id desc limit 1 offset ?)",
+    )
+    .bind(keep - 1)
+    .execute(db)
+    .await?;
     Ok(res.rows_affected())
 }
 
@@ -1163,19 +1177,19 @@ mod tests {
 
     #[test]
     fn total_new_rows_are_capped() {
-        // Review R2-4: 11 sources × 60 rows within a minute: the total stops at 600.
+        // Review R2-4: 3 sources × 60 rows within a minute: the total stops at 120.
         let mut s = TrackerState::default();
         let src = |n: u8| SocketAddr::new(IpAddr::from([10, 0, 0, n]), 40001);
-        for n in 0..11u8 {
+        for n in 0..3u8 {
             for i in 0..60u32 {
                 new_row(&mut s, src(n), u32::from(n) * 1_000 + i, T0 + i64::from(n));
             }
         }
-        assert_eq!((s.attempts.len(), s.rate_dropped, s.total_dropped), (600, 0, 60));
+        assert_eq!((s.attempts.len(), s.rate_dropped, s.total_dropped), (120, 0, 60));
         // Rows dropped by the total do not use up their source's budget: the next minute it gets 60.
-        assert_eq!(s.sweep(T0 + 60_000).len(), 600);
+        assert_eq!(s.sweep(T0 + 60_000).len(), 120);
         for i in 0..61u32 {
-            new_row(&mut s, src(10), 20_000 + i, T0 + 60_000);
+            new_row(&mut s, src(2), 20_000 + i, T0 + 60_000);
         }
         assert_eq!((s.attempts.len(), s.rate_dropped, s.total_dropped), (60, 1, 60));
     }
@@ -1448,6 +1462,26 @@ mod tests {
             .unwrap();
         assert_eq!(left, ["id-1", "id-2"]);
         assert_eq!(purge(&db, now).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn trim_keeps_the_newest_rows() {
+        let (_dir, db) = crate::testutil::pool().await;
+        let mut s = TrackerState::default();
+        for i in 0..5 {
+            let mut req = punch(a1(), Signal::FailOffline);
+            req.b_id = format!("id-{i}");
+            let t = T0 + i64::from(i) * 10_000;
+            s.punch_request(req, t);
+            insert(&db, &mut s, t + PAIR_MERGE_MS).await;
+        }
+        assert_eq!(trim(&db, 10).await.unwrap(), 0);
+        assert_eq!(trim(&db, 2).await.unwrap(), 3);
+        let left: Vec<String> = sqlx::query_scalar("select b_id from conn_attempt order by id")
+            .fetch_all(&db)
+            .await
+            .unwrap();
+        assert_eq!(left, ["id-3", "id-4"]);
     }
 
     #[tokio::test]
