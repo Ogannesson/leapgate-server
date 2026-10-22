@@ -30,7 +30,9 @@ pub(crate) async fn pool() -> (TempDir, SqlitePool) {
 /// Full `AppState` (skeleton-level Router/ConnTracker, default `Config`, temporary secret key) and the router.
 pub(crate) async fn app() -> TestApp {
     let (dir, db) = pool().await;
-    let state = AppState::new(db, Config::default(), &dir.path().join(crate::crypto::SECRET_KEY_FILE)).unwrap();
+    let state = AppState::new(db, Config::default(), &dir.path().join(crate::crypto::SECRET_KEY_FILE))
+        .await
+        .unwrap();
     let app = crate::api::router(state.clone());
     TestApp { dir, state, app }
 }
