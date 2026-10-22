@@ -1,5 +1,7 @@
 # Repository Instructions
 
+> Porta：本仓库是 porta-server（rustdesk-server 的硬分叉），Porta 自己的说明和第一期实施契约在 `PORTA.md`，先读它。
+
 ## Rust Rules
 
 - In Rust code, do not introduce `unwrap()` or `expect()`.
