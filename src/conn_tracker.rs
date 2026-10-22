@@ -5,6 +5,7 @@
 //! writer task, which resolves `token` → `a_user`/`a_device_id` and inserts into `conn_attempt`.
 //! All times are unix ms.
 
+use crate::peer::MAX_PEER_ID_LEN;
 use hbb_common::{
     log,
     tokio::{self, sync::mpsc},
@@ -15,7 +16,7 @@ use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 /// Requests for the same (A IP, B id) within this long of the group's first request are one attempt
@@ -23,15 +24,39 @@ use std::{
 const PAIR_MERGE_MS: i64 = 2_000;
 /// No reply this long after the last request → `no_reply`. 待实测.
 const NO_REPLY_MS: i64 = 20_000;
-/// Direct window W = max(45 s, 6 × (reply_at − started_at) + 10 s): A's direct timeout is the punch
-/// time × 6 with no cap (client `connect_timeout`). 待实测.
+/// Direct window W = max(45 s, 6 × (reply_at − started_at) + 20 s): A's direct timeout is the punch
+/// time × 6 with no cap (client `connect_timeout`). The client's punch time also counts connecting to
+/// hbbs and the KeyExchange, which hbbs never sees; the margin covers up to about 3 s of that. 待实测.
 const DIRECT_MIN_MS: i64 = 45_000;
 const DIRECT_PUNCH_FACTOR: i64 = 6;
-const DIRECT_MARGIN_MS: i64 = 10_000;
+const DIRECT_MARGIN_MS: i64 = 20_000;
 /// An attempt with `RequestRelay`s is finalized this long after the last one (A waits up to 18 s for
 /// each `RelayResponse`). 待实测.
 const RELAY_SETTLE_MS: i64 = 20_000;
+/// A falls back at most 3 times, each `RequestRelay` on a new connection up to 18 s after the last one.
+/// Later ones from the same (A IP, B id) start a new row, so a stream of `RequestRelay`s (unauthenticated)
+/// cannot keep one attempt in memory forever. 待实测.
+const RELAY_MAX_REQS: i64 = 3;
+const RELAY_MERGE_MS: i64 = RELAY_MAX_REQS * RELAY_SETTLE_MS;
 const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
+
+// Limits on what unauthenticated requests can make us store (review C-13). Fixed, not configurable.
+/// Versions, tokens (43 bytes) and uuids are clipped to this many bytes; ids and relay hosts to
+/// `MAX_PEER_ID_LEN`. Frames on 21116 have no size limit.
+const MAX_TEXT_LEN: usize = 64;
+/// New rows per source IP per minute; more are dropped and counted. Repeats merge into one row, so a
+/// client needs a few at most; this is upstream's `RegisterPk` limit of 30 per window, doubled.
+const IP_ROWS_PER_MIN: u32 = 60;
+const IP_WINDOW_MS: i64 = 60_000;
+/// Finalized attempts waiting for the writer; when full, new ones are dropped and counted.
+const WRITE_QUEUE: usize = 10_000;
+/// At most this many rows per insert transaction.
+const WRITE_BATCH: usize = 1_000;
+/// Rows started longer ago than this are deleted once a day.
+const RETENTION_MS: i64 = 90 * 24 * 3600 * 1000;
+const PURGE_INTERVAL: Duration = Duration::from_secs(24 * 3600);
+/// Dropped records are logged at most this often.
+const DROP_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 /// `conn_attempt.signal`: what hbbs did with a `PunchHoleRequest`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,8 +243,9 @@ impl Attempt {
     /// Whether a `RequestRelay` at `now` belongs to this attempt (same (A IP, B id) already checked).
     fn takes_relay_request(&self, now: i64) -> bool {
         if self.relay_req_count > 0 {
-            // A retrying the fallback (or a `relay_only` row); still in memory = within RELAY_SETTLE_MS.
-            return true;
+            // A retrying the fallback (or a `relay_only` row), within its first request's merge window.
+            return self.relay_req_count < RELAY_MAX_REQS
+                && self.relay_req_at.is_some_and(|at| now <= at + RELAY_MERGE_MS);
         }
         match self.reply {
             Some((Answer::PunchHoleSent | Answer::LocalAddr, at)) => now <= at + self.direct_window(at),
@@ -281,10 +307,36 @@ struct TrackerState {
     /// try_into_v4(A:p3) → attempt.
     by_relay_addr: HashMap<SocketAddr, u64>,
     attempts: HashMap<u64, Attempt>,
+    /// Source IP → (start of its current minute, new rows in it), for `IP_ROWS_PER_MIN`.
+    rows_per_ip: HashMap<IpAddr, (i64, u32)>,
+    /// New rows refused by the per-IP limit, taken by the sweeper.
+    rate_dropped: u64,
+}
+
+/// Truncates `s` to at most `max` bytes, at a char boundary.
+fn clip(s: &mut String, max: usize) {
+    if s.len() > max {
+        let mut end = max;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
 }
 
 impl TrackerState {
-    fn add(&mut self, attempt: Attempt) -> u64 {
+    /// Adds a new attempt (started now) unless its source IP is over `IP_ROWS_PER_MIN`.
+    fn add(&mut self, attempt: Attempt) {
+        let now = attempt.started_at;
+        let (start, count) = self.rows_per_ip.entry(attempt.a_addr.ip()).or_insert((now, 0));
+        if now - *start >= IP_WINDOW_MS {
+            (*start, *count) = (now, 0);
+        }
+        if *count >= IP_ROWS_PER_MIN {
+            self.rate_dropped += 1;
+            return;
+        }
+        *count += 1;
         self.next_id += 1;
         let id = self.next_id;
         self.by_pair
@@ -298,10 +350,16 @@ impl TrackerState {
             self.by_relay_addr.insert(*k, id);
         }
         self.attempts.insert(id, attempt);
-        id
     }
 
-    fn punch_request(&mut self, req: PunchRequest, now: i64) {
+    fn punch_request(&mut self, mut req: PunchRequest, now: i64) {
+        if req.signal == Signal::FailLicense {
+            // Not recorded: anyone without the key can send these (review C-13).
+            return;
+        }
+        clip(&mut req.b_id, MAX_PEER_ID_LEN);
+        clip(&mut req.a_version, MAX_TEXT_LEN);
+        clip(&mut req.token, MAX_TEXT_LEN);
         let key = try_into_v4(req.a_addr);
         let pair = (key.ip(), req.b_id.clone());
         // Retry on the same connection: A only resends while it has no answer.
@@ -361,7 +419,10 @@ impl TrackerState {
         self.attempts.get_mut(id)
     }
 
-    fn reply(&mut self, r: Reply, now: i64) {
+    fn reply(&mut self, mut r: Reply, now: i64) {
+        clip(&mut r.b_id, MAX_PEER_ID_LEN);
+        clip(&mut r.b_relay, MAX_PEER_ID_LEN);
+        clip(&mut r.b_version, MAX_TEXT_LEN);
         let Some(a) = self.punch_attempt(r.a_addr) else {
             return;
         };
@@ -380,7 +441,10 @@ impl TrackerState {
         a.b_has_v6 = Some(r.b_has_v6);
     }
 
-    fn relay_response(&mut self, r: RelayResponseInfo, now: i64) {
+    fn relay_response(&mut self, mut r: RelayResponseInfo, now: i64) {
+        clip(&mut r.uuid, MAX_TEXT_LEN);
+        clip(&mut r.b_relay, MAX_PEER_ID_LEN);
+        clip(&mut r.b_version, MAX_TEXT_LEN);
         if r.uuid.is_empty() && r.b_id.is_empty() {
             // Fallback: B answers A's `RequestRelay`.
             let key = try_into_v4(r.a_addr);
@@ -406,7 +470,11 @@ impl TrackerState {
         a.relay_uuid = Some(r.uuid);
     }
 
-    fn request_relay(&mut self, r: RelayRequest, now: i64) {
+    fn request_relay(&mut self, mut r: RelayRequest, now: i64) {
+        clip(&mut r.b_id, MAX_PEER_ID_LEN);
+        clip(&mut r.relay_server, MAX_PEER_ID_LEN);
+        clip(&mut r.uuid, MAX_TEXT_LEN);
+        clip(&mut r.token, MAX_TEXT_LEN);
         let key = try_into_v4(r.a_addr);
         let pair = (key.ip(), r.b_id.clone());
         let matched = self.by_pair.get(&pair).and_then(|ids| {
@@ -466,6 +534,7 @@ impl TrackerState {
 
     /// Removes and returns the attempts due at `now`.
     fn sweep(&mut self, now: i64) -> Vec<Finalized> {
+        self.rows_per_ip.retain(|_, (start, _)| now - *start < IP_WINDOW_MS);
         let due: Vec<u64> = self
             .attempts
             .iter()
@@ -512,10 +581,28 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
-/// Inserts one finalized attempt, resolving its token first.
-async fn write(db: &SqlitePool, f: &Finalized) -> ResultType<()> {
+/// Inserts finalized attempts in one transaction, resolving their tokens first.
+async fn write(db: &SqlitePool, batch: &[Finalized]) -> ResultType<()> {
+    let mut owners = Vec::with_capacity(batch.len());
+    for f in batch {
+        owners.push(crate::auth::token_owner(db, &f.attempt.token).await);
+    }
+    let mut tx = db.begin().await?;
+    for (f, owner) in batch.iter().zip(owners) {
+        insert_row(&mut *tx, f, owner).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Inserts one finalized attempt; `owner` is what `auth::token_owner` found for its token.
+async fn insert_row(
+    conn: &mut sqlx::SqliteConnection,
+    f: &Finalized,
+    owner: Option<(i64, String, String)>,
+) -> ResultType<()> {
     let a = &f.attempt;
-    let (a_user, a_device_id) = match crate::auth::token_owner(db, &a.token).await {
+    let (a_user, a_device_id) = match owner {
         Some((_, name, device_id)) => (Some(name), Some(device_id)),
         None => (None, None),
     };
@@ -559,9 +646,23 @@ async fn write(db: &SqlitePool, f: &Finalized) -> ResultType<()> {
     .bind(a.relay_resp_at)
     .bind(f.outcome)
     .bind(f.finalized_at)
-    .execute(db)
+    .execute(conn)
     .await?;
     Ok(())
+}
+
+/// Hands finalized attempts to the writer without waiting; returns how many were dropped (queue full).
+fn enqueue(tx: &mpsc::Sender<Finalized>, done: Vec<Finalized>) -> u64 {
+    done.into_iter().map(|f| tx.try_send(f)).filter(|r| r.is_err()).count() as u64
+}
+
+/// Deletes the rows started before `now - RETENTION_MS`; returns how many.
+async fn purge(db: &SqlitePool, now: i64) -> ResultType<u64> {
+    let res = sqlx::query("delete from conn_attempt where started_at < ?")
+        .bind(now - RETENTION_MS)
+        .execute(db)
+        .await?;
+    Ok(res.rows_affected())
 }
 
 pub struct ConnTracker {
@@ -597,25 +698,52 @@ impl ConnTracker {
         self.state.lock().unwrap().request_relay(req, now_ms());
     }
 
-    /// The 5-second finalizer and the database writer, spawned on the server's runtime.
+    /// The 5-second finalizer, the database writer and the daily purge, spawned on the server's runtime.
     pub fn spawn_tasks(self: &Arc<Self>) {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Finalized>();
+        let (tx, mut rx) = mpsc::channel::<Finalized>(WRITE_QUEUE);
         let this = self.clone();
         tokio::spawn(async move {
             let mut timer = tokio::time::interval(SWEEP_INTERVAL);
+            // Dropped since the last log line: over the per-IP limit, and with the write queue full.
+            let (mut limited, mut full) = (0u64, 0u64);
+            let mut logged: Option<Instant> = None;
             loop {
                 timer.tick().await;
-                let done = this.state.lock().unwrap().sweep(now_ms());
-                for f in done {
-                    tx.send(f).ok();
+                let (done, n) = {
+                    let mut s = this.state.lock().unwrap();
+                    let done = s.sweep(now_ms());
+                    (done, std::mem::take(&mut s.rate_dropped))
+                };
+                limited += n;
+                full += enqueue(&tx, done);
+                if (limited > 0 || full > 0) && logged.map_or(true, |t| t.elapsed() >= DROP_LOG_INTERVAL) {
+                    log::warn!(
+                        "conn_attempt: dropped {limited} records over {IP_ROWS_PER_MIN} per IP per minute \
+                         and {full} with the write queue full"
+                    );
+                    (limited, full, logged) = (0, 0, Some(Instant::now()));
                 }
             }
         });
         let db = self.db.clone();
         tokio::spawn(async move {
-            while let Some(f) = rx.recv().await {
-                if let Err(e) = write(&db, &f).await {
-                    log::error!("conn_attempt insert: {e}");
+            let mut batch = Vec::with_capacity(WRITE_BATCH);
+            while rx.recv_many(&mut batch, WRITE_BATCH).await > 0 {
+                if let Err(e) = write(&db, &batch).await {
+                    log::error!("conn_attempt insert of {} rows: {e}", batch.len());
+                }
+                batch.clear();
+            }
+        });
+        let db = self.db.clone();
+        tokio::spawn(async move {
+            let mut timer = tokio::time::interval(PURGE_INTERVAL);
+            loop {
+                timer.tick().await;
+                match purge(&db, now_ms()).await {
+                    Ok(0) => {}
+                    Ok(n) => log::info!("conn_attempt: deleted {n} rows older than 90 days"),
+                    Err(e) => log::error!("conn_attempt purge: {e}"),
                 }
             }
         });
@@ -752,7 +880,7 @@ mod tests {
         let mut s = TrackerState::default();
         s.punch_request(punch(a1(), Signal::PunchHole), T0);
         s.reply(reply(a1(), ReplyKind::PunchHoleSent), T0 + 500);
-        // W = 45 s (6 × 0.5 s + 10 s < 45 s)
+        // W = 45 s (6 × 0.5 s + 20 s < 45 s)
         assert!(sweep(&mut s, T0 + 500 + 45_000 - 1).is_empty());
         let f = only(&mut s, T0 + 500 + 45_000);
         assert_eq!(f.outcome, "direct_tcp");
@@ -868,10 +996,7 @@ mod tests {
     #[test]
     fn hbbs_failures_are_rejected() {
         let mut s = TrackerState::default();
-        for (i, signal) in [Signal::FailOffline, Signal::FailIdNotExist, Signal::FailLicense]
-            .into_iter()
-            .enumerate()
-        {
+        for (i, signal) in [Signal::FailOffline, Signal::FailIdNotExist].into_iter().enumerate() {
             let t = T0 + i as i64 * 10_000;
             s.punch_request(punch(a1(), signal), t);
             assert!(sweep(&mut s, t + PAIR_MERGE_MS - 1).is_empty());
@@ -879,6 +1004,114 @@ mod tests {
             assert_eq!(f.outcome, "rejected");
             assert_eq!(f.attempt.req.as_ref().unwrap().signal, signal);
         }
+        // Review C-13: a wrong licence key is not recorded at all.
+        s.punch_request(punch(a1(), Signal::FailLicense), T0 + 100_000);
+        assert!(s.attempts.is_empty() && s.by_pair.is_empty() && s.by_punch_addr.is_empty());
+    }
+
+    #[test]
+    fn stored_text_is_clipped() {
+        let mut c = "ab€".to_owned(); // € is 3 bytes: clipping to 3 must not split it
+        clip(&mut c, 3);
+        assert_eq!(c, "ab");
+        let mut c = "short".to_owned();
+        clip(&mut c, 64);
+        assert_eq!(c, "short");
+
+        let mut s = TrackerState::default();
+        let huge = "x".repeat(1 << 20);
+        let mut req = punch(a1(), Signal::PunchHole);
+        req.b_id = huge.clone();
+        req.a_version = huge.clone();
+        req.token = huge.clone();
+        s.punch_request(req, T0);
+        let mut r = reply(a1(), ReplyKind::PunchHoleSent);
+        r.b_id = huge.clone();
+        r.b_relay = huge.clone();
+        r.b_version = huge.clone();
+        s.reply(r, T0 + 100);
+        let mut rr = relay_req(p3(40003), "r1:21117");
+        rr.b_id = huge.clone();
+        rr.uuid = huge.clone();
+        rr.token = huge.clone();
+        s.request_relay(rr, T0 + 20_000);
+        let f = only(&mut s, T0 + 100_000);
+        let a = &f.attempt;
+        let req = a.req.as_ref().unwrap();
+        assert_eq!(f.outcome, "relay_failed", "reply and RequestRelay still match the clipped id");
+        assert_eq!((a.b_id.len(), req.b_id.len()), (MAX_PEER_ID_LEN, MAX_PEER_ID_LEN));
+        assert_eq!((req.a_version.len(), req.token.len(), a.token.len()), (64, 64, 64));
+        assert_eq!(a.b_relay.as_ref().map(String::len), Some(MAX_PEER_ID_LEN));
+        assert_eq!(a.b_version.as_ref().map(String::len), Some(64));
+        assert_eq!(a.relay_uuid.as_ref().map(String::len), Some(64));
+
+        // relay_only row and branch X.
+        let mut rr = relay_req(p3(40004), "r1:21117");
+        rr.b_id = huge.clone();
+        rr.uuid = huge.clone();
+        rr.token = huge.clone();
+        s.request_relay(rr, T0 + 200_000);
+        let f = only(&mut s, T0 + 300_000);
+        assert_eq!((f.attempt.b_id.len(), f.attempt.token.len()), (MAX_PEER_ID_LEN, 64));
+        assert_eq!(f.attempt.relay_uuid.as_ref().map(String::len), Some(64));
+        s.punch_request(punch(a1(), Signal::PunchHole), T0 + 400_000);
+        let mut x = branch_x(a1(), false);
+        x.uuid = huge.clone();
+        x.b_relay = huge.clone();
+        x.b_version = huge;
+        s.relay_response(x, T0 + 400_100);
+        let f = only(&mut s, T0 + 500_000);
+        assert_eq!(f.outcome, "relay");
+        assert_eq!(f.attempt.relay_uuid.as_ref().map(String::len), Some(64));
+        assert_eq!(f.attempt.b_relay.as_ref().map(String::len), Some(MAX_PEER_ID_LEN));
+        assert_eq!(f.attempt.b_version.as_ref().map(String::len), Some(64));
+    }
+
+    #[test]
+    fn new_rows_are_limited_per_ip() {
+        let mut s = TrackerState::default();
+        let other: SocketAddr = "9.9.9.9:40001".parse().unwrap();
+        let try_ids = |s: &mut TrackerState, a_addr: SocketAddr, from: u32, n: u32, now: i64| {
+            for i in from..from + n {
+                let mut req = punch(a_addr, Signal::FailIdNotExist);
+                req.b_id = format!("id-{i}");
+                s.punch_request(req, now);
+            }
+        };
+        // 61 different ids from one IP within a minute: 60 rows, one dropped.
+        try_ids(&mut s, a1(), 0, 61, T0);
+        assert_eq!((s.attempts.len(), s.rate_dropped), (60, 1));
+        // A merge into an existing row is not a new row; RequestRelay rows count too.
+        let mut req = punch("1.2.3.4:40002".parse().unwrap(), Signal::FailIdNotExist);
+        req.b_id = "id-0".to_owned();
+        s.punch_request(req, T0 + 1_000);
+        let mut rr = relay_req(p3(40003), "r1:21117");
+        rr.b_id = "relay-only".to_owned();
+        s.request_relay(rr, T0 + 1_000);
+        assert_eq!((s.attempts.len(), s.rate_dropped), (60, 2));
+        // Another IP has its own budget.
+        try_ids(&mut s, other, 0, 1, T0 + 1_000);
+        assert_eq!(s.attempts.len(), 61);
+        // The next minute starts over; the sweep forgets IPs whose minute is over.
+        assert_eq!(s.sweep(T0 + 59_999).len(), 61);
+        assert_eq!(s.rows_per_ip.len(), 2);
+        assert_eq!(s.sweep(T0 + 60_000).len(), 0);
+        assert_eq!(s.rows_per_ip.len(), 1, "9.9.9.9 started its minute 1 s later");
+        try_ids(&mut s, a1(), 100, 60, T0 + 60_000);
+        assert_eq!((s.attempts.len(), s.rate_dropped), (60, 2));
+    }
+
+    #[test]
+    fn full_write_queue_drops() {
+        let mut s = TrackerState::default();
+        for port in 40001..40004 {
+            let mut req = punch(SocketAddr::new(a1().ip(), port), Signal::FailOffline);
+            req.b_id = format!("id-{port}");
+            s.punch_request(req, T0);
+        }
+        let (tx, mut rx) = mpsc::channel(2);
+        assert_eq!(enqueue(&tx, s.sweep(T0 + 60_000)), 1);
+        assert!(rx.try_recv().is_ok() && rx.try_recv().is_ok() && rx.try_recv().is_err());
     }
 
     #[test]
@@ -971,12 +1204,12 @@ mod tests {
     #[test]
     fn request_relay_window_follows_punch_time() {
         let mut s = TrackerState::default();
-        // Punch took 10 s → W = 6 × 10 + 10 = 70 s.
+        // Punch took 10 s → W = 6 × 10 + 20 = 80 s.
         s.punch_request(punch(a1(), Signal::PunchHole), T0);
         s.reply(reply(a1(), ReplyKind::PunchHoleSent), T0 + 10_000);
-        s.request_relay(relay_req(p3(40003), "r1:21117"), T0 + 10_000 + 70_000);
-        s.relay_response(fallback_resp(p3(40003)), T0 + 80_200);
-        assert_eq!(sweep(&mut s, T0 + 100_000), ["relay"]);
+        s.request_relay(relay_req(p3(40003), "r1:21117"), T0 + 10_000 + 80_000);
+        s.relay_response(fallback_resp(p3(40003)), T0 + 90_200);
+        assert_eq!(sweep(&mut s, T0 + 110_000), ["relay"]);
 
         // Fast punch → W = 45 s; a RequestRelay after that is relay_only, and the punch is direct.
         s.punch_request(punch(a1(), Signal::PunchHole), T0 + 200_000);
@@ -985,6 +1218,14 @@ mod tests {
         let mut v: Vec<_> = sweep(&mut s, T0 + 300_000);
         v.sort();
         assert_eq!(v, ["direct_tcp", "relay_failed"]);
+
+        // Review C-12: 3 s of connect + KeyExchange that hbbs doesn't see, then 5 s request → reply
+        // as hbbs sees it. A's direct timeout is 6 × 8 s = 48 s after the reply: still the same attempt
+        // (W = 6 × 5 + 20 = 50 s).
+        s.punch_request(punch(a1(), Signal::PunchHole), T0 + 400_000);
+        s.reply(reply(a1(), ReplyKind::PunchHoleSent), T0 + 405_000);
+        s.request_relay(relay_req(p3(40005), "r1:21117"), T0 + 405_000 + 48_000);
+        assert_eq!(sweep(&mut s, T0 + 500_000), ["relay_failed"]);
     }
 
     #[test]
@@ -1051,6 +1292,47 @@ mod tests {
     }
 
     #[test]
+    fn request_relay_merging_is_capped() {
+        // Review C-9: a RequestRelay every 15 s from new ports of one IP to an unknown id. Each row
+        // takes at most 3 of them within 60 s of its first, and is finalized; memory stays bounded.
+        let mut s = TrackerState::default();
+        let mut finalized = Vec::new();
+        for i in 0..2_000i64 {
+            let now = T0 + i * 15_000;
+            let mut rr = relay_req(p3(1_024 + i as u16), "r1:21117");
+            rr.b_id = "no-such-id".to_owned();
+            rr.found_in_memory = false;
+            s.request_relay(rr, now);
+            finalized.extend(s.sweep(now));
+            assert!(s.attempts.len() <= 2, "{}", s.attempts.len());
+            assert!(s.by_relay_addr.len() <= 6, "{}", s.by_relay_addr.len());
+            assert!(s.attempts.values().all(|a| a.relay_keys.len() <= 3 && a.relay_req_count <= 3));
+        }
+        assert!(finalized.len() >= 600, "{}", finalized.len());
+        assert!(finalized.iter().all(|f| f.outcome == "relay_failed" && f.attempt.relay_req_count == 3));
+
+        // A punch attempt also takes at most 3, then a new relay_only row starts.
+        let mut s = TrackerState::default();
+        s.punch_request(punch(a1(), Signal::PunchHole), T0);
+        s.reply(reply(a1(), ReplyKind::PunchHoleSent), T0 + 1_000);
+        for (i, port) in (40003..40007).enumerate() {
+            s.request_relay(relay_req(p3(port), "r1:21117"), T0 + 20_000 + i as i64 * 1_000);
+        }
+        let mut out: Vec<_> = s
+            .sweep(T0 + 100_000)
+            .into_iter()
+            .map(|f| (f.attempt.relay_only(), f.attempt.relay_req_count, f.outcome))
+            .collect();
+        out.sort();
+        assert_eq!(out, [(false, 3, "relay_failed"), (true, 1, "relay_failed")]);
+
+        // More than 60 s after the first RequestRelay: a new row, even below 3.
+        s.request_relay(relay_req(p3(40010), "r1:21117"), T0 + 200_000);
+        s.request_relay(relay_req(p3(40011), "r1:21117"), T0 + 260_001);
+        assert_eq!(s.attempts.len(), 2);
+    }
+
+    #[test]
     fn replies_to_unknown_or_finalized_attempts_are_ignored() {
         let mut s = TrackerState::default();
         s.reply(reply(a1(), ReplyKind::PunchHoleSent), T0);
@@ -1065,9 +1347,28 @@ mod tests {
     }
 
     async fn insert(db: &SqlitePool, s: &mut TrackerState, now: i64) {
-        for f in s.sweep(now) {
-            write(db, &f).await.unwrap();
+        write(db, &s.sweep(now)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn old_rows_are_purged() {
+        let (_dir, db) = crate::testutil::pool().await;
+        let now = T0 + RETENTION_MS + 50_000;
+        let mut s = TrackerState::default();
+        // Started 90 days + 10 s before `now`, exactly 90 days before, and recently.
+        for (i, t) in [T0 + 40_000, now - RETENTION_MS, now - 1_000].into_iter().enumerate() {
+            let mut req = punch(a1(), Signal::FailOffline);
+            req.b_id = format!("id-{i}");
+            s.punch_request(req, t);
+            insert(&db, &mut s, t + PAIR_MERGE_MS).await;
         }
+        assert_eq!(purge(&db, now).await.unwrap(), 1);
+        let left: Vec<String> = sqlx::query_scalar("select b_id from conn_attempt order by b_id")
+            .fetch_all(&db)
+            .await
+            .unwrap();
+        assert_eq!(left, ["id-1", "id-2"]);
+        assert_eq!(purge(&db, now).await.unwrap(), 0);
     }
 
     #[tokio::test]

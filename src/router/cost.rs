@@ -88,6 +88,15 @@ impl Carriers {
     pub fn group(&self, asn: u32) -> String {
         self.0.get(&asn).cloned().unwrap_or_else(|| format!("AS{asn}"))
     }
+
+    /// A configured `carrier` as a group key: `AS<n>` goes through [`Self::group`], so `AS4837`
+    /// and a client in AS4837 are both `cn-unicom`; anything else is a group name already.
+    fn key(&self, carrier: String) -> String {
+        match carrier.strip_prefix("AS").and_then(|n| n.parse().ok()) {
+            Some(asn) => self.group(asn),
+            None => carrier,
+        }
+    }
 }
 
 fn non_empty(s: &str) -> Option<String> {
@@ -132,7 +141,7 @@ pub(crate) fn client_loc(
             .map(|s| Loc {
                 pos: Some((s.lat, s.lon)),
                 country: non_empty(&s.country),
-                carrier: non_empty(&s.carrier),
+                carrier: non_empty(&s.carrier).map(|c| carriers.key(c)),
             })
             .unwrap_or_default();
     }
@@ -159,7 +168,9 @@ pub(crate) fn relay_loc(r: &RelayConfig, rec: Option<GeoRecord>, carriers: &Carr
     Loc {
         pos: r.lat.or(rec.lat).zip(r.lon.or(rec.lon)),
         country: override_str(&r.country).or(rec.country.filter(|c| !c.is_empty())),
-        carrier: override_str(&r.carrier).or(rec.asn.map(|asn| carriers.group(asn))),
+        carrier: override_str(&r.carrier)
+            .map(|c| carriers.key(c))
+            .or(rec.asn.map(|asn| carriers.group(asn))),
     }
 }
 
@@ -406,5 +417,35 @@ mod tests {
         r.country = Some("HK".to_owned());
         assert!(!needs_lookup(&r));
         assert_eq!(relay_loc(&r, None, &carriers), loc(22.3, 114.2, "HK", "AS9304"));
+    }
+
+    #[test]
+    fn configured_asn_carriers_are_groups() {
+        // Review C-10: `carrier = "AS4837"` is the same group as a client in AS4837.
+        let routing = Config::default().routing;
+        let carriers = Carriers::new(&BTreeMap::from([(64512, "mine".to_owned())]));
+        let mut r = RelayConfig::new("r".to_owned());
+        (r.lat, r.lon, r.country) = (Some(1.0), Some(2.0), Some("CN".to_owned()));
+        let client = client_loc("1.2.3.4".parse().unwrap(), Some(&Fake), &carriers, None);
+        for (carrier, group) in [
+            ("AS4837", "cn-unicom"),
+            ("AS64512", "mine"),
+            ("AS13335", "AS13335"),
+            ("cn-unicom", "cn-unicom"),
+            ("ASx", "ASx"),
+        ] {
+            r.carrier = Some(carrier.to_owned());
+            assert_eq!(relay_loc(&r, None, &carriers).carrier.as_deref(), Some(group), "{carrier}");
+        }
+        r.carrier = Some("AS4837".to_owned());
+        assert_eq!(penalty(&routing, &client, &relay_loc(&r, None, &carriers), false), 0.0);
+        let server = Location {
+            lat: 1.0,
+            lon: 2.0,
+            country: "CN".to_owned(),
+            carrier: "AS4134".to_owned(),
+        };
+        let private = client_loc("10.0.0.1".parse().unwrap(), None, &carriers, Some(&server));
+        assert_eq!(private.carrier.as_deref(), Some("cn-telecom"));
     }
 }

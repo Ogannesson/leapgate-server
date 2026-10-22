@@ -272,6 +272,142 @@ async fn stale_round_is_discarded() {
     assert_eq!(relays.list[0].last, None);
 }
 
+/// MaxMind DB encoding (https://maxmind.github.io/MaxMind-DB/): a control byte (type, size), then the payload.
+fn mm_field(ty: u8, size: usize, payload: &[u8]) -> Vec<u8> {
+    assert!(size < 29);
+    let mut out = if ty <= 7 { vec![ty << 5 | size as u8] } else { vec![size as u8, ty - 7] };
+    out.extend_from_slice(payload);
+    out
+}
+
+fn mm_str(s: &str) -> Vec<u8> {
+    mm_field(2, s.len(), s.as_bytes())
+}
+
+fn mm_double(v: f64) -> Vec<u8> {
+    mm_field(3, 8, &v.to_be_bytes())
+}
+
+/// Unsigned integer of type `ty` (5 uint16, 6 uint32, 9 uint64), big-endian without leading zeros.
+fn mm_uint(ty: u8, v: u64) -> Vec<u8> {
+    let bytes = v.to_be_bytes();
+    let skip = bytes.iter().take_while(|b| **b == 0).count();
+    mm_field(ty, 8 - skip, &bytes[skip..])
+}
+
+fn mm_map(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    let mut out = mm_field(7, entries.len(), &[]);
+    for (k, v) in entries {
+        out.extend(mm_str(k));
+        out.extend_from_slice(v);
+    }
+    out
+}
+
+/// A minimal IPv4 MaxMind DB: one search tree node whose two 24-bit records both point at `data`, so
+/// every address has that record.
+fn mmdb(database_type: &str, data: &[u8]) -> Vec<u8> {
+    // Data pointers are node_count + 16 + offset.
+    let mut out = [17u32, 17].iter().flat_map(|p| p.to_be_bytes()[1..].to_vec()).collect::<Vec<u8>>();
+    out.extend_from_slice(&[0; 16]);
+    out.extend_from_slice(data);
+    out.extend_from_slice(b"\xab\xcd\xefMaxMind.com");
+    out.extend(mm_map(&[
+        ("binary_format_major_version", mm_uint(5, 2)),
+        ("binary_format_minor_version", mm_uint(5, 0)),
+        ("build_epoch", mm_uint(9, 1_700_000_000)),
+        ("database_type", mm_str(database_type)),
+        ("description", mm_map(&[])),
+        ("ip_version", mm_uint(5, 4)),
+        ("languages", mm_field(11, 0, &[])),
+        ("node_count", mm_uint(6, 1)),
+        ("record_size", mm_uint(5, 24)),
+    ]));
+    out
+}
+
+/// A city database placing every address at (`lat`, `lon`) in `country`.
+fn city_mmdb(lat: f64, lon: f64, country: &str) -> Vec<u8> {
+    let data = mm_map(&[
+        ("country", mm_map(&[("iso_code", mm_str(country))])),
+        ("location", mm_map(&[("latitude", mm_double(lat)), ("longitude", mm_double(lon))])),
+    ]);
+    mmdb("Test-City", &data)
+}
+
+/// An ASN database putting every address in `asn`.
+fn asn_mmdb(asn: u32) -> Vec<u8> {
+    mmdb("Test-ASN", &mm_map(&[("autonomous_system_number", mm_uint(6, asn.into()))]))
+}
+
+#[tokio::test]
+async fn start_removes_old_months() {
+    // Review C-11: months a hot swap could not delete, or that `geo update` left, go at the next start.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    for (name, data) in [
+        ("dbip-city-lite-2026-09.mmdb", city_mmdb(1.0, 2.0, "CN")),
+        ("dbip-city-lite-2026-10.mmdb", city_mmdb(1.0, 2.0, "CN")),
+        ("dbip-asn-lite-2026-08.mmdb", asn_mmdb(4837)),
+        ("dbip-asn-lite-2026-10.mmdb", asn_mmdb(4837)),
+        ("dbip-asn-lite-2026-11.mmdb.part", vec![0]),
+        ("GeoLite2-City.mmdb", vec![0]),
+    ] {
+        std::fs::write(dir.join(name), data).unwrap();
+    }
+    let (_db_dir, db) = crate::testutil::pool().await;
+    let mut cfg = Config::default();
+    cfg.geo.dir = dir.to_string_lossy().into_owned();
+    cfg.geo.auto_update = false;
+    let r = Arc::new(Router::new(db, Arc::new(cfg)));
+    r.spawn_tasks();
+    let loaded = r.geo_snapshot().unwrap();
+    assert_eq!(loaded.info.months, Some((geo::Ym::new(2026, 10), geo::Ym::new(2026, 10))));
+    assert_eq!(loaded.db.locate(ip("8.8.8.8")).unwrap().asn, Some(4837));
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["GeoLite2-City.mmdb", "dbip-asn-lite-2026-10.mmdb", "dbip-city-lite-2026-10.mmdb"]);
+}
+
+#[test]
+fn manual_files_are_mapped_from_a_private_copy() {
+    // Review C-4/C-15: overwriting a manual file in place (cp, curl -o) must not touch what is mapped.
+    // Without the copy, the reads below would hit pages past the shrunken file's end: SIGBUS.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let cfg = GeoConfig {
+        dir: dir.to_string_lossy().into_owned(),
+        source: GeoSource::Manual,
+        ..Default::default()
+    };
+    std::fs::write(dir.join("GeoLite2-City.mmdb"), city_mmdb(1.0, 2.0, "CN")).unwrap();
+    std::fs::write(dir.join("GeoLite2-ASN.mmdb"), asn_mmdb(4837)).unwrap();
+    let (db, info) = geo::load(&cfg).unwrap();
+    assert_eq!(info.city, dir.join("GeoLite2-City.mmdb"), "reported under the operator's name");
+    assert!(dir.join(".loaded-GeoLite2-City.mmdb").is_file() && dir.join(".loaded-GeoLite2-ASN.mmdb").is_file());
+    // std::fs::write truncates and rewrites the same inode, like cp.
+    std::fs::write(dir.join("GeoLite2-City.mmdb"), b"x").unwrap();
+    std::fs::write(dir.join("GeoLite2-ASN.mmdb"), b"x").unwrap();
+    let rec = db.locate(ip("8.8.8.8")).unwrap();
+    assert_eq!((rec.lat, rec.country.as_deref(), rec.asn), (Some(1.0), Some("CN"), Some(4837)));
+    // A broken update fails to load and leaves the loaded databases alone.
+    assert!(geo::load(&cfg).is_err());
+    assert_eq!(db.locate(ip("8.8.8.8")).unwrap().asn, Some(4837));
+    // The next good file is copied again; the old mapping still reads the old data.
+    std::fs::write(dir.join("GeoLite2-City.mmdb"), city_mmdb(3.0, 4.0, "DE")).unwrap();
+    std::fs::write(dir.join("GeoLite2-ASN.mmdb"), asn_mmdb(3320)).unwrap();
+    let (db2, _) = geo::load(&cfg).unwrap();
+    assert_eq!(db2.locate(ip("8.8.8.8")).unwrap().country.as_deref(), Some("DE"));
+    assert_eq!(db.locate(ip("8.8.8.8")).unwrap().country.as_deref(), Some("CN"));
+    // No temporary files left.
+    assert!(!std::fs::read_dir(dir)
+        .unwrap()
+        .any(|e| e.unwrap().file_name().to_string_lossy().ends_with(".part")));
+}
+
 /// Downloads the real DB-IP Lite files (about 65 MB). Run by hand:
 /// `cargo test --lib router::tests::real_dbip_download -- --ignored --nocapture`
 #[tokio::test]

@@ -313,11 +313,19 @@ impl Router {
     }
 
     /// Background tasks (health check, GeoIP update), spawned on the server's runtime. Server only:
-    /// removes leftover `*.part` files and loads the local GeoIP files first.
+    /// removes leftover `*.part` files, loads the local GeoIP files and (dbip) removes the other months
+    /// first.
     pub fn spawn_tasks(self: &Arc<Self>) {
-        geo::remove_parts(Path::new(&self.cfg.geo.dir));
+        let dir = Path::new(&self.cfg.geo.dir);
+        geo::remove_parts(dir);
         match geo::load(&self.cfg.geo) {
-            Ok((db, info)) => self.install(db, info),
+            Ok((db, info)) => {
+                self.install(db, info.clone());
+                if self.cfg.geo.source == GeoSource::Dbip {
+                    // Ones a hot swap failed to delete, or `geo update` downloaded while we were down.
+                    geo::remove_old_months(dir, &info);
+                }
+            }
             Err(e) => log::warn!("GeoIP not loaded ({e}); relays are chosen round-robin until it is"),
         }
         let me = self.clone();

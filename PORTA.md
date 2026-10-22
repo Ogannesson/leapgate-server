@@ -287,7 +287,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 - 健康检查：配置载入时（启动、控制台 `rs` 替换）把全部中继视为可达；之后每 3 秒对每台中继做一次 TCP 建连（3 秒超时），只有一台也要查；记录是否可达和建连耗时；某一轮全部失败时保留上一轮的可达集合（和原版一致）。
 - GeoIP：`maxminddb`（开 `mmap`），文件名规则见 §5。没有库时路由退回轮询，不阻塞启动。
   - `source = "dbip"` 且 `auto_update`：启动后在后台检查、此后每天检查一次。want = 当前 **UTC** 年月；本地 city 和 asn 都 ≥ want 就跳过。否则下载 `dbip-{city,asn}-lite-YYYY-MM.mmdb.gz`；当月 404 时，本地没有库或本地库比上月还旧才下载上月，本地已有上月文件就保持不动、次日再试。解压到 `*.part`、用 maxminddb 打开并抽查几个 IP 通过后原子改名并热切换。下载用已有的 `reqwest` + `flate2`（笔记 06 §3）。
-  - `source = "manual"`：每天检查一次两个文件的 mtime，变了就按同样的打开、抽查流程重新加载并热切换；抽查失败保留旧库。
+  - `source = "manual"`：每天检查一次两个文件的 mtime，变了就按同样的打开、抽查流程重新加载并热切换；抽查失败保留旧库。每次加载都先把文件复制成同目录的私有副本 `.loaded-<文件名>`（先写临时名再改名）、映射副本，运维用 cp、curl -o 原地覆盖文件也不会让进程因 SIGBUS 崩溃。
   - 清理：服务进程启动时删除目录里残留的 `*.part`；热切换成功后删除旧月份的 mmdb（删不掉就忽略，下次启动再删）；任何一步失败都删掉本次的 `*.part`，保留旧库，次日重试。只有服务进程做清理。
   - 命令行 `geo lookup` 用同一个加载函数找文件。
 - 每次决策打一行 debug 日志：双方国家/运营商组、候选代价、选中的中继和 `reason`。
@@ -298,8 +298,9 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 - 按笔记 02 §4.4 实现：内存跟踪器（键 `try_into_v4(A:p1)`、`(A 公网 IP, B id)`、`try_into_v4(A:p3)`），每 5 秒扫一遍把到期的记录定稿写入 `conn_attempt`，定稿规则照笔记，下面几条是对笔记的补充和更正。热路径（H1~H5）只做内存操作，不 await 数据库。
 - `a_user`/`a_device_id`：H1 只把 `PunchHoleRequest.token` 原串存进内存记录，反查放在后台（定稿写库时）调 `auth::token_owner`（async）；`a_user` 存 `user.name`，`a_device_id` 存 `token.device_id`；未登录或令牌已失效时两者都是 NULL。
 - `outcome` 取值全集：`rejected`、`no_reply`、`relay`、`relay_or_v6`、`relay_failed`、`relay_unmatched`、`direct_lan`、`direct_tcp`、`direct_tcp_or_v6`。
-- 窗口（命名常量，标注"待实测"）：直连判定窗口 `W = max(45 秒, 6 × (reply_at − started_at) + 10 秒)`（A 的直连超时 = 打洞耗时 × 6，没有封顶）；H5 匹配时要求 `RequestRelay` 落在 `reply_at + W` 以内；匹配到 `RequestRelay` 的记录，等最后一次 `relay_req_at` + 20 秒后才定稿，那时有 `relay_resp_at` 记 `relay`，没有记 `relay_failed`。
+- 窗口（命名常量，标注"待实测"）：直连判定窗口 `W = max(45 秒, 6 × (reply_at − started_at) + 20 秒)`（A 的直连超时 = 打洞耗时 × 6，没有封顶；客户端的打洞耗时还包含连 hbbs 和 KeyExchange 的时间，hbbs 看不到，20 秒余量约能覆盖 3 秒，实测时要专门覆盖慢建连）；H5 匹配时要求 `RequestRelay` 落在 `reply_at + W` 以内；一条记录最多合并 3 次 `RequestRelay`（客户端最多回落 3 次），而且只在它第一次 `relay_req_at` 之后 60 秒内合并，超出的另起一条 `relay_only`；匹配到 `RequestRelay` 的记录，等最后一次 `relay_req_at` + 20 秒后才定稿，那时有 `relay_resp_at` 记 `relay`，没有记 `relay_failed`。
 - H5 没匹配到打洞记录：写一行 `signal='relay_only'`：`started_at`、`relay_req_at` 取收到的时刻；`a_ip`/`a_port` 取 A:p3；`via` 照实；`b_id = rf.id`；`conn_type`、`a_nat_type`、`a_force_relay`、`a_has_v6`、`server_forced_relay` 填 0；`a_user` 照常反查。有 `relay_resp_at` 记 `relay_unmatched`，没有记 `relay_failed`。
+- 防滥用（这些请求都不认证；常量写死，不做配置）：许可证不符（`LICENSE_MISMATCH`）的请求不记录，所以不会出现 `signal='fail_license'`；`b_id` 和中继地址截到 253 字节，版本号、令牌、uuid 截到 64 字节；同一来源 IP 每分钟最多新建 60 条记录，超出的丢弃并计数；写库队列最多 1 万条，满了丢弃并计数，两种丢弃每分钟最多打一条 warn 日志；队列里的定稿记录成批（每批最多 1000 条）在一个事务里写入；每天删除 `started_at` 早于 90 天的行。
 - 统计查询（给命令行）：按时间范围算中继回落率 = count(outcome IN (`relay`,`relay_or_v6`)) / count(outcome IN (`relay`,`relay_or_v6`,`direct_lan`,`direct_tcp`,`direct_tcp_or_v6`))；`rejected`、`no_reply`、`relay_failed`、`relay_unmatched` 不进分子分母，只在分项计数里列出。另列 `relay_offered` 非空、`b_relay` 非空且两者不相等的次数（被控端本地写死了中继）。
 
 ## 9. HTTP API 通则

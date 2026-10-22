@@ -139,9 +139,28 @@ impl fmt::Display for GeoInfo {
 const PROBES: [IpAddr; 2] = [IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)), IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1))];
 
 fn open(path: &Path) -> ResultType<Reader<Mmap>> {
-    // SAFETY: database files are only replaced by renaming a new file over them, never modified in
-    // place (our downloads, and geoipupdate for manual files).
+    // SAFETY: the files we map are only replaced by renaming a new file over them, never modified in
+    // place: our DB-IP downloads, and for manual files our private copies (`private_copy`).
     unsafe { Reader::open_mmap(path) }.map_err(|e| anyhow!("{}: {e}", path.display()))
+}
+
+/// `source = "manual"`: operators may update a file in place (cp, curl -o), and a mapped file that
+/// shrinks under us kills the process with SIGBUS. So we map `.loaded-<name>` next to it instead,
+/// copied on every load under a temporary name and renamed into place.
+fn private_copy(path: &Path) -> ResultType<PathBuf> {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        bail!("{}: not a file path", path.display());
+    };
+    let name = name.to_string_lossy();
+    let copy = dir.join(format!(".loaded-{name}"));
+    // The pid keeps the server and a `geo lookup` from writing the same temporary file.
+    let part = dir.join(format!(".loaded-{name}.{}.part", std::process::id()));
+    let res = std::fs::copy(path, &part).and_then(|_| std::fs::rename(&part, &copy));
+    if let Err(e) = res {
+        std::fs::remove_file(&part).ok();
+        bail!("{}: copy to {}: {e}", path.display(), copy.display());
+    }
+    Ok(copy)
 }
 
 /// Opens a city database and checks it: type contains "City", and a probe has a position and country.
@@ -247,8 +266,8 @@ pub(crate) fn load(cfg: &GeoConfig) -> ResultType<(GeoDb, GeoInfo)> {
             let (city_path, asn_path) = manual_paths(cfg);
             let mtimes = manual_mtimes(cfg);
             let db = GeoDb {
-                city: open_city(&city_path)?,
-                asn: open_asn(&asn_path)?,
+                city: open_city(&private_copy(&city_path)?)?,
+                asn: open_asn(&private_copy(&asn_path)?)?,
             };
             let info = GeoInfo {
                 city: city_path,
@@ -272,8 +291,8 @@ pub(crate) fn remove_parts(dir: &Path) {
     }
 }
 
-/// After a hot swap: removes the DB-IP files of other months than the loaded ones. Failures are
-/// ignored (Windows refuses while a file is mapped); the next start tries again.
+/// At server start and after a hot swap: removes the DB-IP files of other months than the loaded ones.
+/// Failures are ignored (Windows refuses while a file is mapped); the next start tries again.
 pub(crate) fn remove_old_months(dir: &Path, keep: &GeoInfo) {
     for kind in [Kind::City, Kind::Asn] {
         for (_, path) in dbip_files(dir, kind) {
