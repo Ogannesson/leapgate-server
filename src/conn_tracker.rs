@@ -14,7 +14,7 @@ use hbb_common::{
 use sqlx::SqlitePool;
 use std::{
     collections::HashMap,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
 };
@@ -44,10 +44,15 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 /// Versions, tokens (43 bytes) and uuids are clipped to this many bytes; ids and relay hosts to
 /// `MAX_PEER_ID_LEN`. Frames on 21116 have no size limit.
 const MAX_TEXT_LEN: usize = 64;
-/// New rows per source IP per minute; more are dropped and counted. Repeats merge into one row, so a
+/// New rows per source per minute; more are dropped and counted. Repeats merge into one row, so a
 /// client needs a few at most; this is upstream's `RegisterPk` limit of 30 per window, doubled.
+/// A source is one IPv4 address or one IPv6 /64 (see `source_key`).
 const IP_ROWS_PER_MIN: u32 = 60;
 const IP_WINDOW_MS: i64 = 60_000;
+/// New rows per minute from all sources together, a backstop for requests spread over many sources
+/// (review R2-4). 10 a second is far above what a personal deployment makes (a few hundred a day) and
+/// caps the table at about 864k new rows a day.
+const TOTAL_ROWS_PER_MIN: u32 = 600;
 /// Finalized attempts waiting for the writer; when full, new ones are dropped and counted.
 const WRITE_QUEUE: usize = 10_000;
 /// At most this many rows per insert transaction.
@@ -307,10 +312,32 @@ struct TrackerState {
     /// try_into_v4(A:p3) → attempt.
     by_relay_addr: HashMap<SocketAddr, u64>,
     attempts: HashMap<u64, Attempt>,
-    /// Source IP → (start of its current minute, new rows in it), for `IP_ROWS_PER_MIN`.
+    /// `source_key` → (start of its current minute, new rows in it), for `IP_ROWS_PER_MIN`.
     rows_per_ip: HashMap<IpAddr, (i64, u32)>,
-    /// New rows refused by the per-IP limit, taken by the sweeper.
+    /// (Start of the current minute, new rows in it) over all sources, for `TOTAL_ROWS_PER_MIN`.
+    rows_total: (i64, u32),
+    /// New rows refused by the per-source limit, taken by the sweeper.
     rate_dropped: u64,
+    /// New rows refused by the total limit, taken by the sweeper.
+    total_dropped: u64,
+}
+
+/// What `IP_ROWS_PER_MIN` counts per: an IPv4 address, or the /64 of an IPv6 address (any host
+/// gets at least a /64, so counting /128s would give one host 2^64 budgets; review R2-4).
+fn source_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & (u128::MAX << 64))),
+    }
+}
+
+/// Whether a fixed one-minute window `(start, new rows)` has room for another row; starts a new
+/// window when the current one is over.
+fn has_room(window: &mut (i64, u32), now: i64, max: u32) -> bool {
+    if now - window.0 >= IP_WINDOW_MS {
+        *window = (now, 0);
+    }
+    window.1 < max
 }
 
 /// Truncates `s` to at most `max` bytes, at a char boundary.
@@ -325,18 +352,21 @@ fn clip(s: &mut String, max: usize) {
 }
 
 impl TrackerState {
-    /// Adds a new attempt (started now) unless its source IP is over `IP_ROWS_PER_MIN`.
+    /// Adds a new attempt (started now) unless its source is over `IP_ROWS_PER_MIN` or all sources
+    /// together are over `TOTAL_ROWS_PER_MIN`. A dropped row counts against neither limit.
     fn add(&mut self, attempt: Attempt) {
         let now = attempt.started_at;
-        let (start, count) = self.rows_per_ip.entry(attempt.a_addr.ip()).or_insert((now, 0));
-        if now - *start >= IP_WINDOW_MS {
-            (*start, *count) = (now, 0);
-        }
-        if *count >= IP_ROWS_PER_MIN {
+        let source = self.rows_per_ip.entry(source_key(attempt.a_addr.ip())).or_insert((now, 0));
+        if !has_room(source, now, IP_ROWS_PER_MIN) {
             self.rate_dropped += 1;
             return;
         }
-        *count += 1;
+        if !has_room(&mut self.rows_total, now, TOTAL_ROWS_PER_MIN) {
+            self.total_dropped += 1;
+            return;
+        }
+        source.1 += 1;
+        self.rows_total.1 += 1;
         self.next_id += 1;
         let id = self.next_id;
         self.by_pair
@@ -704,24 +734,29 @@ impl ConnTracker {
         let this = self.clone();
         tokio::spawn(async move {
             let mut timer = tokio::time::interval(SWEEP_INTERVAL);
-            // Dropped since the last log line: over the per-IP limit, and with the write queue full.
-            let (mut limited, mut full) = (0u64, 0u64);
+            // Dropped since the last log line: over the per-source limit, over the total limit, and
+            // with the write queue full.
+            let (mut limited, mut over_total, mut full) = (0u64, 0u64, 0u64);
             let mut logged: Option<Instant> = None;
             loop {
                 timer.tick().await;
-                let (done, n) = {
+                let (done, n, t) = {
                     let mut s = this.state.lock().unwrap();
                     let done = s.sweep(now_ms());
-                    (done, std::mem::take(&mut s.rate_dropped))
+                    (done, std::mem::take(&mut s.rate_dropped), std::mem::take(&mut s.total_dropped))
                 };
                 limited += n;
+                over_total += t;
                 full += enqueue(&tx, done);
-                if (limited > 0 || full > 0) && logged.map_or(true, |t| t.elapsed() >= DROP_LOG_INTERVAL) {
+                if (limited > 0 || over_total > 0 || full > 0)
+                    && logged.map_or(true, |t| t.elapsed() >= DROP_LOG_INTERVAL)
+                {
                     log::warn!(
-                        "conn_attempt: dropped {limited} records over {IP_ROWS_PER_MIN} per IP per minute \
+                        "conn_attempt: dropped {limited} records over {IP_ROWS_PER_MIN} per source per minute, \
+                         {over_total} over {TOTAL_ROWS_PER_MIN} per minute in total \
                          and {full} with the write queue full"
                     );
-                    (limited, full, logged) = (0, 0, Some(Instant::now()));
+                    (limited, over_total, full, logged) = (0, 0, 0, Some(Instant::now()));
                 }
             }
         });
@@ -1099,6 +1134,50 @@ mod tests {
         assert_eq!(s.rows_per_ip.len(), 1, "9.9.9.9 started its minute 1 s later");
         try_ids(&mut s, a1(), 100, 60, T0 + 60_000);
         assert_eq!((s.attempts.len(), s.rate_dropped), (60, 2));
+    }
+
+    /// One new row (a fresh b_id, so nothing merges) from `a_addr` at `now`.
+    fn new_row(s: &mut TrackerState, a_addr: SocketAddr, i: u32, now: i64) {
+        let mut req = punch(a_addr, Signal::FailIdNotExist);
+        req.b_id = format!("id-{i}");
+        s.punch_request(req, now);
+    }
+
+    #[test]
+    fn ipv6_rows_are_limited_per_64() {
+        // Review R2-4: 61 different addresses of one /64 share one budget of 60.
+        let mut s = TrackerState::default();
+        for i in 0..61u32 {
+            let ip = Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 0, i as u16, 0, 1);
+            new_row(&mut s, SocketAddr::new(ip.into(), 40001), i, T0);
+        }
+        assert_eq!((s.attempts.len(), s.rate_dropped, s.total_dropped), (60, 1, 0));
+        assert_eq!(s.rows_per_ip.len(), 1);
+        // The next /64 has its own budget.
+        new_row(&mut s, "[2001:db8:1:3::1]:40001".parse().unwrap(), 100, T0);
+        assert_eq!(s.attempts.len(), 61);
+        let key = |s: &str| source_key(s.parse().unwrap()).to_string();
+        assert_eq!(key("2001:db8:1:2:aaaa:bbbb:cccc:dddd"), "2001:db8:1:2::");
+        assert_eq!(key("1.2.3.4"), "1.2.3.4");
+    }
+
+    #[test]
+    fn total_new_rows_are_capped() {
+        // Review R2-4: 11 sources × 60 rows within a minute: the total stops at 600.
+        let mut s = TrackerState::default();
+        let src = |n: u8| SocketAddr::new(IpAddr::from([10, 0, 0, n]), 40001);
+        for n in 0..11u8 {
+            for i in 0..60u32 {
+                new_row(&mut s, src(n), u32::from(n) * 1_000 + i, T0 + i64::from(n));
+            }
+        }
+        assert_eq!((s.attempts.len(), s.rate_dropped, s.total_dropped), (600, 0, 60));
+        // Rows dropped by the total do not use up their source's budget: the next minute it gets 60.
+        assert_eq!(s.sweep(T0 + 60_000).len(), 600);
+        for i in 0..61u32 {
+            new_row(&mut s, src(10), 20_000 + i, T0 + 60_000);
+        }
+        assert_eq!((s.attempts.len(), s.rate_dropped, s.total_dropped), (60, 1, 60));
     }
 
     #[test]
