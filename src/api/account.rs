@@ -353,7 +353,9 @@ pub(crate) async fn login(State(state): State<AppState>, body: Bytes) -> ApiResu
     tx.commit().await?;
 
     // Only a device registered with hbbs, with a matching uuid, is bound: someone else's device is
-    // not taken over, and made-up ids add no device rows (§11).
+    // not taken over, and ids hbbs does not know add no device rows (§11). Registering is not
+    // authenticated, so a made-up id can still be bound here; the row kept for it goes once this
+    // user has no token on it left (`device::make_room`, at most 50 tokens a user; §9.3).
     if !req.id.is_empty() && uuid_matches(&state.db, &req.id, Some(&req.uuid)).await? {
         sqlx::query(
             "insert into device(id, uuid, user_id, first_seen_at, last_seen_at) values(?, ?, ?, ?, ?)
@@ -391,25 +393,34 @@ pub(crate) async fn current_user(
     }
 }
 
-/// `POST /api/logout`: deletes the token used and the user's older tokens from the same device.
+/// `POST /api/logout`: deletes the token used and the user's tokens from the same device that are
+/// older and unused since it was issued.
 pub(crate) async fn logout(
     State(state): State<AppState>,
     user: CurrentUser,
     _body: Bytes,
 ) -> ApiResult {
-    let device_id: Option<String> =
-        sqlx::query_scalar("delete from token where token_hash = ? returning device_id")
+    let used: Option<(String, i64)> =
+        sqlx::query_as("delete from token where token_hash = ? returning device_id, created_at")
             .bind(&user.token_hash)
             .fetch_optional(&state.db)
             .await?;
-    if let Some(device_id) = device_id.filter(|d| !d.is_empty()) {
-        // The client holds only its latest token, so earlier ones from this device are dead; left
-        // in place, the next heartbeat would bind the device right back to this user (§11).
-        sqlx::query("delete from token where user_id = ? and device_id = ?")
-            .bind(user.id)
-            .bind(&device_id)
-            .execute(&state.db)
-            .await?;
+    if let Some((device_id, created_at)) = used.filter(|(d, _)| !d.is_empty()) {
+        // A client keeps only its latest token, so this user's tokens from this device issued
+        // before this one and not used since are dead; left in place, the next heartbeat would bind
+        // the device right back to this user (§11). Spared: tokens issued after this one (a new
+        // login while this request was on its way) and ones used since it was issued (another
+        // system account of the same machine, logged in to the same user: same device id and
+        // uuid, its own token; reviews C-5, C-20). One that has not been used since is still
+        // deleted: the server cannot tell it from a dead one.
+        sqlx::query(
+            "delete from token where user_id = ?1 and device_id = ?2 and created_at <= ?3 and last_used_at <= ?3",
+        )
+        .bind(user.id)
+        .bind(&device_id)
+        .bind(created_at)
+        .execute(&state.db)
+        .await?;
         sqlx::query("update device set user_id = null where id = ? and user_id = ?")
             .bind(device_id)
             .bind(user.id)

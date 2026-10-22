@@ -257,8 +257,18 @@ impl Server {
 
     /// 停掉进程，在同一个工作目录、同一个端口上重新启动（库、密钥文件都保留）；日志接着追加。
     pub async fn restart(&mut self) {
+        self.stop();
+        self.start_again().await;
+    }
+
+    /// 停掉进程（库已迁移，测试自己的连接池照常能读写）。
+    pub fn stop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+
+    /// `stop` 之后在同一个工作目录、同一个端口上重新启动。
+    pub async fn start_again(&mut self) {
         self.child = spawn(&self.dir, self.port);
         self.wait_ready().await;
     }
@@ -283,6 +293,14 @@ impl Server {
 
     pub fn log(&self) -> String {
         std::fs::read_to_string(self.dir.path().join("server.log")).unwrap_or_default()
+    }
+
+    /// 进程的内存峰值（`/proc/<pid>/status` 的 `VmHWM`，单位 KB），只在 Linux 上有。
+    #[cfg(target_os = "linux")]
+    pub fn peak_rss_kb(&self) -> i64 {
+        let status = std::fs::read_to_string(format!("/proc/{}/status", self.child.id())).unwrap();
+        let line = status.lines().find(|l| l.starts_with("VmHWM:")).unwrap();
+        line.split_whitespace().nth(1).unwrap().parse().unwrap()
     }
 
     pub fn path(&self, name: &str) -> PathBuf {

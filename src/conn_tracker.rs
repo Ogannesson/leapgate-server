@@ -48,7 +48,8 @@ const MAX_TEXT_LEN: usize = 64;
 /// client needs a few at most; this is upstream's `RegisterPk` limit of 30 per window, doubled.
 /// A source is one IPv4 address or one IPv6 /64 (see `source_key`).
 const IP_ROWS_PER_MIN: u32 = 60;
-const IP_WINDOW_MS: i64 = 60_000;
+/// The window of `has_room`; also the device reports' budgets (`api::device::report_allowed`).
+pub(crate) const IP_WINDOW_MS: i64 = 60_000;
 /// New rows per minute from all sources together, a backstop for requests spread over many sources
 /// (review R2-4). 2 a second is far above what a personal deployment makes (a few hundred a day).
 const TOTAL_ROWS_PER_MIN: u32 = 120;
@@ -69,7 +70,7 @@ const WRITE_BATCH: usize = 1_000;
 const RETENTION_MS: i64 = 90 * 24 * 3600 * 1000;
 /// Hourly, so at most an hour of new rows comes on top of `MAX_ROWS`. The 90-day delete shares the
 /// timer: a range on `idx_ca_started` that finds nothing most hours, not worth a timer of its own.
-/// So do the audit tables' retention and the device table's limit (`hourly_purge`).
+/// So does the audit tables' retention (`hourly_purge`).
 const PURGE_INTERVAL: Duration = Duration::from_secs(3600);
 /// Dropped records are logged at most this often.
 const DROP_LOG_INTERVAL: Duration = Duration::from_secs(60);
@@ -344,7 +345,7 @@ pub(crate) fn source_key(ip: IpAddr) -> IpAddr {
 
 /// Whether a fixed one-minute window `(start, new rows)` has room for another row; starts a new
 /// window when the current one is over.
-fn has_room(window: &mut (i64, u32), now: i64, max: u32) -> bool {
+pub(crate) fn has_room(window: &mut (i64, u32), now: i64, max: u32) -> bool {
     if now - window.0 >= IP_WINDOW_MS {
         *window = (now, 0);
     }
@@ -615,7 +616,7 @@ impl TrackerState {
     }
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|x| x.as_millis() as i64)
@@ -723,16 +724,16 @@ async fn trim(db: &SqlitePool, keep: i64) -> ResultType<u64> {
     Ok(res.rows_affected())
 }
 
-/// The hourly cleanup of every bounded table: `conn_attempt` (`purge`), the audit tables'
-/// retention (`audit::purge`) and the device table's limit (`device::evict`). Logs one line with
-/// what each deleted (nothing when nothing was deleted and nothing failed).
+/// The hourly cleanup: `conn_attempt` (`purge`) and the audit tables' retention (`audit::purge`).
+/// The device table and the audit tables' row limits are kept on insert instead (`device::make_room`,
+/// `audit::make_room`). Logs one line with what each deleted (nothing when nothing was deleted and
+/// nothing failed).
 async fn hourly_purge(db: &SqlitePool, now: i64) {
-    use crate::api::{audit, device};
+    use crate::api::audit;
     let mut steps = vec![("conn_attempt", purge(db, now).await)];
     for table in audit::TABLES {
         steps.push((table, audit::purge(db, table, now / 1000).await.map_err(Into::into)));
     }
-    steps.push(("device", device::evict(db).await.map_err(Into::into)));
     let failed = steps.iter().any(|(_, r)| r.is_err());
     if !failed && steps.iter().all(|(_, r)| matches!(r, Ok(0))) {
         return;
