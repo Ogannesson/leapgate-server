@@ -117,6 +117,11 @@ pub(crate) fn ok_json<T: Serialize + ?Sized>(value: &T) -> Response {
     json(StatusCode::OK, value)
 }
 
+/// 200 + JSON serialized by the caller.
+pub(crate) fn ok_json_bytes(body: Vec<u8>) -> Response {
+    (StatusCode::OK, [(header::CONTENT_TYPE, JSON)], body).into_response()
+}
+
 /// 200 + empty body (address book writes, audit success).
 pub(crate) fn ok_empty() -> Response {
     StatusCode::OK.into_response()
@@ -205,11 +210,11 @@ pub(crate) fn parse_json<T: DeserializeOwned>(body: &[u8]) -> Result<T, ApiError
     serde_json::from_slice(body).map_err(|err| ApiError::bad_request(&format!("Invalid request body: {err}")))
 }
 
-/// Largest page: one `/api/ab/peers` page is parsed into memory whole. The client always asks for
-/// 100 (`pageSize = 100` in flutter/lib/models/ab_model.dart and group_model.dart, note 04 §1.1)
-/// and pages with its own value (`while (current * pageSize < total)`): a cap below what any client
-/// asks would make it stop early and silently drop entries, so this stays well above 100 and the
-/// memory of a page is bounded per row instead (`ab::MAX_DATA_NODES`).
+/// Largest page: one `/api/ab/peers` page is read and its response built in memory whole (about
+/// 18 MB for 1000 of the largest rows, PORTA.md §12.1). The client always asks for 100 (`pageSize =
+/// 100` in flutter/lib/models/ab_model.dart and group_model.dart, note 04 §1.1) and pages with its
+/// own value (`while (current * pageSize < total)`): a cap below what any client asks would make it
+/// stop early and silently drop entries, so this stays well above 100.
 const MAX_PAGE_SIZE: i64 = 1000;
 
 /// `current`, `pageSize`, `status` (the group panel's user filter) and `ab` (`/api/ab/peers`);
@@ -253,7 +258,8 @@ pub(crate) struct CurrentUser {
     pub id: i64,
     pub name: String,
     pub is_admin: bool,
-    /// `token.token_hash` of the token used (logout deletes only this one).
+    /// `token.token_hash` of the token used (logout deletes it, plus the user's other tokens with
+    /// the same non-empty `device_id`).
     pub token_hash: String,
 }
 

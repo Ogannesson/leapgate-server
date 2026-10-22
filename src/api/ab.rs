@@ -1,7 +1,7 @@
 //! Address book, the 12 endpoints of the new protocol (PORTA.md §12; note 04).
 //! Writes succeed with 200 + empty body only; `personal`, `settings`, `shared/profiles` never 404.
 
-use super::{ok_empty, ok_json, parse_json, ApiError, ApiResult, CurrentUser, PageQuery};
+use super::{ok_empty, ok_json, ok_json_bytes, parse_json, ApiError, ApiResult, CurrentUser, PageQuery};
 use crate::{peer::MAX_PEER_ID_LEN, state::AppState};
 use axum::{
     body::Bytes,
@@ -11,6 +11,7 @@ use axum::{
 use serde_derive::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sqlx::{SqliteConnection, SqlitePool};
+use std::io::Write as _;
 
 /// The client recognizes the personal book by this name (note 04 §6).
 const PERSONAL_NAME: &str = "My address book";
@@ -39,17 +40,17 @@ const MAX_TAGS: i64 = 1000;
 /// in one go (up to MAX_PEERS rows) six times their byte length.
 const MAX_TAG_LEN: usize = 64;
 /// Tags on one peer.
-const MAX_PEER_TAGS: usize = 64;
+pub(crate) const MAX_PEER_TAGS: usize = 64;
 /// A peer's `data` column as stored (serialized JSON, after `peer/update` merges into it).
 const MAX_DATA_LEN: usize = 8 << 10;
 /// JSON nodes in a peer's `data` (every key and every value, nested arrays and objects counted
-/// through). `/api/ab/peers` parses a whole page (up to `MAX_PAGE_SIZE` = 1000 rows) into
-/// `serde_json::Value`s, about ten times the bytes for tiny keys and values, so this bounds the page
-/// rather than lowering the page size: the client pages with its own `pageSize` (`while (current *
-/// pageSize < total)`), so a cap below what it asks would silently drop peers. The client's own
-/// peer (`Peer.toJson`, flutter/lib/models/peer_model.dart) has 11 data keys, i.e. 22 nodes.
+/// through). Parsed into `serde_json::Value`s a row takes about ten times its bytes for tiny keys
+/// and values; `/api/ab/peers` parses one row at a time, but `peer/update` merges into a parsed row.
+/// The client's own peer (`Peer.toJson`, flutter/lib/models/peer_model.dart) has 11 data keys,
+/// i.e. 22 nodes.
 const MAX_DATA_NODES: usize = 64;
-/// The `hash`/`password` the client uploads, before encryption.
+/// The `hash`/`password` the client uploads, before encryption. Control characters are refused,
+/// as in tag names: each would be written back as a 6-byte `\u00XX`.
 const MAX_SECRET_LEN: usize = 1 << 10;
 
 /// Must be strings when given (§12.1); `same_server` must be a bool.
@@ -190,8 +191,13 @@ pub(crate) async fn peers(
     .await?;
     // Personal books carry the password hash, shared books the plain password.
     let secret_key = if personal { "hash" } else { "password" };
-    let mut data = Vec::with_capacity(rows.len());
-    for (id, fields, tags, secret) in rows {
+    // One row parsed at a time and serialized straight into the response, never a page of `Value`s
+    // (review C-14). The stored columns are about the output's size (the secret is smaller decrypted
+    // than encrypted), so this capacity is not outgrown.
+    let capacity = rows.iter().map(|(i, d, t, s)| i.len() + d.len() + t.len() + s.len() + 32).sum::<usize>() + 64;
+    let mut out = Vec::with_capacity(capacity);
+    write!(out, r#"{{"total":{total},"data":["#).map_err(ApiError::internal)?;
+    for (n, (id, fields, tags, secret)) in rows.into_iter().enumerate() {
         let mut peer: Map<String, Value> = serde_json::from_str(&fields).map_err(ApiError::internal)?;
         peer.insert("id".to_owned(), Value::String(id.clone()));
         peer.insert("tags".to_owned(), serde_json::from_str(&tags).map_err(ApiError::internal)?);
@@ -206,9 +212,13 @@ pub(crate) async fn peers(
                 hbb_common::log::warn!("Address book {guid}, peer {id}: {secret_key} omitted: {err}")
             }
         }
-        data.push(Value::Object(peer));
+        if n > 0 {
+            out.push(b',');
+        }
+        serde_json::to_writer(&mut out, &peer).map_err(ApiError::internal)?;
     }
-    Ok(ok_json(&serde_json::json!({ "total": total, "data": data })))
+    out.extend_from_slice(b"]}");
+    Ok(ok_json_bytes(out))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -279,6 +289,9 @@ fn split_peer(body: &[u8], personal: bool) -> Result<PeerFields, ApiError> {
                     if secret.len() > MAX_SECRET_LEN {
                         return Err(ApiError::bad_request(&format!("Field '{key}' too long")));
                     }
+                    if secret.chars().any(char::is_control) {
+                        return Err(ApiError::bad_request(&format!("Field '{key}' contains control characters")));
+                    }
                     fields.secret = Some(secret.to_owned());
                 }
             }
@@ -299,8 +312,9 @@ fn split_peer(body: &[u8], personal: bool) -> Result<PeerFields, ApiError> {
     Ok(fields)
 }
 
-/// The error is the 400 message (`.map_err(ApiError::bad_request)`).
-fn check_tag(name: &str) -> Result<(), &'static str> {
+/// The error is the 400 message (`.map_err(ApiError::bad_request)`). Also used by the import's
+/// report (§15).
+pub(crate) fn check_tag(name: &str) -> Result<(), &'static str> {
     if name.len() > MAX_TAG_LEN {
         return Err("Tag name too long");
     }
@@ -321,12 +335,11 @@ fn child_nodes(v: &Value) -> usize {
 
 /// The `data` column as stored, refused over `MAX_DATA_NODES` or `MAX_DATA_LEN`; the error is the
 /// 400 message.
-fn encode_data(data: Map<String, Value>) -> Result<String, &'static str> {
-    let data = Value::Object(data);
-    if child_nodes(&data) > MAX_DATA_NODES {
+fn encode_data(data: &Map<String, Value>) -> Result<String, &'static str> {
+    if data.values().map(|v| 2 + child_nodes(v)).sum::<usize>() > MAX_DATA_NODES {
         return Err("Peer data has too many fields");
     }
-    let data = data.to_string();
+    let data = serde_json::to_string(data).map_err(|_| "Peer data cannot be encoded")?;
     if data.len() > MAX_DATA_LEN {
         return Err("Peer data too large");
     }
@@ -343,7 +356,7 @@ pub(crate) async fn peer_add(
 ) -> ApiResult {
     let personal = check(&state.db, &user, &guid, WRITE).await?;
     let fields = split_peer(&body, personal)?;
-    let data = encode_data(fields.data).map_err(ApiError::bad_request)?;
+    let data = encode_data(&fields.data).map_err(ApiError::bad_request)?;
     let secret = state.secret.encrypt(fields.secret.as_deref().unwrap_or_default());
     let (hash, password) = if personal { (secret, String::new()) } else { (String::new(), secret) };
     // The count and the insert in one statement, so concurrent adds cannot overshoot MAX_PEERS.
@@ -386,6 +399,10 @@ pub(crate) async fn peer_update(
 ) -> ApiResult {
     let personal = check(&state.db, &user, &guid, WRITE).await?;
     let fields = split_peer(&body, personal)?;
+    drop(body);
+    // The request's own data over a limit fails before it is carried into the transaction (where
+    // it may wait for the write lock); the merged row is checked again below.
+    encode_data(&fields.data).map_err(ApiError::bad_request)?;
     let mut tx = state.db.begin().await?;
     // Write first so the transaction holds the write lock before it reads (in WAL mode a
     // read-then-write transaction fails with SQLITE_BUSY instead of waiting).
@@ -407,7 +424,7 @@ pub(crate) async fn peer_update(
     let mut data: Map<String, Value> = serde_json::from_str(&stored).map_err(ApiError::internal)?;
     data.extend(fields.data);
     // Checked after merging: each update may add keys to the same row. Dropping `tx` rolls back.
-    let data = encode_data(data).map_err(ApiError::bad_request)?;
+    let data = encode_data(&data).map_err(ApiError::bad_request)?;
     let secret = fields.secret.map(|s| state.secret.encrypt(&s));
     let (hash, password) = if personal { (secret, None) } else { (None, secret) };
     sqlx::query(
@@ -756,6 +773,8 @@ mod tests {
             serde_json::json!({"id": "2", "tags": vec!["t"; MAX_PEER_TAGS + 1]}),
             serde_json::json!({"id": "2", "tags": ["a", format!("{tag}x")]}),
             serde_json::json!({"id": "2", "hash": format!("{secret}x")}),
+            serde_json::json!({"id": "2", "hash": "a\u{1}b"}),
+            serde_json::json!({"id": "2", "hash": "\n"}),
             serde_json::json!({"id": "2", "note": note(1)}),
         ] {
             write_err(&t.app, "POST", &add, &token, &bad.to_string(), StatusCode::BAD_REQUEST).await;
@@ -766,6 +785,13 @@ mod tests {
         assert_eq!(stored(db, &personal, &id).await, before);
         let body = serde_json::json!({"id": "2", "password": format!("{secret}x")}).to_string();
         write_err(&t.app, "POST", &format!("/api/ab/peer/add/{shared}"), &token, &body, StatusCode::BAD_REQUEST).await;
+        let body = serde_json::json!({"id": "2", "password": "pw\u{7f}"}).to_string();
+        write_err(&t.app, "POST", &format!("/api/ab/peer/add/{shared}"), &token, &body, StatusCode::BAD_REQUEST).await;
+        // The request's own data is checked before looking the peer up: over the limit is a 400
+        // even for an id not in the book (which is otherwise a 404).
+        let body = serde_json::json!({"id": "nope", "note": note(1)}).to_string();
+        write_err(&t.app, "PUT", &update, &token, &body, StatusCode::BAD_REQUEST).await;
+        write_err(&t.app, "PUT", &update, &token, r#"{"id":"nope"}"#, StatusCode::NOT_FOUND).await;
         // The other book's secret key is ignored, so not limited either.
         let body = serde_json::json!({"id": "2", "password": format!("{secret}x")}).to_string();
         write_ok(&t.app, "POST", &add, &token, &body).await;
@@ -1282,6 +1308,14 @@ mod tests {
         assert_eq!(page(format!("current=3&pageSize=2&ab={book}")).await, (5, vec!["p4".into()]));
         assert_eq!(page(format!("current=1&pageSize=100&ab={book}")).await.1.len(), 5);
         assert_eq!(page(format!("ab={book}")).await.1.len(), 5);
+        // Past the end, and exactly what the page is made of.
+        assert_eq!(page(format!("current=4&pageSize=2&ab={book}")).await, (5, vec![]));
+        let (status, ct, body) =
+            send(&t.app, "POST", &format!("/api/ab/peers?current=4&pageSize=2&ab={book}"), Some(&token), "").await;
+        assert_eq!((status, ct.as_str(), &body[..]), (StatusCode::OK, JSON, &br#"{"total":5,"data":[]}"#[..]));
+        let (_, _, body) =
+            send(&t.app, "POST", &format!("/api/ab/peers?current=2&pageSize=2&ab={book}"), Some(&token), "").await;
+        assert_eq!(&body[..], br#"{"total":5,"data":[{"id":"p2","tags":[]},{"id":"p3","tags":[]}]}"#);
     }
 
     #[tokio::test]
