@@ -411,7 +411,8 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 - `geo lookup <ip>`（直接读本地 mmdb：国家、经纬度、ASN、运营商组）、`geo update`（走控制台 `gu`，由服务进程执行下载、校验和热切换并回显结果；连不上控制台即服务没在运行时，才在命令行进程里直接下载，不做目录清理）
 - `stats [--days N]`：中继回落率和各结果计数（§8）
 - `import rustdesk-api <db 路径> [--dry-run]`（§15）
-- 名字校验：用户名、组名、簿名不能为空；共享簿名唯一且不能是 `My address book` 或 `Legacy address book`。
+- 名字校验：用户名、组名、簿名不能为空；用户名最长 128 字节（登录接口拒绝更长的名字）；共享簿名唯一且不能是 `My address book` 或 `Legacy address book`。
+- 命令行不新建数据库：`DB_URL` 指向的库文件不存在时报错退出（提示到服务的工作目录下运行或设置 `DB_URL`），写操作在输出末尾打印所用数据库的绝对路径。在错误目录下运行不会悄悄写进一个服务看不到的新库。
 
 ## 15. 从 rustdesk-api 导入（`src/import.rs`）
 

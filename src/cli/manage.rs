@@ -16,6 +16,10 @@ pub(super) async fn exec(ctx: &Ctx, cmd: &str, mut args: Args, input: &mut dyn B
             let email = args.value(&["--email"]).unwrap_or_default();
             args.finish()?;
             check_name("user", &name)?;
+            if name.len() > crate::api::account::MAX_NAME_LEN {
+                // Login refuses longer names, so such a user could never sign in.
+                bail!("The user name must be at most {} bytes", crate::api::account::MAX_NAME_LEN);
+            }
             if find_user(db, &name).await?.is_some() {
                 bail!("User '{name}' already exists");
             }

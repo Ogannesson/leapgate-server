@@ -20,7 +20,7 @@ use tokio::sync::Semaphore;
 const FAIL_WINDOW: Duration = Duration::from_secs(15 * 60);
 const MAX_FAILS: usize = 5;
 /// Longer names are refused before the lookup, so request bodies cannot make big keys.
-const MAX_NAME_LEN: usize = 128;
+pub(crate) const MAX_NAME_LEN: usize = 128;
 
 #[derive(Default)]
 struct FailState {
