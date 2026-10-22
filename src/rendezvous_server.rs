@@ -556,6 +556,7 @@ impl RendezvousServer {
                         relay_server: rf.relay_server.clone(),
                         token: rf.token.clone(),
                         found_in_memory: peer.is_some(),
+                        ws,
                     });
                     if let Some(peer) = peer {
                         let mut msg_out = RendezvousMessage::new();
