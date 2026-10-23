@@ -427,7 +427,8 @@ async fn request_timeout(req: Request<Body>, next: Next) -> Response {
 /// 503 on the Porta endpoints, else 200 or 400 + `{"error"}` (`internal_error_is_200`).
 fn timeout_response(path: &str) -> Response {
     if is_porta(path) {
-        devauth::porta_internal("request timeout")
+        // Not logged, as on the other endpoints.
+        devauth::porta_error(StatusCode::SERVICE_UNAVAILABLE, "internal", "Request timeout")
     } else if internal_error_is_200(path) {
         ok_error("Request timeout")
     } else {
@@ -442,6 +443,7 @@ async fn catch_panic(req: Request<Body>, next: Next) -> Response {
     let path = req.uri().path().to_owned();
     match AssertUnwindSafe(next.run(req)).catch_unwind().await {
         Ok(resp) => resp,
+        // `porta_internal`: logged at most once a minute.
         Err(_) if is_porta(&path) => devauth::porta_internal("handler panicked"),
         Err(_) if internal_error_is_200(&path) => ok_internal("handler panicked"),
         Err(_) => ApiError::internal("handler panicked").0,
@@ -641,7 +643,7 @@ mod tests {
         // Timeouts: 503 on the Porta endpoints (which get the reports' 10 s), as before elsewhere.
         assert!(is_report("/api/porta/v1/heartbeat") && is_report("/api/porta/v1/audit/file"));
         let cases = [
-            ("/api/porta/v1/heartbeat", StatusCode::SERVICE_UNAVAILABLE, &br#"{"error":"internal","message":"Server error"}"#[..]),
+            ("/api/porta/v1/heartbeat", StatusCode::SERVICE_UNAVAILABLE, &br#"{"error":"internal","message":"Request timeout"}"#[..]),
             ("/api/audit/conn", StatusCode::OK, br#"{"error":"Request timeout"}"#),
             ("/api/currentUser", StatusCode::OK, br#"{"error":"Request timeout"}"#),
             ("/api/heartbeat", StatusCode::BAD_REQUEST, br#"{"error":"Request timeout"}"#),

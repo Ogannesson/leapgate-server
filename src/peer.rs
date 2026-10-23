@@ -197,14 +197,17 @@ impl PeerMap {
                 w.last_reg_time = Instant::now();
                 w.info = info;
             }
-            if let Err(err) = self.db.update_pk(&guid, &id, &pk, &info_str).await {
-                throttled_log!(
+            match self.db.update_pk(&guid, &id, &pk, &info_str).await {
+                // The row is gone (`device key reset --forget`) or holds another pinned key.
+                Ok(0) => return self.unwritten(&id, &peer, addr).await,
+                Ok(_) => {}
+                Err(err) => throttled_log!(
                     Duration::from_secs(60),
                     warn,
                     "db.update_pk failed, new IP of {:?} kept in memory only: {}",
                     log_id(&id),
                     err
-                );
+                ),
             }
             return register_pk_response::Result::OK;
         }
@@ -215,7 +218,7 @@ impl PeerMap {
                     if is_unique_violation(&err) {
                         // The id was added after `get` found nothing (the command line, an import):
                         // take its row, so the client's retry is judged against the row's uuid.
-                        self.reload(&id, &peer).await;
+                        self.reload(&id, &peer).await.ok();
                     }
                     throttled_log!(Duration::from_secs(60), error, "db.insert_peer failed: {}", err);
                     return register_pk_response::Result::SERVER_ERROR;
@@ -223,23 +226,9 @@ impl PeerMap {
             }
         } else {
             match self.db.update_pk(&guid, &id, &pk, &info_str).await {
-                Ok(0) => {
-                    // Not written: the row is pinned to another key (pinned after this entry was
-                    // read, or this entry is a stale copy), or it is gone (`device key reset
-                    // --forget`). Memory takes the row's state either way.
-                    if self.reload(&id, &peer).await {
-                        throttled_log!(
-                            Duration::from_secs(60),
-                            warn,
-                            "Peer {:?} has a pinned key, refused another from {}",
-                            log_id(&id),
-                            addr
-                        );
-                        return register_pk_response::Result::UUID_MISMATCH;
-                    }
-                    // Gone: the client's next round registers it as a new device, keeping its id.
-                    return register_pk_response::Result::SERVER_ERROR;
-                }
+                // Not written: the row is pinned to another key (pinned after this entry was read,
+                // or this entry is a stale copy), or it is gone (`device key reset --forget`).
+                Ok(0) => return self.unwritten(&id, &peer, addr).await,
                 Ok(_) => {}
                 Err(err) => {
                     throttled_log!(Duration::from_secs(60), error, "db.update_pk failed: {}", err);
@@ -258,11 +247,42 @@ impl PeerMap {
         register_pk_response::Result::OK
     }
 
+    /// A registration write that changed no row. The database decides: memory takes its row; with
+    /// a row, its key is pinned to another (`UUID_MISMATCH`, the client takes a new id); without one
+    /// (deleted by `device key reset --forget`) the entry goes, and the client's next round registers
+    /// the id as a new device (`SERVER_ERROR`, which it only logs).
+    async fn unwritten(&self, id: &str, peer: &LockPeer, addr: SocketAddr) -> register_pk_response::Result {
+        match self.reload(id, peer).await {
+            Ok(true) => {
+                throttled_log!(
+                    Duration::from_secs(60),
+                    warn,
+                    "Peer {:?} has a pinned key, refused another from {}",
+                    log_id(id),
+                    addr
+                );
+                register_pk_response::Result::UUID_MISMATCH
+            }
+            Ok(false) => {
+                self.remove(id).await;
+                register_pk_response::Result::SERVER_ERROR
+            }
+            Err(err) => {
+                throttled_log!(Duration::from_secs(60), error, "db.get_peer failed: {}", err);
+                register_pk_response::Result::SERVER_ERROR
+            }
+        }
+    }
+
     /// Replaces `peer`'s stored fields (guid, uuid, pk, info, pinned) with the database row of
-    /// `id`, if one can be read; whether one was.
-    async fn reload(&self, id: &str, peer: &LockPeer) -> bool {
-        let Ok(Some(v)) = self.db.get_peer(id).await else {
-            return false;
+    /// `id` (`io_loop`: the rendezvous pool); whether there is one.
+    pub(crate) async fn reload(&self, id: &str, peer: &LockPeer) -> ResultType<bool> {
+        Self::reload_through(&self.db, id, peer).await
+    }
+
+    async fn reload_through(db: &database::Database, id: &str, peer: &LockPeer) -> ResultType<bool> {
+        let Some(v) = db.get_peer(id).await? else {
+            return Ok(false);
         };
         let mut w = peer.write().await;
         w.guid = v.guid;
@@ -270,7 +290,23 @@ impl PeerMap {
         w.pk = v.pk.into();
         w.info = serde_json::from_str::<PeerInfo>(&v.info).unwrap_or_default();
         w.pinned = v.pk_pinned_at.is_some();
-        true
+        Ok(true)
+    }
+
+    /// Console `kl <id>` (`device key reset` sends it after changing the database): brings the
+    /// in-memory entry of `id` in line with its row, through the main pool (a connection task, not
+    /// `io_loop`). Anyone on this machine may trigger it; all it can do is make memory match the
+    /// database. Returns what the console prints.
+    pub(crate) async fn reload_from_main(&self, id: &str) -> ResultType<String> {
+        let Some(peer) = self.get_in_memory(id).await else {
+            return Ok(format!("{id}: not in memory, nothing to reload\n"));
+        };
+        Ok(if Self::reload_through(&self.main, id, &peer).await? {
+            format!("{id}: reloaded from the database\n")
+        } else {
+            self.remove(id).await;
+            format!("{id}: not in the database, dropped from memory\n")
+        })
     }
 
     /// The entry of `id`, from memory or else loaded from the database (`io_loop`: the rendezvous
@@ -369,49 +405,16 @@ impl PeerMap {
         self.map.read().await.contains_key(id)
     }
 
-    /// Sets the in-memory `pinned` of `id`, if in memory (`reset_key`).
+    /// Sets the in-memory `pinned` of `id`, if in memory (tests pin as a signed report does).
+    #[cfg(test)]
     pub(crate) async fn set_pinned(&self, id: &str, pinned: bool) {
         if let Some(p) = self.get_in_memory(id).await {
             p.write().await.pinned = pinned;
         }
     }
 
-    /// Drops the entry of `id` (`reset_key --forget`, after its row was deleted).
+    /// Drops the entry of `id` (its row is gone).
     pub(crate) async fn remove(&self, id: &str) {
         self.map.write().await.remove(id);
     }
-}
-
-/// `device key reset <id>` (console `kr`) and `--forget` (console `kf`), PORTA.md §14: unpins the key
-/// of `id`, keeping its uuid and key (a reinstall keeps its id by the usual rule: same uuid, same IP
-/// may change the key), or with `forget` deletes its row (the uuid changed too; the next registration
-/// of the id is a new device). The database first, then the running server's memory (`pm`; `None`
-/// when the command line changes the database itself because the server is not running). Returns
-/// what the console / command line prints.
-pub(crate) async fn reset_key(
-    db: &sqlx::SqlitePool,
-    pm: Option<&PeerMap>,
-    id: &str,
-    forget: bool,
-) -> Result<String, sqlx::Error> {
-    let sql = if forget {
-        "delete from peer where id = ?"
-    } else {
-        "update peer set pk_pinned_at = null where id = ?"
-    };
-    let n = sqlx::query(sql).bind(id).execute(db).await?.rows_affected();
-    if let Some(pm) = pm {
-        if forget {
-            pm.remove(id).await;
-        } else {
-            pm.set_pinned(id, false).await;
-        }
-    }
-    Ok(match (n, forget) {
-        (0, _) => format!("No registered device {id}\n"),
-        (_, false) => format!(
-            "{id}: key no longer pinned (uuid and key kept); the next signed report pins the key it is signed with\n"
-        ),
-        (_, true) => format!("{id}: forgotten; the next registration of this id is taken as a new device\n"),
-    })
 }

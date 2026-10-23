@@ -17,7 +17,7 @@ use axum::{
     http::{HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
-use hbb_common::{log, throttled_log};
+use hbb_common::throttled_log;
 use once_cell::sync::Lazy;
 use serde::{de::DeserializeOwned, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -105,7 +105,7 @@ impl FromRequest<AppState> for SignedBody {
             Err(err) => return Err(porta_error(StatusCode::BAD_REQUEST, "bad_request", &err.body_text())),
         };
         let now = crate::common::now() as i64;
-        if t.abs_diff(now) > MAX_CLOCK_SKEW {
+        if !fresh(t, now) {
             return Err(rejected(state, &sig, Reason::StaleTime, ip, &id));
         }
         let peer = match state.pm.get_from_main(&id).await {
@@ -153,6 +153,11 @@ fn parse_auth(v: &str) -> Option<(String, i64, [u8; 64])> {
     let t = t.parse::<i64>().ok()?;
     let sig = b64url_decode(s)?.try_into().ok()?;
     Some((id, t, sig))
+}
+
+/// Whether a request's timestamp `t` is within `MAX_CLOCK_SKEW` of the server's `now`.
+fn fresh(t: i64, now: i64) -> bool {
+    t.abs_diff(now) <= MAX_CLOCK_SKEW
 }
 
 fn b64url_decode(s: &str) -> Option<Vec<u8>> {
@@ -306,9 +311,10 @@ pub(crate) fn porta_error(status: StatusCode, code: &'static str, message: &str)
     json(status, &serde_json::json!({ "error": code, "message": message }))
 }
 
-/// Logged; 503 `internal` (database error, timeout, panic). The client retries later.
+/// Logged at most once a minute (signed requests can trigger it at the report budget's rate); 503
+/// `internal` (database error, panic). The client retries later.
 pub(crate) fn porta_internal(err: impl Display) -> Response {
-    log::error!("Porta API internal error: {err}");
+    throttled_log!(Duration::from_secs(60), error, "Porta API internal error: {err}");
     porta_error(StatusCode::SERVICE_UNAVAILABLE, "internal", "Server error")
 }
 
@@ -473,8 +479,8 @@ mod tests {
             assert_eq!(v["error"], "bad_auth");
             assert!(v.get("time").is_none() && !headers.contains_key(SIG_HEADER), "{v}");
         }
-        // 61 seconds off either way: stale_time, signed, with time.
-        for t_off in [-61, 61] {
+        // Well off either way (the bounds are `time_window`'s): stale_time, signed, with time.
+        for t_off in [-90, 90] {
             let (auth, sig) = dev.auth("audit/alarm", now + t_off, body);
             assert_signed_401(&t, &auth, &sig, body, "stale_time").await;
         }
@@ -514,6 +520,17 @@ mod tests {
         let (status, headers, _) = send_porta(&app, "/api/porta/v1/audit/alarm", Some(&auth), body).await;
         assert_eq!(status, StatusCode::OK);
         assert!(!headers.contains_key(SIG_HEADER));
+    }
+
+    #[test]
+    fn time_window() {
+        let now = 1_761_200_000;
+        for t in [now - 60, now, now + 60] {
+            assert!(fresh(t, now), "{}", t - now);
+        }
+        for t in [now - 61, now + 61, i64::MIN, i64::MAX] {
+            assert!(!fresh(t, now), "{t}");
+        }
     }
 
     fn sig_of(n: u8) -> [u8; 64] {
@@ -580,6 +597,11 @@ mod tests {
         assert!(pinned_at(&t, "pin001").await.is_some());
         let peer = t.state.pm.get_in_memory("pin001").await.unwrap();
         assert!(peer.read().await.pinned);
+        // Loaded again from the database (after eviction), the entry is pinned too.
+        t.state.pm.evict_idle(Duration::ZERO).await;
+        let reloaded = t.state.pm.get_from_main("pin001").await.unwrap().unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&peer, &reloaded));
+        assert!(reloaded.read().await.pinned);
 
         // The row's key changed behind the entry's back: the pin writes nothing, the request still
         // goes through (verified against the entry's key).

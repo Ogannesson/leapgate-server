@@ -641,11 +641,35 @@ impl RendezvousServer {
                             },
                         },
                     };
-                    let (changed, ip_changed) = {
-                        let peer = peer.read().await;
-                        // A key pinned by a signed report takes no other: saves a write that
-                        // `update_pk` would refuse anyway (the database decides).
-                        if peer.pinned && peer.pk != rk.pk {
+                    // A key pinned by a signed report takes no other. Memory may be behind the
+                    // database (`device key reset` changes the database only), so in this rare
+                    // case the entry is reloaded first and the row decides.
+                    let pinned_to_other = {
+                        let p = peer.read().await;
+                        p.pinned && p.pk != rk.pk
+                    };
+                    if pinned_to_other {
+                        match self.pm.reload(&id, &peer).await {
+                            Ok(true) => {}
+                            // Deleted (`--forget`): the next round registers the id as new.
+                            Ok(false) => {
+                                self.pm.remove(&id).await;
+                                return send_rk_res(socket, addr, register_pk_response::Result::SERVER_ERROR)
+                                    .await;
+                            }
+                            Err(err) => {
+                                throttled_log!(
+                                    Duration::from_secs(60),
+                                    warn,
+                                    "RegisterPk: reload of {:?} failed, dropped: {}",
+                                    log_id(&id),
+                                    err
+                                );
+                                return Ok(());
+                            }
+                        }
+                        let p = peer.read().await;
+                        if p.pinned && p.pk != rk.pk {
                             throttled_log!(
                                 Duration::from_secs(60),
                                 warn,
@@ -653,9 +677,12 @@ impl RendezvousServer {
                                 log_id(&id),
                                 ip
                             );
-                            drop(peer);
+                            drop(p);
                             return send_rk_res(socket, addr, UUID_MISMATCH).await;
                         }
+                    }
+                    let (changed, ip_changed) = {
+                        let peer = peer.read().await;
                         if peer.uuid.is_empty() {
                             (true, false)
                         } else {
@@ -1396,7 +1423,7 @@ impl RendezvousServer {
         match fds.next() {
             Some("h") => {
                 res = format!(
-                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
                     "relay-servers(rs) <separated by ,>",
                     "geo-update(gu)",
                     "ip-blocker(ib) [<ip>|<number>] [-]",
@@ -1404,16 +1431,14 @@ impl RendezvousServer {
                     "punch-requests(pr) [<number>] [-]",
                     "always-use-relay(aur)",
                     "test-geo(tg) <ip1> <ip2>",
-                    "key-reset(kr) <id>",
-                    "key-forget(kf) <id>"
+                    "key-reload(kl) <id>"
                 )
             }
-            Some(cmd @ ("key-reset" | "kr" | "key-forget" | "kf")) => {
-                let forget = matches!(cmd, "key-forget" | "kf");
+            // Not authenticated (any local process reaches the console), so it changes nothing:
+            // memory takes what the database has (`device key reset` changes the database).
+            Some(cmd @ ("key-reload" | "kl")) => {
                 res = match fds.next().filter(|id| !id.is_empty()) {
-                    Some(id) => crate::peer::reset_key(&self.state.db, Some(&self.pm), id, forget)
-                        .await
-                        .unwrap_or_else(|err| format!("Failed: {err}\n")),
+                    Some(id) => self.pm.reload_from_main(id).await.unwrap_or_else(|err| format!("Failed: {err}\n")),
                     None => format!("{cmd} needs a device id\n"),
                 };
             }
@@ -3157,9 +3182,20 @@ mod tests {
         assert!(h.rs.pm.get_in_memory("pinned1").await.unwrap().read().await.pinned);
     }
 
-    /// `device key reset` / `--forget` through the console (`kr` / `kf`): database and memory.
+    /// What `device key reset [--forget]` does to the database (only the command line changes it).
+    async fn cli_reset(h: &Harness, id: &str, forget: bool) {
+        let sql = if forget {
+            "delete from peer where id = ?"
+        } else {
+            "update peer set pk_pinned_at = null where id = ?"
+        };
+        sqlx::query(sql).bind(id).execute(&h.rs.state.db).await.unwrap();
+    }
+
+    /// The command line changes the database, then the console's `kl` brings memory in line with
+    /// it; the console itself changes nothing (it is not authenticated). The old `kr`/`kf` are gone.
     #[hbb_common::tokio::test]
-    async fn key_reset_and_forget_through_the_console() {
+    async fn key_reset_then_console_reload() {
         let mut h = harness(true, None).await;
         let mut server = FramedSocket::new("127.0.0.1:0").await.unwrap();
         let mut a = FramedSocket::new("127.26.1.1:0").await.unwrap();
@@ -3168,9 +3204,14 @@ mod tests {
         h.rs.handle_udp(&register_pk("reset01", b"uuid-rst", &pk), from, &mut server, "").await.unwrap();
         assert_eq!(register_reply(&mut a).await, Some(register_pk_response::Result::OK));
         pin(&h, "reset01").await;
+        for cmd in ["kr reset01", "kf reset01", "key-forget reset01"] {
+            assert_eq!(h.rs.check_cmd(cmd).await, "", "{cmd}");
+        }
+        assert_eq!(peer_row(&h, "reset01").await.2, Some(1));
 
-        let out = h.rs.check_cmd("kr reset01").await;
-        assert!(out.contains("no longer pinned"), "{out}");
+        cli_reset(&h, "reset01", false).await;
+        let out = h.rs.check_cmd("kl reset01").await;
+        assert!(out.contains("reloaded"), "{out}");
         assert_eq!(peer_row(&h, "reset01").await, (b"uuid-rst".to_vec(), pk.to_vec(), None));
         assert!(!h.rs.pm.get_in_memory("reset01").await.unwrap().read().await.pinned);
         // The reinstall (same uuid, same IP, new key) keeps the id.
@@ -3179,16 +3220,72 @@ mod tests {
         assert_eq!(peer_row(&h, "reset01").await.1, pk2.to_vec());
 
         pin(&h, "reset01").await;
-        let out = h.rs.check_cmd("key-forget reset01").await;
-        assert!(out.contains("forgotten"), "{out}");
+        cli_reset(&h, "reset01", true).await;
+        let out = h.rs.check_cmd("key-reload reset01").await;
+        assert!(out.contains("dropped from memory"), "{out}");
         assert!(!h.rs.pm.is_in_memory("reset01").await);
-        assert_eq!(peer_rows(&h, "reset01").await, 0);
         // Registered again as a new device, with another uuid and key.
         h.rs.handle_udp(&register_pk("reset01", b"uuid-new", &pk3), from, &mut server, "").await.unwrap();
         assert_eq!(register_reply(&mut a).await, Some(register_pk_response::Result::OK));
         assert_eq!(peer_row(&h, "reset01").await, (b"uuid-new".to_vec(), pk3.to_vec(), None));
+        // Memory and database agree: reloading changes nothing.
+        assert!(h.rs.check_cmd("kl reset01").await.contains("reloaded"));
+        assert_eq!(h.rs.pm.get_in_memory("reset01").await.unwrap().read().await.pk[..], pk3);
 
-        assert!(h.rs.check_cmd("kr nosuch1").await.contains("No registered device"));
-        assert!(h.rs.check_cmd("kf").await.contains("needs a device id"));
+        assert!(h.rs.check_cmd("kl nosuch1").await.contains("not in memory"));
+        assert!(h.rs.check_cmd("kl").await.contains("needs a device id"));
+    }
+
+    /// Review fix: memory is not trusted over the database. An unpinning made without the console
+    /// takes effect at the next registration with another key (the entry is reloaded first); a row
+    /// deleted without the console drops the stale entry (SERVER_ERROR), and the next round
+    /// registers the id as new.
+    #[hbb_common::tokio::test]
+    async fn registration_reloads_a_pinned_entry() {
+        let mut h = harness(true, None).await;
+        let mut server = FramedSocket::new("127.0.0.1:0").await.unwrap();
+        let mut a = FramedSocket::new("127.26.2.1:0").await.unwrap();
+        let from = a.local_addr().unwrap();
+        let (pk, pk2, pk3) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        h.rs.handle_udp(&register_pk("reload1", b"uuid-rl", &pk), from, &mut server, "").await.unwrap();
+        assert_eq!(register_reply(&mut a).await, Some(register_pk_response::Result::OK));
+        pin(&h, "reload1").await;
+        cli_reset(&h, "reload1", false).await;
+        assert!(h.rs.pm.get_in_memory("reload1").await.unwrap().read().await.pinned, "memory still pinned");
+        h.rs.handle_udp(&register_pk("reload1", b"uuid-rl", &pk2), from, &mut server, "").await.unwrap();
+        assert_eq!(register_reply(&mut a).await, Some(register_pk_response::Result::OK));
+        assert_eq!(peer_row(&h, "reload1").await.1, pk2.to_vec());
+
+        // Pinned again, then the row deleted behind the server's back.
+        pin(&h, "reload1").await;
+        cli_reset(&h, "reload1", true).await;
+        h.rs.handle_udp(&register_pk("reload1", b"uuid-new", &pk3), from, &mut server, "").await.unwrap();
+        assert_eq!(register_reply(&mut a).await, Some(register_pk_response::Result::SERVER_ERROR));
+        assert!(!h.rs.pm.is_in_memory("reload1").await);
+        h.rs.handle_udp(&register_pk("reload1", b"uuid-new", &pk3), from, &mut server, "").await.unwrap();
+        assert_eq!(register_reply(&mut a).await, Some(register_pk_response::Result::OK));
+        assert_eq!(peer_row(&h, "reload1").await, (b"uuid-new".to_vec(), pk3.to_vec(), None));
+    }
+
+    /// Review fix: a new address of a device whose row is gone is not answered OK (that entry
+    /// would keep answering OK without a row): SERVER_ERROR, the entry dropped, and the next round
+    /// registers it as new.
+    #[hbb_common::tokio::test]
+    async fn ip_change_of_a_deleted_row() {
+        let mut h = harness(true, None).await;
+        let mut server = FramedSocket::new("127.0.0.1:0").await.unwrap();
+        let mut old = FramedSocket::new("127.26.3.1:0").await.unwrap();
+        let mut new = FramedSocket::new("127.26.3.2:0").await.unwrap();
+        let (from_old, from_new) = (old.local_addr().unwrap(), new.local_addr().unwrap());
+        let pk = [4u8; 32];
+        h.rs.handle_udp(&register_pk("gone01", b"uuid-gone", &pk), from_old, &mut server, "").await.unwrap();
+        assert_eq!(register_reply(&mut old).await, Some(register_pk_response::Result::OK));
+        cli_reset(&h, "gone01", true).await;
+        h.rs.handle_udp(&register_pk("gone01", b"uuid-gone", &pk), from_new, &mut server, "").await.unwrap();
+        assert_eq!(register_reply(&mut new).await, Some(register_pk_response::Result::SERVER_ERROR));
+        assert!(!h.rs.pm.is_in_memory("gone01").await);
+        h.rs.handle_udp(&register_pk("gone01", b"uuid-gone", &pk), from_new, &mut server, "").await.unwrap();
+        assert_eq!(register_reply(&mut new).await, Some(register_pk_response::Result::OK));
+        assert_eq!(peer_rows(&h, "gone01").await, 1);
     }
 }

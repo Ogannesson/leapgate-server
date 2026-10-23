@@ -219,16 +219,34 @@ fn fingerprint(pk: &[u8]) -> String {
     out
 }
 
-/// `device key reset [--forget] <id>`: through the running server's console (`kr` / `kf`), which
-/// changes the database and its memory; with no server running, the database here (as `geo update`).
+/// `device key reset [--forget] <id>` (PORTA.md §14): unpins the key of `id`, keeping its uuid and
+/// key (a reinstall keeps its id by the usual rule: same uuid, same IP may change the key), or with
+/// `forget` deletes its row (the uuid changed too; the next registration of the id is a new device).
+/// Only the command line changes the database: whoever can open its file may. Then the running
+/// server's console reloads the entry from the database (`kl`, which anyone may trigger and only
+/// aligns memory); unreachable, the change stands and the command fails, saying a running server
+/// must be restarted. (The server also reloads a pinned entry by itself on a registration with
+/// another key, so an unpinning reaches it at the device's next registration anyway.)
 async fn key_reset(ctx: &Ctx, id: &str, forget: bool) -> ResultType<String> {
-    let cmd = if forget { "kf" } else { "kr" };
-    match console_connect(ctx.console).await {
-        Ok(stream) => console_send(stream, &format!("{cmd} {id}"), CONSOLE_WAIT).await,
-        Err(err) => {
-            eprintln!("{err}; changing the database directly");
-            Ok(crate::peer::reset_key(&ctx.db, None, id, forget).await?)
-        }
+    let sql = if forget {
+        "delete from peer where id = ?"
+    } else {
+        "update peer set pk_pinned_at = null where id = ?"
+    };
+    if sqlx::query(sql).bind(id).execute(&ctx.db).await?.rows_affected() == 0 {
+        bail!("No registered device {id}");
+    }
+    let done = if forget {
+        format!("{id}: forgotten; the next registration of this id is taken as a new device\n")
+    } else {
+        format!("{id}: key no longer pinned (uuid and key kept); the next signed report pins the key it is signed with\n")
+    };
+    match console(ctx.console, &format!("kl {id}"), CONSOLE_WAIT).await {
+        Ok(reply) => Ok(done + &reply),
+        Err(err) => bail!(
+            "{done}The database is changed, but the server did not reload it ({err}).\n\
+             If porta-server is running, restart it for this to take effect."
+        ),
     }
 }
 
@@ -555,25 +573,32 @@ mod tests {
         assert!(out.contains("Key: not pinned\n") && out.contains("Other ids with this uuid: none\n"), "{out}");
         assert!(cli(&ctx, &["device", "key", "nosuch"], "").await.is_err());
 
-        // No server running: the database is changed here. Reset keeps the uuid and key.
-        let out = cli(&ctx, &["device", "key", "reset", "dev001"], "").await.unwrap();
-        assert!(out.contains("no longer pinned"), "{out}");
+        // No server console: the database is changed all the same (not rolled back), and the command
+        // fails saying a running server must be restarted. Reset keeps the uuid and key.
+        let err = cli(&ctx, &["device", "key", "reset", "dev001"], "").await.unwrap_err().to_string();
+        assert!(err.contains("no longer pinned") && err.contains("restart it"), "{err}");
         assert_eq!(pinned_at(db, "dev001").await, Some(None));
         let (uuid, pk): (Vec<u8>, Vec<u8>) =
             sqlx::query_as("select uuid, pk from peer where id = 'dev001'").fetch_one(db).await.unwrap();
         assert_eq!((uuid, pk), (b"machine-1".to_vec(), vec![0xab; 32]));
-        let out = cli(&ctx, &["device", "key", "reset", "--forget", "dev001"], "").await.unwrap();
-        assert!(out.contains("forgotten"), "{out}");
+        let err = cli(&ctx, &["device", "key", "reset", "--forget", "dev001"], "").await.unwrap_err().to_string();
+        assert!(err.contains("forgotten") && err.contains("restart it"), "{err}");
         assert_eq!(pinned_at(db, "dev001").await, None);
-        let out = cli(&ctx, &["device", "key", "reset", "dev001"], "").await.unwrap();
-        assert!(out.contains("No registered device"), "{out}");
+        let err = cli(&ctx, &["device", "key", "reset", "dev001"], "").await.unwrap_err().to_string();
+        assert!(err.contains("No registered device"), "{err}");
         assert!(cli(&ctx, &["device", "key", "reset", "a b"], "").await.is_err());
         assert!(cli(&ctx, &["device", "key", "reset"], "").await.is_err());
 
-        // With a server running: its console does it (database and memory, `kr` / `kf`).
+        // With a server running: the command line changes the database, then the console reloads
+        // the entry (`kl`; the server side is in `rendezvous_server`'s tests).
         let (_dir2, ctx2) = super::super::tests::ctx(fake_console().await).await;
-        assert_eq!(cli(&ctx2, &["device", "key", "reset", "dev003"], "").await.unwrap(), "got kr dev003\n");
-        assert_eq!(cli(&ctx2, &["device", "key", "reset", "dev003", "--forget"], "").await.unwrap(), "got kf dev003\n");
+        peer(&ctx2.db, "dev004", b"machine-4", &[0x44; 32], Some(1)).await;
+        let out = cli(&ctx2, &["device", "key", "reset", "dev004"], "").await.unwrap();
+        assert!(out.contains("no longer pinned") && out.ends_with("got kl dev004\n"), "{out}");
+        assert_eq!(pinned_at(&ctx2.db, "dev004").await, Some(None));
+        let out = cli(&ctx2, &["device", "key", "reset", "dev004", "--forget"], "").await.unwrap();
+        assert!(out.contains("forgotten") && out.ends_with("got kl dev004\n"), "{out}");
+        assert_eq!(pinned_at(&ctx2.db, "dev004").await, None);
     }
 
     #[tokio::test]
