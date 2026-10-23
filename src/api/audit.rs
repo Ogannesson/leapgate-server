@@ -59,6 +59,12 @@ const RETENTION_SECS: i64 = 180 * 24 * 3600;
 /// Rows the retention purge deletes per statement: each statement holds the write lock (shared
 /// with hbbs's registrations and every API write) for one short batch, not for the whole backlog.
 const PURGE_BATCH: i64 = 1_000;
+/// Pause between two batches of the purge, and before each table's (`conn_tracker`'s hourly
+/// purge). Waiting writers retry on SQLite's busy handler (sleeps of 1, 2, 5, … 100 ms) and do not
+/// queue, so they almost never hit the microseconds between two statements: without a pause the
+/// write lock stayed taken for the whole backlog and hbbs's writes (200 ms `busy_timeout`) failed
+/// (review D-10, measured: with 20 ms every probe write got in, waiting 79 ms at most).
+pub(crate) const PURGE_PAUSE: Duration = Duration::from_millis(20);
 
 /// Nonces of records already written, in two generations of `NONCE_TTL`: each is kept for 5 to 10
 /// minutes, and old ones go a whole generation at a time instead of by scanning.
@@ -136,7 +142,8 @@ async fn make_room(db: &SqlitePool, table: &str) -> Result<(), sqlx::Error> {
 }
 
 /// Hourly, from `conn_tracker`'s purge: deletes the rows of `table` (one of `TABLES`) created more
-/// than `RETENTION_SECS` before `now` (unix seconds), `PURGE_BATCH` rows per statement. A range on
+/// than `RETENTION_SECS` before `now` (unix seconds), `PURGE_BATCH` rows per statement, with
+/// `PURGE_PAUSE` between two so other writers get the write lock in between. A range on
 /// the `created_at` index (migration 0002; review C-16: `created_at` sits after the 4 KB text
 /// columns, so without it every purge read the whole table's overflow pages in the write lock).
 pub(crate) async fn purge(db: &SqlitePool, table: &str, now: i64) -> Result<u64, sqlx::Error> {
@@ -153,6 +160,7 @@ pub(crate) async fn purge(db: &SqlitePool, table: &str, now: i64) -> Result<u64,
         if n < PURGE_BATCH as u64 {
             return Ok(deleted);
         }
+        hbb_common::tokio::time::sleep(PURGE_PAUSE).await;
     }
 }
 
@@ -688,9 +696,10 @@ mod tests {
         assert_eq!(info, "é".repeat(MAX_TEXT_LEN / 2));
     }
 
-    /// Review C-9: a body near the 2 MB limit, made of an unknown key's big array and a long `peer`,
-    /// parses into the known fields only: nothing holds the skipped elements (the RSS side is
-    /// `audit_conn_big_body_is_not_amplified` in tests/bb_api.rs).
+    /// Review C-9: a big body, made of an unknown key's big array and a long `peer`, parses into the
+    /// known fields only: nothing holds the skipped elements. Parsed directly, so it may be well over
+    /// the route's 64 KB limit; the RSS side, within the limit, is `audit_conn_big_body_is_not_amplified`
+    /// in tests/bb_api.rs.
     #[test]
     fn big_conn_body_builds_only_known_fields() {
         let body = format!(

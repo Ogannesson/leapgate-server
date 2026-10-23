@@ -1459,9 +1459,9 @@ async fn audit_tables_keep_newest_rows() {
     }
 }
 
-/// §9.3、审查 C-9：`/api/audit/conn` 只解析已知字段，未知键的大数组和 `peer` 第二个以后的元素都不在内存里展开。
-/// 改之前一个约 2 MB 的数字数组请求体解析峰值约 80 MB；这里几个并发请求合计也只涨请求体本身那么多。
-/// 请求体上限以后调小时这些请求回 413，同样不会展开。
+/// §9.3、审查 C-9、D-20：`/api/audit/conn` 只解析已知字段，未知键的大数组和 `peer` 第二个以后的元素都不在内存里展开。
+/// 请求体要在审计路由的 64 KB 上限以内（超限的在解析前就回 413，测不到解析）。展开时一个约 60 KB 的请求要占
+/// 1~2 MB，而且要一直留到查完库、写完库；这里 200 个并发请求让它们同时在等库，峰值 RSS 只涨请求体本身那么多。
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn audit_conn_big_body_is_not_amplified() {
@@ -1473,25 +1473,25 @@ async fn audit_conn_big_body_is_not_amplified() {
     let before = s.peak_rss_kb();
     let zeros = format!(
         r#"{{"id":"{dev}","uuid":"{uuid}","conn_id":2,"session_id":1,"junk":[{}0]}}"#,
-        "0,".repeat(950_000)
+        "0,".repeat(30_000)
     );
     let peers = format!(
         r#"{{"id":"{dev}","uuid":"{uuid}","conn_id":3,"session_id":1,"peer":["a","b"{}]}}"#,
-        ",\"\"".repeat(630_000)
+        ",\"\"".repeat(20_000)
     );
-    assert!(zeros.len() < 2_000_000 && peers.len() < 2_000_000);
-    let (a, b, c, d) = tokio::join!(
-        s.post("/api/audit/conn", None, &zeros),
-        s.post("/api/audit/conn", None, &zeros),
-        s.post("/api/audit/conn", None, &peers),
-        s.post("/api/audit/conn", None, &peers),
-    );
-    for r in [a, b, c, d] {
-        assert!(r.status == 200 || r.status == 413, "{} {:?}", r.status, r.text());
+    assert!(zeros.len() < 64 * 1024 && peers.len() < 64 * 1024, "{} {}", zeros.len(), peers.len());
+    let resps = hbb_common::futures::future::join_all(
+        (0..200).map(|i| s.post("/api/audit/conn", None, if i % 2 == 0 { &zeros } else { &peers })),
+    )
+    .await;
+    for r in &resps {
+        assert_audit_ok(r, "big body");
     }
     let grown_mb = (s.peak_rss_kb() - before) / 1024;
     eprintln!("peak RSS grew by {grown_mb} MB");
-    assert!(grown_mb < 40, "peak RSS grew by {grown_mb} MB for four ~1.9 MB bodies");
+    // 实测（测试机，debug 构建）：现在涨 17~18 MB；把 ConnReq 改回通配 map 收其余键时涨 77~100 MB，`peer` 改回
+    // 全部收下时涨 53~60 MB。
+    assert!(grown_mb < 40, "peak RSS grew by {grown_mb} MB for 200 ~60 KB bodies");
 }
 
 /// §8、§9.3 每小时清理（服务启动时先跑一次）：审计表删掉 180 天前的行。device 表不在这里清理（插入时守上限，

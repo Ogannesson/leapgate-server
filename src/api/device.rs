@@ -32,9 +32,14 @@ const MAX_SYSINFO_FIELD_LEN: usize = 253;
 /// not by a periodic purge: between two purges every id ever registered could come back (review
 /// C-10/C-18/C-26). A row is at most about 10.5 KB on disk (8 KB of sysinfo, 4 × 253 bytes of split
 /// fields, the id and uuid; measured with 4 KB pages, the primary key index included): 10,000 rows ≈
-/// 0.1 GB. Rows `make_room` may not evict are kept even past this, and reports then create no rows;
-/// logins (`account.rs`) and imports add rows without this check, owned ones (see `EVICTABLE`).
+/// 0.1 GB. Rows `make_room` may not evict are kept even past this, and reports and logins then
+/// create no rows; imports add rows without this check.
 const MAX_DEVICES: i64 = 10_000;
+/// Rows one `make_room` deletes at most when the table is past `MAX_DEVICES` (review D-7: deleting
+/// the whole excess in one write transaction held the write lock for seconds, and past the request
+/// timeout it was rolled back and started over by every next new row). 64 rows of 10.5 KB read cold
+/// are tens of milliseconds.
+const EVICT_BATCH: i64 = 64;
 /// A heartbeat that changes nothing else writes `last_seen_at` only once the stored one is this many
 /// seconds old: heartbeats come every 15 s (every 3 s while the device is in a session), and every
 /// write takes the database's write lock, which hbbs's registrations also wait on (§4.1).
@@ -131,10 +136,15 @@ const OWNER_FROM_TOKEN: &str = "(select t.user_id from token t join user u on u.
 /// but a user keeps at most `MAX_TOKENS` = 50 tokens, so the owned rows kept are at most 50 per user,
 /// and a binding made up with a login goes once its token does). Never a row with a `device_policy`
 /// or device-scoped `strategy_option` row (neither table references `device`, so nothing goes with
-/// the row). Both arms read the `device_user_seen` index (migration 0002), never the table's
-/// `last_seen_at`, which sits after the 8 KB sysinfo in overflow pages (review C-16); the unowned arm
-/// in `last_seen_at` order, the owned arm sorting the owned rows. The planner takes a full scan for
-/// `user_id is not null` without `indexed by`.
+/// the row). Neither arm reads the table's `last_seen_at`, which sits after the 8 KB sysinfo in
+/// overflow pages (review C-16), and both stop once they have `?1` rows: the unowned arm reads
+/// `device_user_seen(user_id, last_seen_at)` (migration 0002) in order; the owned arm reads the
+/// partial index `device_owned_seen(last_seen_at, user_id, id)` (migration 0003), which covers its
+/// token check, looked up on `token_user_device(user_id, device_id)` (review D-6: on
+/// `device_user_seen` it sorted every owned row, reading each one's id in the table and its owner's
+/// up to 50 tokens, ~100 ms in the write lock with 10,000 owned rows). So it reads past only the
+/// owned rows that still have a token, at most 50 per user. Pinned with `indexed by`: with only
+/// 0002's index the planner took a full scan for `user_id is not null`.
 const EVICTABLE: &str = "
     select id, last_seen_at from (
       select id, last_seen_at from device d where user_id is null
@@ -143,21 +153,23 @@ const EVICTABLE: &str = "
       order by last_seen_at limit ?1)
     union all
     select id, last_seen_at from (
-      select id, last_seen_at from device d indexed by device_user_seen where user_id is not null
+      select id, last_seen_at from device d indexed by device_owned_seen where user_id is not null
         and not exists (select 1 from token t where t.user_id = d.user_id and t.device_id = d.id)
         and not exists (select 1 from device_policy p where p.device_id = d.id)
         and not exists (select 1 from strategy_option s where s.scope = d.id)
       order by last_seen_at limit ?1)
     order by last_seen_at limit ?1";
 
-/// Before a report writes the row of `id` that did not exist, in `tx` (`begin immediate`): true
-/// when the row exists by now (a concurrent first report) or there is room for it, after deleting
-/// the oldest evictable rows (`EVICTABLE`) down to `MAX_DEVICES - 1` if needed (normally one row;
-/// more only after logins or an import took the table past the limit); false when not enough rows
-/// may be evicted, and then the caller writes nothing and drops `tx`, which undoes the deletes. An
-/// evicted device that comes back gets a new row, and its heartbeat asks for its sysinfo again
-/// (`sysinfo` key, §10). Real devices report every 15 s, so the oldest rows are ones that stopped.
-async fn make_room(tx: &mut SqliteConnection, id: &str) -> Result<bool, sqlx::Error> {
+/// Before a report or a login (`account.rs`) writes the row of `id` that did not exist, in `tx`
+/// (`begin immediate`): true when the row exists by now (a concurrent first report) or there is
+/// room for it, after deleting the oldest evictable rows (`EVICTABLE`) if the table is at
+/// `MAX_DEVICES`: normally one; past the limit (an import adds rows without this check) the excess,
+/// at most `EVICT_BATCH`, and one deleted is enough for the insert, so the table never grows and
+/// comes back to the limit over the next new rows. False when none may be evicted, and then the
+/// caller writes nothing and drops `tx`. An evicted device that comes back gets a new row, and its
+/// heartbeat asks for its sysinfo again (`sysinfo` key, §10). Real devices report every 15 s, so
+/// the oldest rows are normally ones that stopped; a reporter can keep its own rows the newest.
+pub(crate) async fn make_room(tx: &mut SqliteConnection, id: &str) -> Result<bool, sqlx::Error> {
     let exists: bool = sqlx::query_scalar("select exists(select 1 from device where id = ?)")
         .bind(id)
         .fetch_one(&mut *tx)
@@ -169,19 +181,19 @@ async fn make_room(tx: &mut SqliteConnection, id: &str) -> Result<bool, sqlx::Er
     if rows < MAX_DEVICES {
         return Ok(true);
     }
-    let excess = rows - MAX_DEVICES + 1;
+    let want = (rows - MAX_DEVICES + 1).min(EVICT_BATCH);
     let deleted = sqlx::query(&format!("delete from device where id in (select id from ({EVICTABLE}))"))
-        .bind(excess)
+        .bind(want)
         .execute(&mut *tx)
         .await?
         .rows_affected();
-    Ok(deleted as i64 == excess)
+    Ok(deleted >= 1)
 }
 
 /// A write transaction that takes the write lock up front: one that reads first and writes later
 /// fails with `SQLITE_BUSY_SNAPSHOT` when another connection wrote in between, which `busy_timeout`
 /// does not retry.
-const BEGIN_WRITE: &str = "begin immediate";
+pub(crate) const BEGIN_WRITE: &str = "begin immediate";
 
 /// sysinfo body (note 01 §5.2): every value is a string; the rest of the keys are kept in the raw text.
 #[derive(Deserialize)]
@@ -363,7 +375,7 @@ pub(crate) async fn query_plan(db: &SqlitePool, sql: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        query_plan, ReportBudgets, EVICTABLE, LAST_SEEN_STEP, MAX_DEVICES, MAX_PEER_ID_LEN, MAX_REPORT_SOURCES,
+        query_plan, ReportBudgets, EVICTABLE, EVICT_BATCH, LAST_SEEN_STEP, MAX_DEVICES, MAX_PEER_ID_LEN, MAX_REPORT_SOURCES,
         MAX_SYSINFO_FIELD_LEN, MAX_SYSINFO_LEN, MAX_UUID_LEN, REPORTS_PER_MIN,
     };
     use crate::testutil::{self, send};
@@ -665,7 +677,8 @@ mod tests {
         let (status, _, _) = send(&t.app, "POST", "/api/sysinfo", None, &sysinfo_body("n4", Some(&uuid), "h")).await;
         assert_eq!(status, StatusCode::OK);
         assert!(has_row(db, "n4").await && !has_row(db, "bulk2").await);
-        // Past the limit (rows added without the check, e.g. by logins): back to it in one go.
+        // Past the limit (rows added without the check, e.g. by an import) by less than a batch: back
+        // to it in one go.
         insert("x1", 99_999).await;
         insert("x2", 99_999).await;
         add_peer(db, "n5", UUID).await;
@@ -688,17 +701,99 @@ mod tests {
         assert_eq!(count(db, "select ver from device where id = 'n1'").await, 1005012);
     }
 
-    /// Review C-16: picking the rows to evict reads the `device_user_seen` index in `last_seen_at`
-    /// order (no scan of the table, whose `last_seen_at` sits after the 8 KB sysinfo).
+    /// Reviews C-16, D-6: picking the rows to evict reads indexes in `last_seen_at` order (no scan of
+    /// the table, whose `last_seen_at` sits after the 8 KB sysinfo, and no sort of the owned rows).
     #[tokio::test]
     async fn eviction_uses_the_owner_and_last_seen_index() {
         let t = testutil::app().await;
         let sql = format!("delete from device where id in (select id from ({}))", EVICTABLE.replace("?1", "1"));
         let plan = query_plan(&t.state.db, &sql).await;
         eprintln!("device eviction: {plan:#?}");
-        assert!(plan.iter().any(|l| l == "SEARCH d USING INDEX device_user_seen (user_id=?)"), "{plan:?}");
-        assert!(plan.iter().any(|l| l.starts_with("SEARCH d USING INDEX device_user_seen (user_id>?)")), "{plan:?}");
-        assert!(!plan.iter().any(|l| l.starts_with("SCAN d")), "{plan:?}");
+        for step in [
+            "SEARCH d USING INDEX device_user_seen (user_id=?)",
+            "SCAN d USING COVERING INDEX device_owned_seen",
+            "SEARCH t USING COVERING INDEX token_user_device (user_id=? AND device_id=?)",
+        ] {
+            assert!(plan.iter().any(|l| l == step), "{step}: {plan:?}");
+        }
+        assert!(!plan.iter().any(|l| l.starts_with("SCAN d") && !l.contains("device_owned_seen")), "{plan:?}");
+        // The only sorts are of each arm's at most `?1` rows, for the merge of the two.
+        for (i, l) in plan.iter().enumerate() {
+            if l.contains("TEMP B-TREE") {
+                assert!(i > 0 && plan[i - 1].starts_with("SCAN (subquery"), "{plan:?}");
+            }
+        }
+    }
+
+    /// Review D-7: past the limit a new row deletes at most `EVICT_BATCH` rows, and one deleted is
+    /// enough for it; the table comes back to `MAX_DEVICES` over the next new rows. A login keeps to
+    /// the limit too: with nothing evictable it succeeds without a row.
+    #[tokio::test]
+    async fn eviction_past_the_limit_is_batched() {
+        let t = testutil::app().await;
+        let db = &t.state.db;
+        let uuid = b64(UUID);
+        let rows = || count(db, "select count(*) from device");
+        let excess = 5_000;
+        sqlx::query(
+            "with recursive n(i) as (select 1 union all select i + 1 from n where i < ?)
+             insert into device(id, first_seen_at, last_seen_at) select 'bulk' || i, 0, i from n",
+        )
+        .bind(MAX_DEVICES + excess)
+        .execute(db)
+        .await
+        .unwrap();
+        let mut left = MAX_DEVICES + excess;
+        let mut new = 0;
+        while left > MAX_DEVICES {
+            new += 1;
+            let id = format!("n{new}");
+            add_peer(db, &id, UUID).await;
+            let r = heartbeat(&t.app, json!({"id": id, "uuid": uuid, "ver": 1005010, "modified_at": 0})).await;
+            assert_eq!(r["sysinfo"], json!(true), "{id}");
+            let want = (left - MAX_DEVICES + 1).min(EVICT_BATCH);
+            assert_eq!(rows().await, left - want + 1, "{id}");
+            left -= want - 1;
+        }
+        // Every new row deleted up to EVICT_BATCH - 1 more than it added.
+        assert_eq!(new, (excess + EVICT_BATCH - 2) / (EVICT_BATCH - 1));
+
+        // Past the limit with fewer evictable rows than the excess: those go and the row is made.
+        let oldest: Vec<String> = sqlx::query_scalar("select id from device order by last_seen_at limit 3")
+            .fetch_all(db)
+            .await
+            .unwrap();
+        sqlx::query("insert into device(id, first_seen_at, last_seen_at) values('x1', 0, 99999), ('x2', 0, 99999)")
+            .execute(db)
+            .await
+            .unwrap();
+        sqlx::query("insert into device_policy(device_id) select id from device where id not in (?, ?)")
+            .bind(&oldest[0])
+            .bind(&oldest[1])
+            .execute(db)
+            .await
+            .unwrap();
+        add_peer(db, "few", UUID).await;
+        heartbeat(&t.app, json!({"id": "few", "uuid": uuid, "ver": 1005010, "modified_at": 0})).await;
+        assert!(has_row(db, "few").await && !has_row(db, &oldest[0]).await && !has_row(db, &oldest[1]).await);
+        assert_eq!(rows().await, MAX_DEVICES + 1);
+
+        // Nothing evictable: a login on a new device succeeds without a row; one on a device with a
+        // row binds it.
+        sqlx::query("insert into device_policy(device_id) values('few')").execute(db).await.unwrap();
+        let (amy, _) = testutil::create_user(db, "ev-amy", "pw", false).await;
+        add_peer(db, "full", UUID).await;
+        login(&t.app, "ev-amy", "full", &uuid).await;
+        assert!(!has_row(db, "full").await);
+        login(&t.app, "ev-amy", "n1", &uuid).await;
+        assert_eq!(owner(db, "n1").await, Some(amy));
+        assert_eq!(rows().await, MAX_DEVICES + 1);
+        // With room again (a policy gone), the login makes the row in the evicted one's place.
+        sqlx::query("delete from device_policy where device_id = ?").bind(&oldest[2]).execute(db).await.unwrap();
+        login(&t.app, "ev-amy", "full", &uuid).await;
+        assert_eq!(owner(db, "full").await, Some(amy));
+        assert!(!has_row(db, &oldest[2]).await);
+        assert_eq!(rows().await, MAX_DEVICES + 1);
     }
 
     /// A heartbeat that changes nothing writes `last_seen_at` once it is `LAST_SEEN_STEP` old.
