@@ -56,15 +56,16 @@ const MAX_ROWS: i64 = 20_000;
 /// without it) connects and logs in again for every local connection it accepts
 /// (rustdesk@bd92623:src/port_forward.rs `listen`, `Claim::Legacy`), a record each, so a browser
 /// through it soon has tens. Counted per type, so these never crowd out the remote desktop's record
-/// (review E-5); within a type, a session reconnected more often loses the note on its oldest
-/// records. 4, not 8: one note rewrites up to 6 × this many rows (each taking the 4 KB note) in the
+/// (review E-5); within a type, more than this many records (reconnects, or the local connections
+/// of such a tunnel) leaves the oldest of that type without the note. 4, not 8: one note rewrites up to 6 × this many rows (each taking the 4 KB note) in the
 /// write lock, 24 rows (~1 ms, see `note_updates_only_the_newest_records`), three times the 8 it was
 /// before the split rather than six.
 const NOTE_ROWS: i64 = 4;
 /// The connection types the note picks records of (`NOTE_ROWS` each): what the controlled side
 /// reports as `type` (rustdesk@bd92623:src/server/connection.rs `AuthConnType`: 0 remote desktop,
-/// 1 file transfer, 2 port forward, 3 camera, 4 terminal), and no type (a record whose authed report
-/// was lost, or that left it out). Other values, which no client sends, never get a note.
+/// 1 file transfer, 2 port forward, 3 camera, 4 terminal), and no type (an authed report that left
+/// it out; upstream always sends it). A record whose authed report was lost keeps session_id '' and
+/// is never noted either way. Other values, which no client sends, never get a note.
 const NOTE_TYPES: [&str; 6] = ["= 0", "= 1", "= 2", "= 3", "= 4", "is null"];
 /// The note's update, `?1` note, `?2` device, `?3` session, `?4` `NOTE_ROWS`: one arm per type in
 /// `NOTE_TYPES`, each an exact range on `audit_conn_session_dev(session_id, device_id, conn_type)`

@@ -956,15 +956,9 @@ async fn api_write_flood_does_not_stall_rendezvous() {
     for f in flood {
         f.abort();
     }
-    // 洪水真的在写库，测试才有意义（审查 D-1/D-17：合并上报限速后它曾经一条都没写）。
-    assert!(w > 0, "测量期 alarm 一次都没写进库（其余响应 {o} 次），测不到会合等库");
-    assert!(
-        worst < WORST,
-        "API 洪水拖住了会合主循环：最坏 {worst:?}\n{}",
-        lines.join("\n")
-    );
     // 测量期确实只查库（审查 E-1）：预置行的 info 没被改写。改写了说明服务存的 IP 格式和预置的
-    // 不同（比如测试机关了 IPv6，服务退回绑 0.0.0.0），上面测的就成了写库。
+    // 不同（比如测试机关了 IPv6，服务退回绑 0.0.0.0），测的就成了写库。先查这个，前提失效时报
+    // 真正的原因，而不是下面"拖住了会合主循环"的误诊（第八轮审查）。
     let opts = sqlx::sqlite::SqliteConnectOptions::new()
         .filename(&db_url)
         .busy_timeout(Duration::from_secs(5));
@@ -977,6 +971,13 @@ async fn api_write_flood_does_not_stall_rendezvous() {
             .unwrap();
         assert_eq!(&info, seeded, "{id} 的 info 被改写");
     }
+    // 洪水真的在写库，测试才有意义（审查 D-1/D-17：合并上报限速后它曾经一条都没写）。
+    assert!(w > 0, "测量期 alarm 一次都没写进库（其余响应 {o} 次），测不到会合等库");
+    assert!(
+        worst < WORST,
+        "API 洪水拖住了会合主循环：最坏 {worst:?}\n{}",
+        lines.join("\n")
+    );
 }
 
 /// 审查 D-15：持 key 的客户端在 21116 的几百条连接上不停发目标不存在的 `PunchHoleRequest`
