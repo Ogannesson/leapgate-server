@@ -232,7 +232,7 @@ const MAX_RELAY_REQUESTS: usize = 12;
 /// `conn_tracker` keeps them (`MAX_TEXT_LEN`): a uuid is 36 characters.
 const MAX_RELAY_TEXT: usize = 64;
 /// Longest `AddrMangle` encoding: a v6 address is 16 bytes of IP + 2 of port, a v4 one at most
-/// 16 (hbb_common `AddrMangle::encode`). A longer value is not an address.
+/// 11 (hbb_common `AddrMangle::encode`). A longer value is not an address.
 const MAX_MANGLED_ADDR: usize = 18;
 /// LAN candidates relayed from `LocalAddr.porta_local_addrs`; a Porta client sends at most 8
 /// (`client/PORTA.md` §3.3).
