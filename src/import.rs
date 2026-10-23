@@ -5,11 +5,12 @@
 
 use crate::{
     api::{
-        ab::{check_tag, MAX_PEER_TAGS},
+        ab::{check_tag, MAX_PEERS, MAX_PEER_TAGS},
         account::MAX_NAME_LEN,
     },
     cli::RESERVED_BOOK_NAMES,
     crypto::SecretBox,
+    peer::MAX_PEER_ID_LEN,
 };
 use hbb_common::{bail, ResultType};
 use sqlx::{
@@ -357,6 +358,9 @@ async fn plan(db: &SqlitePool, src_path: &Path) -> ResultType<Plan> {
     // they are, only reported (review C-6).
     let mut refused_tags: BTreeMap<(BookRef, String), &str> = BTreeMap::new();
     let mut too_many_tags = false;
+    // Entries over what Porta's writes take (review E-4): imported as they are, only reported.
+    let mut long_ids = false;
+    let mut per_book: BTreeMap<BookRef, i64> = BTreeMap::new();
     let rows = personal_rows
         .into_iter()
         .map(|row| (BookRef::Personal(row.0), row))
@@ -369,6 +373,17 @@ async fn plan(db: &SqlitePool, src_path: &Path) -> ResultType<Plan> {
         };
         if !imported {
             continue;
+        }
+        *per_book.entry(book).or_default() += 1;
+        if id.len() > MAX_PEER_ID_LEN {
+            long_ids = true;
+            let _ = writeln!(
+                r,
+                "Over the limits: entry {:?}… in {} has an id of {} bytes (Porta takes at most {MAX_PEER_ID_LEN})",
+                id.chars().take(32).collect::<String>(),
+                book_name(book),
+                id.len()
+            );
         }
         let data = serde_json::json!({
             "username": username,
@@ -403,6 +418,19 @@ async fn plan(db: &SqlitePool, src_path: &Path) -> ResultType<Plan> {
             hash,
             password,
         });
+    }
+    let full: Vec<(BookRef, i64)> = per_book.into_iter().filter(|(_, n)| *n > MAX_PEERS).collect();
+    for (book, n) in &full {
+        let _ = writeln!(r, "Over the limits: {} has {n} entries (Porta takes at most {MAX_PEERS} in a book)", book_name(*book));
+    }
+    if long_ids || !full.is_empty() {
+        let _ = writeln!(
+            r,
+            "These entries and books are imported as they are. An entry whose id is over {MAX_PEER_ID_LEN} bytes \
+             cannot be edited (400), only deleted. In a book of more than {MAX_PEERS} entries the client adds no \
+             more, and deleting more than {MAX_PEERS} entries at once (select all > Delete) fails (400): delete \
+             them in batches of at most {MAX_PEERS}."
+        );
     }
     let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM address_books WHERE id = ''")
         .fetch_one(&mut *src)
@@ -1200,6 +1228,53 @@ INSERT INTO peers(row_id, id, uuid, user_id, hostname, os, username, version, la
             .unwrap();
         assert_eq!(stored, [entry_tags, serde_json::json!(many).to_string()], "imported unchanged");
         assert_eq!(count(&f.db, &format!("select count(*) from ab_tag where name = '{long}'")).await, 1);
+    }
+
+    /// Entries with an id over `MAX_PEER_ID_LEN` and books of more than `MAX_PEERS` entries are
+    /// imported unchanged and listed in the report (review E-4).
+    #[tokio::test]
+    async fn over_limit_entries_reported() {
+        let f = fixture().await;
+        let long = "長".repeat(MAX_PEER_ID_LEN / 3 + 1);
+        let mut conn = SqliteConnection::connect_with(&SqliteConnectOptions::new().filename(&f.src)).await.unwrap();
+        sqlx::query("INSERT INTO address_books(user_id, collection_id, id, tags) VALUES (1, 0, ?, '[]'), (1, 0, ?, '[]')")
+            .bind(&long)
+            .bind("i".repeat(MAX_PEER_ID_LEN))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        // Collection 10 has 1 entry imported already ('555' is not its owner's).
+        sqlx::query(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?)
+             INSERT INTO address_books(user_id, collection_id, id, tags) SELECT 1, 10, 'B' || i, '[]' FROM n",
+        )
+        .bind(MAX_PEERS)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        conn.close().await.unwrap();
+
+        let p = plan(&f.db, &f.src).await.unwrap();
+        let short: String = long.chars().take(32).collect();
+        for needle in [
+            format!("Over the limits: entry {short:?}… in the personal book of user_id 1 has an id of {} bytes", long.len()),
+            format!("Over the limits: collection 10 has {} entries (Porta takes at most {MAX_PEERS} in a book)", MAX_PEERS + 1),
+            format!("delete them in batches of at most {MAX_PEERS}"),
+        ] {
+            assert!(p.report.contains(&needle), "missing {needle:?} in:\n{}", p.report);
+        }
+        // Exactly at the limits: not listed.
+        assert_eq!(p.report.matches("Over the limits").count(), 2, "{}", p.report);
+        write(&f.db, &f.secret, &p).await.unwrap();
+        assert_eq!(count(&f.db, &format!("select count(*) from ab_peer where id = '{long}'")).await, 1);
+        let shared: i64 = sqlx::query_scalar(
+            "select count(*) from ab_peer p join ab a on a.guid = p.ab_guid where a.name = 'Team' and a.personal = 0
+               and a.owner_id = (select id from user where name = 'admin')",
+        )
+        .fetch_one(&f.db)
+        .await
+        .unwrap();
+        assert_eq!(shared, MAX_PEERS + 1, "imported unchanged");
     }
 
     #[tokio::test]
