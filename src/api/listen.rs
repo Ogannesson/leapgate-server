@@ -24,6 +24,10 @@ use std::{
     future::Future,
     io,
     pin::Pin,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -47,8 +51,13 @@ const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// answer (`super::request_timeout`). Below `IO_IDLE_TIMEOUT`: hyper keeps a read pending to see the
 /// peer close while a handler runs, so a slow handler must get its answer out before the socket
 /// timeout drops the connection without one (the client would then try its TCP fallback).
-/// The largest body (2 MB, `DELETE /api/ab/peer`) arrives in it at 100 KB/s; the client's Flutter
-/// side, which sends the address book requests, waits 30 s.
+/// The largest body (2 MB, `DELETE /api/ab/peer`) arrives in it at 100 KB/s. The client sends the
+/// login and address book requests from its Flutter side by default, which waits 30 s; with a SOCKS
+/// proxy set or the local option `enable-flutter-http-on-rust` they go through its Rust side, 12 s a
+/// try as for the reports below (rustdesk@bd92623:flutter/lib/utils/http_service.dart
+/// `HttpService.sendRequest`, src/common.rs `get_http_response_async`; review E-7): such a client
+/// gives up on a request that takes 12 to 20 s a few seconds before this answer, and needs 170 KB/s
+/// for a 2 MB body.
 pub(super) const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// `REQUEST_TIMEOUT` for the device reports (`super::is_report`: heartbeat, sysinfo, audit). The
 /// client sends those from its Rust side, which gives up after 12 s, connecting and the TLS
@@ -61,18 +70,20 @@ pub(super) const REPORT_TIMEOUT: Duration = Duration::from_secs(10);
 /// response body is written after `REQUEST_TIMEOUT` is over; without this a client that stops
 /// reading holds it (an `/api/ab/peers` page is MBs) until it disconnects.
 const IO_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-/// Write floor (review D-4/D-18), for a client that reads, but slowly: from the first write the
-/// socket holds up (its send buffer full) until the next request is read, the bytes written must
-/// keep up with this rate once `IO_IDLE_TIMEOUT` of grace is over, else the connection drops.
-/// `IO_IDLE_TIMEOUT` alone does not bound it: the kernel takes a write whenever a third of the
-/// send buffer is free, and over the Internet that buffer stays at tens of KB for a client that
-/// keeps its window small, so reading a few KB every 30 s held an `/api/ab/peers` page (MBs) and
-/// its slot for hours. 32 KB/s (256 kbit/s) is far below what a remote desktop needs; a real page
-/// (100 rows, tens of KB) goes into the socket buffers at once and never meets it. A page of
-/// S bytes is then sent within 30 s + S / 32 KB/s (18 MB, 1000 of the largest rows: ~10 min),
-/// twice that at worst: bytes read while a response is being written restart the count, and
-/// hyper reads at most once before that response is written out. Checked here, not in the
-/// response body: hyper stops asking the body for frames while its write buffer is full.
+/// Write floor (review D-4/D-18), for a client that reads, but slowly: from the first write of a
+/// response the socket holds up (its send buffer full) until the next request starts, the bytes
+/// written must keep up with this rate once `IO_IDLE_TIMEOUT` of grace is over, else the
+/// connection drops. `IO_IDLE_TIMEOUT` alone does not bound it: the kernel takes a write whenever a
+/// third of the send buffer is free, and over the Internet that buffer stays at tens of KB for a
+/// client that keeps its window small, so reading a few KB every 30 s held an `/api/ab/peers` page
+/// (MBs) and its slot for hours. 32 KB/s (256 kbit/s) is far below what a remote desktop needs; a
+/// real page (100 rows, tens of KB) goes into the socket buffers at once and never meets it. A
+/// page of S bytes is then sent within about 30 s + S / 32 KB/s (18 MB, 1000 of the largest rows:
+/// ~10 min). The count restarts when hyper hands the next request to the service (`Guarded`), not
+/// when bytes are read (review E-9): pipelined requests all arrive in hyper's read buffer with the
+/// first, the socket is not read again, and the bytes of the pages read fast before carried over
+/// as credit for a later one, hours of it. Checked here, not in the response body: hyper stops
+/// asking the body for frames while its write buffer is full.
 const MIN_WRITE_RATE: u64 = 32 * 1024;
 /// hyper's per-connection read buffer cap, i.e. the largest request head (hyper's default is about
 /// 400 KB: 200 MB over `MAX_CONNS`). Real heads are under 2 KB; a larger one gets 431.
@@ -101,11 +112,14 @@ pub(super) async fn serve(listener: TcpListener, app: Router) {
             throttled_log!(Duration::from_secs(60), warn, "API: too many connections, closed one from {}", addr);
             continue;
         };
+        let requests = Arc::new(AtomicU64::new(0));
+        let counted = requests.clone();
         let service = app.clone().map_request(move |mut req: Request<Incoming>| {
+            counted.fetch_add(1, Ordering::Relaxed);
             req.extensions_mut().insert(ConnectInfo(addr));
             req
         });
-        let io = TokioIo::new(Guarded::new(stream, permit));
+        let io = TokioIo::new(Guarded::new(stream, permit, requests));
         tokio::spawn(async move {
             let conn = http1::Builder::new()
                 .timer(TokioTimer::new())
@@ -125,20 +139,30 @@ pub(super) async fn serve(listener: TcpListener, app: Router) {
 struct Guarded {
     io: TcpStream,
     idle: Pin<Box<Sleep>>,
-    /// Since the first write held up after the last read, and the bytes written since.
+    /// Since the first write of the current response held up, and the bytes written since.
     behind: Option<(Instant, u64)>,
     /// When the bytes written in `behind` fall below `MIN_WRITE_RATE`.
     slow: Pin<Box<Sleep>>,
+    /// Requests the connection has handed to the service so far, counted in `serve`'s
+    /// `map_request`. hyper's HTTP/1 serves one at a time and calls the service for the next only
+    /// once the response before has been written (into its write buffer, which it may still be
+    /// flushing), so a change means the next response has started, whether its request was read
+    /// from the socket or was already in hyper's read buffer.
+    requests: Arc<AtomicU64>,
+    /// `requests` when `behind` was last cleared.
+    seen: u64,
     _permit: ConnPermit,
 }
 
 impl Guarded {
-    fn new(io: TcpStream, permit: ConnPermit) -> Self {
+    fn new(io: TcpStream, permit: ConnPermit, requests: Arc<AtomicU64>) -> Self {
         Self {
             io,
             idle: Box::pin(tokio::time::sleep(IO_IDLE_TIMEOUT)),
             behind: None,
             slow: Box::pin(tokio::time::sleep(IO_IDLE_TIMEOUT)),
+            requests,
+            seen: 0,
             _permit: permit,
         }
     }
@@ -156,6 +180,12 @@ impl Guarded {
     }
 
     fn wrote(&mut self, cx: &mut Context<'_>, res: Poll<io::Result<usize>>) -> Poll<io::Result<usize>> {
+        // A new request: its response starts a new count.
+        let requests = self.requests.load(Ordering::Relaxed);
+        if requests != self.seen {
+            self.seen = requests;
+            self.behind = None;
+        }
         match res {
             Poll::Pending => {
                 let (since, sent) = *self.behind.get_or_insert((Instant::now(), 0));
@@ -189,8 +219,6 @@ impl AsyncRead for Guarded {
             ready => {
                 if buf.filled().len() > before {
                     this.moved();
-                    // The next request: its response starts a new count.
-                    this.behind = None;
                 }
                 ready
             }
@@ -239,14 +267,24 @@ mod tests {
     use std::net::SocketAddr;
 
     /// Sends `request` on a new connection with a small receive buffer and reads the response at
-    /// about `rate` bytes/s, a quarter-second's worth at a time; returns (bytes read, response
-    /// length, when the reading ended).
+    /// about `rate` bytes/s (`read_response`).
     async fn read_at(addr: SocketAddr, request: String, rate: usize) -> (usize, usize, Duration) {
+        let mut stream = connect(addr).await;
+        stream.write_all(request.as_bytes()).await.unwrap();
+        read_response(&mut stream, rate).await
+    }
+
+    async fn connect(addr: SocketAddr) -> TcpStream {
         let socket = TcpSocket::new_v4().unwrap();
         socket.set_recv_buffer_size(4096).unwrap();
-        let mut stream = socket.connect(addr).await.unwrap();
+        socket.connect(addr).await.unwrap()
+    }
+
+    /// Reads one response at about `rate` bytes/s, a quarter-second's worth at a time (at most a
+    /// response's worth, so a response pipelined after it is left unread); returns (bytes read,
+    /// response length, how long the reading took).
+    async fn read_response(stream: &mut TcpStream, rate: usize) -> (usize, usize, Duration) {
         let start = Instant::now();
-        stream.write_all(request.as_bytes()).await.unwrap();
         let mut data = Vec::new();
         let mut total = usize::MAX;
         let mut buf = vec![0u8; rate / 4];
@@ -277,18 +315,14 @@ mod tests {
         (data.len(), total, start.elapsed())
     }
 
-    /// A client that keeps reading, but below `MIN_WRITE_RATE`, is dropped by the write floor
-    /// (bytes move every quarter second, so `IO_IDLE_TIMEOUT` never fires), and its
-    /// `/api/ab/peers` slots go back; a client above the rate gets its whole page. The server's
-    /// send buffer is kept small, as it stays over the Internet for a client with a small window
-    /// (on loopback the kernel grows it to MBs, which takes a write only every ~1 MB read).
-    #[tokio::test]
-    async fn a_slow_reader_is_dropped_and_its_page_slots_go_back() {
+    /// A served user with a page of about 1.4 MB, the API on a listener with a small send buffer
+    /// (as it stays over the Internet for a client with a small window; on loopback the kernel grows
+    /// it to MBs, which takes a write only every ~1 MB read), and that page's request.
+    async fn big_page() -> (testutil::TestApp, SocketAddr, String) {
         let t = testutil::app().await;
         let (_, token) = testutil::create_user(&t.state.db, "alice", "", false).await;
         let (_, _, body) = testutil::send(&t.app, "POST", "/api/ab/personal", Some(&token), "").await;
         let book = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["guid"].as_str().unwrap().to_owned();
-        // About 1.4 MB.
         sqlx::query(
             "with recursive n(i) as (select 1 union all select i + 1 from n where i < 200)
              insert into ab_peer(ab_guid, id, data, created_at, updated_at)
@@ -309,6 +343,15 @@ mod tests {
             "POST /api/ab/peers?current=1&pageSize=1000&ab={book} HTTP/1.1\r\nHost: x\r\n\
              Authorization: Bearer {token}\r\nContent-Length: 0\r\n\r\n"
         );
+        (t, addr, request)
+    }
+
+    /// A client that keeps reading, but below `MIN_WRITE_RATE`, is dropped by the write floor
+    /// (bytes move every quarter second, so `IO_IDLE_TIMEOUT` never fires), and its
+    /// `/api/ab/peers` slots go back; a client above the rate gets its whole page.
+    #[tokio::test]
+    async fn a_slow_reader_is_dropped_and_its_page_slots_go_back() {
+        let (t, addr, request) = big_page().await;
         let slow = tokio::spawn(read_at(addr, request.clone(), 4 * 1024));
         let fast = tokio::spawn(read_at(addr, request, 96 * 1024));
         let (got, total, took) = fast.await.unwrap();
@@ -324,5 +367,23 @@ mod tests {
             assert!(start.elapsed() < Duration::from_secs(5), "{:?}", t.state.ab_pages.free());
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// Review E-9: two requests pipelined in one write reach hyper's read buffer together, so the
+    /// socket is not read between their responses; the second response still gets a count of its
+    /// own, not the credit of the first page read fast (which would put the drop at ~30 s + 1.4 MB
+    /// / 32 KB/s ≈ 75 s from the first).
+    #[tokio::test]
+    async fn pipelined_requests_get_a_count_each() {
+        let (_t, addr, request) = big_page().await;
+        let mut stream = connect(addr).await;
+        stream.write_all(format!("{request}{request}").as_bytes()).await.unwrap();
+        let (got, total, took) = read_response(&mut stream, 1 << 20).await;
+        assert!(total > 1 << 20, "page of {total} bytes");
+        assert_eq!(got, total, "first page, read fast, in {took:?}");
+        let (got, total, took) = read_response(&mut stream, 4 * 1024).await;
+        assert!(got < total, "below the floor: got the whole second page in {took:?}");
+        // As the slow reader above: due ≈ 34 s after the second page starts.
+        assert!((Duration::from_secs(31)..Duration::from_secs(42)).contains(&took), "dropped after {took:?}");
     }
 }
