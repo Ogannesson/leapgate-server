@@ -70,6 +70,12 @@
 ### 4.1 连接池与迁移
 - 主池 `sqlx::SqlitePool`（API、命令行、后台任务用）：WAL、`synchronous=NORMAL`（提交不等 fsync，只有 checkpoint 才刷盘；不会损坏库，掉电最多丢最后几个事务）、`busy_timeout` 5 秒、`foreign_keys` 打开，池大小 `MAX_DATABASE_CONNECTIONS`（默认改为 8），取连接最多等 3 秒（sqlx 默认 30 秒；API 被灌时宁可几秒内失败，审查 C-21）。路径仍是 `DB_URL`，默认 `./db_v2.sqlite3`。
 - 会合池：`PeerMap` 单独一个池，连同一个库（`database::rendezvous_pool`，由 `AppState::new` 建）：2 个连接，取连接最多等 200 毫秒，`busy_timeout` 200 毫秒，其余设置同主池。`io_loop` 里查库、写库都走它，不和未认证的 API 请求排同一个公平队列（审查 C-21/C-11：API 被灌时，`io_loop` 每查一次库就要排几秒，UDP 收包和三个 TCP 端口的 accept 一起卡住）。等不到就放弃这次处理，客户端下一轮注册会重试；查库失败不能当成"没有这个 id"（§6 第 7 条）。
+- WAL 的上界（审查 D-11）：SQLite 自带的自动 checkpoint（`wal_autocheckpoint`）是 PASSIVE 的，读写一直交叠时（多个来源灌上报接口）总有读者停在旧快照上，日志永远回绕不了，`-wal` 只增不减（实测约 1.8 GB/分钟，主库始终不到 1 MB，停灌后也不回收）；而且它由每个超过 1000 页的提交触发，被灌时总有一个占着 checkpoint 锁，别的 checkpoint 一试就失败。所以：
+  - 两个池都设 `wal_autocheckpoint=0`（关掉自动 checkpoint）和 `journal_size_limit` 64 MB（日志回绕时把 `-wal` 截回这个大小；SQLite 默认 -1，永不缩）。
+  - 服务进程里只有一个 checkpoint 者：后台任务（`database::spawn_checkpoints`，由 `AppState::spawn_tasks` 启动）每 5 秒先跑一次 `PRAGMA wal_checkpoint(PASSIVE)`，再跑一次 `PRAGMA wal_checkpoint(TRUNCATE)`。PASSIVE 不挡写者，先把能拷的帧拷进主库并 fsync；TRUNCATE 拿写锁、拷完剩下的帧（只有这几百毫秒里新写的）、等还停在日志上的读者退出（之后来的读者直接读主库），把 `-wal` 截成 0 字节。只跑 TRUNCATE 时它要在写锁里拷几秒的积累并 fsync，实测挡写者中位 0.5 秒、最长 2 秒，会合写库因此失败；先跑 PASSIVE 后中位 60 毫秒、最长 0.37 秒（debug 构建，每秒约 2400 次审计写入，测试机磁盘）。
+  - 它用自己的一个连接：不占会合池的 2 个连接，也不在主池里排队（主池被灌时取连接要等最多 3 秒，`busy_timeout` 5 秒）。它的 `busy_timeout` 是 50 毫秒：等写锁、等读者期间它挡着写者，所以要远短于会合池的 200 毫秒写锁等待；等不到就保留已拷的部分、下一轮再来，每分钟最多打一条 warn。拿到写锁以后拷帧和 fsync 的时间不受这个限制，慢盘上可能超过 200 毫秒，这时撞上的会合写库失败、客户端下一轮重试。
+  - 命令行不跑这个任务：服务在跑时由服务的任务 checkpoint；服务没跑时，命令行关掉最后一个连接时 SQLite 自己 checkpoint 并删掉 `-wal`。
+- 磁盘上界：主库文件按各表的上限核算（`peer` 表 §6 第 7 条，`conn_attempt` §8，`device` 和审计表 §9.3，地址簿 §12.1）；`-wal` 另计，约为两次 checkpoint 之间（5 秒多）的写入量：上面的洪水下峰值约 160 MB（修复前同样的洪水 3 分钟涨到 5.6 GB），停灌后回到 0。写入速率越高峰值越大（大致按每秒写入量 × 5 秒 × 每次写入的页数算）；只有 checkpoint 一直拿不到锁时它才会继续长，这时每分钟有一条 warn。
 - 迁移用 `sqlx::migrate!("./migrations")`（编译期嵌入文件，不需要数据库），服务和命令行启动时都执行。原来 `create_tables` 里的 `peer` 表 DDL 挪进 `0001`，保留 `if not exists`，这样能直接接管已有的 hbbs 数据库。
 - 全部用运行时 `sqlx::query()`，不用编译期宏。
 - 迁移文件必须是 LF（校验和按字节算）。已发布的迁移不再修改，第一期合并前可以直接改 `0001`。

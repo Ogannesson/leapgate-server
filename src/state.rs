@@ -54,10 +54,12 @@ impl AppState {
         })
     }
 
-    /// Router health check / GeoIP update and the tracker's finalizer; call inside the server runtime.
+    /// Router health check / GeoIP update, the tracker's finalizer and the WAL checkpoints; call
+    /// inside the server runtime.
     pub fn spawn_tasks(&self) {
         self.router.spawn_tasks();
         self.tracker.spawn_tasks();
+        crate::database::spawn_checkpoints(&self.db);
     }
 }
 

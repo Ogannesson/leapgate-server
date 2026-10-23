@@ -1,4 +1,4 @@
-use hbb_common::{bail, log, ResultType};
+use hbb_common::{bail, log, throttled_log, tokio, ResultType};
 use sqlx::{
     sqlite::{
         SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
@@ -18,6 +18,26 @@ const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(3);
 const RENDEZVOUS_CONNECTIONS: u32 = 2;
 const RENDEZVOUS_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(200);
 const RENDEZVOUS_BUSY_TIMEOUT: Duration = Duration::from_millis(200);
+/// What SQLite cuts the `-wal` file back to whenever it restarts the log (`journal_size_limit`;
+/// its default, -1, never shrinks the file): one burst does not keep its WAL on disk for good.
+const JOURNAL_SIZE_LIMIT: u64 = 64 * 1024 * 1024;
+/// `spawn_checkpoints` (review D-11). SQLite's own checkpoints (`wal_autocheckpoint`) are PASSIVE:
+/// with short reads and writes overlapping all the time (a report flood from many sources), some
+/// reader always holds an older snapshot, the log is never restarted, and the WAL grows without
+/// bound (measured: 1.8 GB a minute while the database stayed under 1 MB). They are also run by
+/// every commit past 1000 pages, so under a flood one of them always holds the checkpoint lock and
+/// any other checkpoint fails at once (measured: our TRUNCATE got through twice in three minutes).
+/// So `open` turns them off and this task is the only checkpointer (`checkpoint`): a PASSIVE run,
+/// then a TRUNCATE one, which takes the write lock, copies the rest, waits for the readers still on
+/// the log (later ones read the database file) and truncates the file to zero.
+/// - Interval: between two runs the WAL holds about this long's writes (PORTA.md §4.1 has the
+///   measured peak), and a run on an empty log costs nothing. Longer means a bigger file and a
+///   longer copy; shorter, more fsyncs for nothing.
+/// - Busy timeout: while it waits for the write lock or for readers, the TRUNCATE run holds up
+///   writers, the rendezvous pool's for at most `RENDEZVOUS_BUSY_TIMEOUT`; so it gives up well
+///   within that (keeping what it copied) and the next run tries again.
+const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
+const CHECKPOINT_BUSY_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// `DB_URL`, or `db_v2.sqlite3` next to the executable's data (same default as upstream hbbs).
 pub(crate) fn db_url() -> String {
@@ -71,6 +91,10 @@ pub(crate) async fn open(url: &str, create: bool) -> ResultType<SqlitePool> {
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
         .busy_timeout(Duration::from_secs(5))
+        .pragma("journal_size_limit", JOURNAL_SIZE_LIMIT.to_string())
+        // `spawn_checkpoints` checkpoints instead (the command line has none: closing its last
+        // connection checkpoints and removes the WAL, as with any SQLite database).
+        .pragma("wal_autocheckpoint", "0")
         .foreign_keys(true)
         .log_statements(log::LevelFilter::Debug);
     let pool = SqlitePoolOptions::new()
@@ -93,6 +117,47 @@ pub(crate) fn rendezvous_pool(main: &SqlitePool) -> SqlitePool {
         .max_connections(RENDEZVOUS_CONNECTIONS)
         .acquire_timeout(RENDEZVOUS_ACQUIRE_TIMEOUT)
         .connect_lazy_with(opt)
+}
+
+/// Checkpoints `main`'s database every `CHECKPOINT_INTERVAL`, truncating the WAL (PORTA.md §4.1).
+/// On a connection of its own: one of the rendezvous pool's would be taken from `io_loop`, and the
+/// main pool's queue behind an API flood and wait 5 s for locks.
+pub(crate) fn spawn_checkpoints(main: &SqlitePool) {
+    let opt = (*main.connect_options())
+        .clone()
+        .busy_timeout(CHECKPOINT_BUSY_TIMEOUT);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_lazy_with(opt);
+    tokio::spawn(async move {
+        let mut timer = tokio::time::interval(CHECKPOINT_INTERVAL);
+        loop {
+            timer.tick().await;
+            checkpoint(&pool).await;
+        }
+    });
+}
+
+/// One checkpoint run; a busy or failed one is logged (throttled) and left to the next run.
+/// PASSIVE first: it copies (and fsyncs) what it can without holding up writers, so the TRUNCATE run
+/// copies under the write lock only what was written meanwhile. Measured under a report flood
+/// (debug build, ~2,400 writes a second): TRUNCATE alone held writers p50 0.5 s, up to 2 s; after a
+/// PASSIVE, p50 60 ms, up to 0.37 s.
+async fn checkpoint(pool: &SqlitePool) {
+    // A failed PASSIVE run fails the TRUNCATE one too, which logs it.
+    sqlx::query("pragma wal_checkpoint(passive)").execute(pool).await.ok();
+    match sqlx::query_as::<_, (i64, i64, i64)>("pragma wal_checkpoint(truncate)")
+        .fetch_one(pool)
+        .await
+    {
+        Ok((0, _, _)) => {}
+        Ok((_, log, copied)) => throttled_log!(
+            Duration::from_secs(60),
+            warn,
+            "WAL checkpoint busy: {copied} of {log} frames copied, retried in {CHECKPOINT_INTERVAL:?}"
+        ),
+        Err(err) => throttled_log!(Duration::from_secs(60), warn, "WAL checkpoint failed: {err}"),
+    }
 }
 
 #[derive(Clone)]
@@ -196,6 +261,29 @@ mod tests {
         assert_eq!(peer.guid, guid);
         assert_eq!(peer.pk, b"pk2");
         assert_eq!(peer.info, "{}");
+    }
+
+    // Review D-11: both pools cut the WAL back on restart and leave checkpoints to
+    // `spawn_checkpoints`, whose `checkpoint` truncates it to zero bytes without losing what it held.
+    #[tokio::test]
+    async fn checkpoint_truncates_the_wal() {
+        let (dir, pool) = crate::testutil::pool().await;
+        let rendezvous = super::rendezvous_pool(&pool);
+        for p in [&pool, &rendezvous] {
+            let limit: i64 = sqlx::query_scalar("pragma journal_size_limit").fetch_one(p).await.unwrap();
+            assert_eq!(limit as u64, super::JOURNAL_SIZE_LIMIT);
+            let auto: i64 = sqlx::query_scalar("pragma wal_autocheckpoint").fetch_one(p).await.unwrap();
+            assert_eq!(auto, 0);
+        }
+        let wal = dir.path().join("db.sqlite3-wal");
+        let db = super::Database::new(rendezvous);
+        for i in 0..200 {
+            db.insert_peer(&format!("wal{i:04}"), b"uuid", &[0; 32], "{}").await.unwrap();
+        }
+        assert!(std::fs::metadata(&wal).unwrap().len() > 0);
+        super::checkpoint(&pool).await;
+        assert_eq!(std::fs::metadata(&wal).unwrap().len(), 0);
+        assert!(db.get_peer("wal0199").await.unwrap().is_some());
     }
 
     // An existing hbbs database (peer table only, no migration history) is taken over in place.
