@@ -5,6 +5,7 @@ use crate::{
     router::Router,
 };
 use hbb_common::{bail, ResultType};
+use sodiumoxide::crypto::sign;
 use sqlx::SqlitePool;
 use std::{path::Path, sync::Arc};
 
@@ -20,11 +21,19 @@ pub(crate) struct AppState {
     /// `/api/ab/peers` pages being built or sent, in all and per user (`api::ab::PageSlots`); the
     /// slots go with the page's bytes.
     pub ab_pages: Arc<PageSlots>,
+    /// The rendezvous private key (`RendezvousServer::get_server_sk`): KeyExchange offers, `IdPk`
+    /// signatures and the Porta API's response signatures. `None` when `-k` gave a public key only.
+    pub sk: Option<Arc<sign::SecretKey>>,
 }
 
 impl AppState {
     /// Builds the state; background tasks are not spawned here (`spawn_tasks`).
-    pub async fn new(db: SqlitePool, cfg: Config, secret_key_file: &Path) -> ResultType<Self> {
+    pub async fn new(
+        db: SqlitePool,
+        cfg: Config,
+        sk: Option<sign::SecretKey>,
+        secret_key_file: &Path,
+    ) -> ResultType<Self> {
         // No key file but ciphertext in the database means the key was lost (database restored
         // without it, another working directory): a new key would make every saved password
         // unreadable without anyone noticing, so refuse to start (PORTA.md §13).
@@ -51,6 +60,7 @@ impl AppState {
             secret: Arc::new(SecretBox::load_or_create(secret_key_file)?),
             cfg,
             ab_pages: Arc::new(PageSlots::new()),
+            sk: sk.map(Arc::new),
             db,
         })
     }
@@ -74,7 +84,7 @@ mod tests {
     async fn missing_key_with_ciphertext_refuses_to_start() {
         let (dir, db) = testutil::pool().await;
         let path = dir.path().join(SECRET_KEY_FILE);
-        let new = || AppState::new(db.clone(), Config::default(), &path);
+        let new = || AppState::new(db.clone(), Config::default(), None, &path);
 
         // Empty database: the first start creates the key.
         new().await.unwrap();

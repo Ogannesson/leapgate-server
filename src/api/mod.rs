@@ -7,6 +7,7 @@
 pub(crate) mod ab;
 pub(crate) mod account;
 pub(crate) mod audit;
+pub(crate) mod devauth;
 pub(crate) mod device;
 pub(crate) mod group;
 mod listen;
@@ -55,6 +56,9 @@ const AB_TAG_DELETE_BODY_LIMIT: usize = 256 * 1024;
 /// `DELETE /api/ab/peer`: ab_model.dart puts every id to delete in one array, up to a book's 5000
 /// ids of 253 bytes (~1.3 MB).
 const AB_PEER_DELETE_BODY_LIMIT: usize = 2 * 1024 * 1024;
+/// `POST /api/porta/v1/heartbeat`: sysinfo (8 KB at most) plus the relay probes (block 02: up to 32
+/// relays × about 270 bytes).
+const PORTA_HEARTBEAT_BODY_LIMIT: usize = 32 * 1024;
 
 pub(crate) fn router(state: AppState) -> axum::Router {
     let limit = DefaultBodyLimit::max;
@@ -75,6 +79,11 @@ pub(crate) fn router(state: AppState) -> axum::Router {
         .route("/api/audit/conn", post(audit::conn).layer(limit(AUDIT_BODY_LIMIT)))
         .route("/api/audit/file", post(audit::file).layer(limit(AUDIT_BODY_LIMIT)))
         .route("/api/audit/alarm", post(audit::alarm).layer(limit(AUDIT_BODY_LIMIT)))
+        // Porta clients' signed reports (devauth.rs)
+        .route("/api/porta/v1/heartbeat", post(device::porta_heartbeat).layer(limit(PORTA_HEARTBEAT_BODY_LIMIT)))
+        .route("/api/porta/v1/audit/conn", post(audit::porta_conn).layer(limit(AUDIT_BODY_LIMIT)))
+        .route("/api/porta/v1/audit/file", post(audit::porta_file).layer(limit(AUDIT_BODY_LIMIT)))
+        .route("/api/porta/v1/audit/alarm", post(audit::porta_alarm).layer(limit(AUDIT_BODY_LIMIT)))
         // Address book (ab.rs)
         .route("/api/ab/personal", post(ab::personal))
         .route("/api/ab/settings", post(ab::settings))
@@ -368,14 +377,16 @@ async fn not_found() -> Response {
 /// others) are plain text; §9.1 wants JSON errors. No handler of ours answers either status. The
 /// audit endpoints keep the 413 too: the client gives up on a 4xx at once and retries a 200 with
 /// an error, and resending the same body cannot help.
+/// On the Porta endpoints the body is the Porta error shape (`devauth::porta_error`).
 async fn json_rejections(req: Request<Body>, next: Next) -> Response {
+    let porta = is_porta(req.uri().path());
     let resp = next.run(req).await;
-    let msg = match resp.status() {
-        StatusCode::METHOD_NOT_ALLOWED => "Method Not Allowed",
-        StatusCode::PAYLOAD_TOO_LARGE => "Request body too large",
+    let (code, msg) = match resp.status() {
+        StatusCode::METHOD_NOT_ALLOWED => ("method_not_allowed", "Method Not Allowed"),
+        StatusCode::PAYLOAD_TOO_LARGE => ("too_large", "Request body too large"),
         _ => return resp,
     };
-    let mut json = error(resp.status(), msg);
+    let mut json = if porta { devauth::porta_error(resp.status(), code, msg) } else { error(resp.status(), msg) };
     if let Some(allow) = resp.headers().get(header::ALLOW) {
         json.headers_mut().insert(header::ALLOW, allow.clone());
     }
@@ -389,33 +400,50 @@ fn internal_error_is_200(path: &str) -> bool {
     path.starts_with("/api/audit/") || path == "/api/currentUser"
 }
 
+/// The Porta clients' signed endpoints (`devauth`), which may answer 5xx.
+fn is_porta(path: &str) -> bool {
+    path.starts_with(devauth::PREFIX)
+}
+
 /// The device reports, which the client sends only from its Rust side (12-second HTTP timeout):
-/// they get `listen::REPORT_TIMEOUT` instead of `listen::REQUEST_TIMEOUT`.
+/// they get `listen::REPORT_TIMEOUT` instead of `listen::REQUEST_TIMEOUT`. The Porta reports too.
 fn is_report(path: &str) -> bool {
-    matches!(path, "/api/heartbeat" | "/api/sysinfo" | "/api/sysinfo_ver") || path.starts_with("/api/audit/")
+    matches!(path, "/api/heartbeat" | "/api/sysinfo" | "/api/sysinfo_ver")
+        || path.starts_with("/api/audit/")
+        || is_porta(path)
 }
 
 /// A request not answered within its timeout (`is_report`; receiving its body included) gets an
-/// internal-error answer (`internal_error_is_200`).
+/// internal-error answer (`timeout_response`).
 async fn request_timeout(req: Request<Body>, next: Next) -> Response {
-    let path = req.uri().path();
-    let ok_status = internal_error_is_200(path);
-    let limit = if is_report(path) { listen::REPORT_TIMEOUT } else { listen::REQUEST_TIMEOUT };
+    let path = req.uri().path().to_owned();
+    let limit = if is_report(&path) { listen::REPORT_TIMEOUT } else { listen::REQUEST_TIMEOUT };
     match tokio::time::timeout(limit, next.run(req)).await {
         Ok(resp) => resp,
-        Err(_) if ok_status => ok_error("Request timeout"),
-        Err(_) => error(StatusCode::BAD_REQUEST, "Request timeout"),
+        Err(_) => timeout_response(&path),
     }
 }
 
-/// A panicking handler answers like any other internal error (`internal_error_is_200`) instead of
-/// dropping the connection (needs `panic = "unwind"`, the default; the release profile no longer
-/// aborts).
+/// 503 on the Porta endpoints, else 200 or 400 + `{"error"}` (`internal_error_is_200`).
+fn timeout_response(path: &str) -> Response {
+    if is_porta(path) {
+        devauth::porta_internal("request timeout")
+    } else if internal_error_is_200(path) {
+        ok_error("Request timeout")
+    } else {
+        error(StatusCode::BAD_REQUEST, "Request timeout")
+    }
+}
+
+/// A panicking handler answers like any other internal error (`internal_error_is_200`; 503 on the
+/// Porta endpoints) instead of dropping the connection (needs `panic = "unwind"`, the default; the
+/// release profile no longer aborts).
 async fn catch_panic(req: Request<Body>, next: Next) -> Response {
-    let ok_status = internal_error_is_200(req.uri().path());
+    let path = req.uri().path().to_owned();
     match AssertUnwindSafe(next.run(req)).catch_unwind().await {
         Ok(resp) => resp,
-        Err(_) if ok_status => ok_internal("handler panicked"),
+        Err(_) if is_porta(&path) => devauth::porta_internal("handler panicked"),
+        Err(_) if internal_error_is_200(&path) => ok_internal("handler panicked"),
         Err(_) => ApiError::internal("handler panicked").0,
     }
 }
@@ -561,6 +589,68 @@ mod tests {
             let (status, ct, body) = send(&app, method, path, None, "").await;
             assert_eq!((status, ct.as_str()), (StatusCode::OK, JSON), "{path}");
             assert_eq!(&body[..], br#"{"error":"Server error"}"#, "{path}");
+        }
+    }
+
+    /// Phase 3 contract 01 §3.9: on the Porta endpoints axum's 413 and 405 carry the Porta error
+    /// shape, a timeout or panic is a 503, an unknown path a 404; the compatibility answers are as
+    /// before (`wrong_method_and_big_body_are_json`, `panics_do_not_become_5xx`).
+    #[tokio::test]
+    async fn porta_endpoints_errors() {
+        let t = testutil::app().await;
+        let dev = testutil::Device::new("unknown1");
+        let porta_json = |body: &[u8]| serde_json::from_slice::<serde_json::Value>(body).unwrap();
+
+        // Over the heartbeat's 32 KB (the header must parse for the body to be read at all).
+        let big = vec![b' '; PORTA_HEARTBEAT_BODY_LIMIT + 1];
+        let (auth, _) = dev.auth("heartbeat", crate::common::now() as i64, &big);
+        let (status, headers, body) = testutil::send_porta(&t.app, "/api/porta/v1/heartbeat", Some(&auth), &big).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(headers[header::CONTENT_TYPE], JSON);
+        assert_eq!(porta_json(&body)["error"], "too_large");
+        assert!(porta_json(&body)["message"].is_string());
+        // Within it: read, and the device is unknown.
+        let fits = vec![b' '; PORTA_HEARTBEAT_BODY_LIMIT];
+        let (auth, _) = dev.auth("heartbeat", crate::common::now() as i64, &fits);
+        let (status, _, body) = testutil::send_porta(&t.app, "/api/porta/v1/heartbeat", Some(&auth), &fits).await;
+        assert_eq!((status, &porta_json(&body)["error"]), (StatusCode::UNAUTHORIZED, &serde_json::json!("unknown_device")));
+        // The audits keep 64 KB.
+        let big = vec![b' '; AUDIT_BODY_LIMIT + 1];
+        let (auth, _) = dev.auth("audit/conn", crate::common::now() as i64, &big);
+        let (status, _, body) = testutil::send_porta(&t.app, "/api/porta/v1/audit/conn", Some(&auth), &big).await;
+        assert_eq!((status, &porta_json(&body)["error"]), (StatusCode::PAYLOAD_TOO_LARGE, &serde_json::json!("too_large")));
+
+        let req = axum::http::Request::builder().method("GET").uri("/api/porta/v1/heartbeat").body(Body::empty()).unwrap();
+        let resp = tower::ServiceExt::oneshot(t.app.clone(), req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert!(resp.headers().contains_key(header::ALLOW));
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], br#"{"error":"method_not_allowed","message":"Method Not Allowed"}"#);
+
+        let (status, _, _) = testutil::send_porta(&t.app, "/api/porta/v1/nope", None, b"{}").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        async fn boom() -> Response {
+            panic!("boom")
+        }
+        let app = axum::Router::new().route("/api/porta/v1/x", get(boom)).layer(middleware::from_fn(catch_panic));
+        let (status, ct, body) = send(&app, "GET", "/api/porta/v1/x", None, "").await;
+        assert_eq!((status, ct.as_str()), (StatusCode::SERVICE_UNAVAILABLE, JSON));
+        assert_eq!(&body[..], br#"{"error":"internal","message":"Server error"}"#);
+
+        // Timeouts: 503 on the Porta endpoints (which get the reports' 10 s), as before elsewhere.
+        assert!(is_report("/api/porta/v1/heartbeat") && is_report("/api/porta/v1/audit/file"));
+        let cases = [
+            ("/api/porta/v1/heartbeat", StatusCode::SERVICE_UNAVAILABLE, &br#"{"error":"internal","message":"Server error"}"#[..]),
+            ("/api/audit/conn", StatusCode::OK, br#"{"error":"Request timeout"}"#),
+            ("/api/currentUser", StatusCode::OK, br#"{"error":"Request timeout"}"#),
+            ("/api/heartbeat", StatusCode::BAD_REQUEST, br#"{"error":"Request timeout"}"#),
+        ];
+        for (path, status, want) in cases {
+            let resp = timeout_response(path);
+            assert_eq!(resp.status(), status, "{path}");
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(&body[..], want, "{path}");
         }
     }
 

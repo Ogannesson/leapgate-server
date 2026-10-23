@@ -40,6 +40,7 @@ const USAGE: &str = "Usage: porta-server <command> [options]
   ab list | ab create <name> --owner <user> [--note <s>] | ab rename <name> <new> | ab del <name>
   ab grant <book> --user <u>|--group <g> ro|rw|full | ab revoke <book> --user <u>|--group <g>
   device list [--legacy] | device pin-relay <device> <host|none>
+  device key <device> | device key reset [--forget] <device>
   strategy show [<device>] | strategy set <device|'*'> <key> <value>
   strategy unset|forget <device|'*'> <key> | strategy repush <device|'*'>
   relay status | route test <ipA> <ipB>
@@ -117,6 +118,7 @@ fn changes_database(args: &Args) -> bool {
     let mut words = args.pos.iter().map(String::as_str);
     match (words.next(), words.next()) {
         (Some("user" | "group" | "ab" | "device"), Some("list")) | (Some("strategy"), Some("show")) => false,
+        (Some("device"), Some("key")) => words.next() == Some("reset"),
         (Some("relay" | "route" | "geo" | "stats"), _) => false,
         (Some("import"), _) => !args.opts.iter().any(|(n, _)| n == "--dry-run"),
         _ => true,
@@ -180,7 +182,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--note", "--user", "--group", "--days",
 ];
 const BOOL_FLAGS: &[&str] = &[
-    "-h", "--help", "--admin", "--share-devices", "--legacy", "--dry-run",
+    "-h", "--help", "--admin", "--share-devices", "--legacy", "--dry-run", "--forget",
 ];
 
 /// Command line words: positionals in order, plus options from anywhere on the line.
@@ -423,6 +425,8 @@ pub(super) mod tests {
             &["group", "member", "add", "g", "alice"],
             &["ab", "grant", "b", "--user", "alice", "rw"],
             &["device", "pin-relay", "123", "none"],
+            &["device", "key", "reset", "123456"],
+            &["device", "key", "reset", "--forget", "123456"],
             &["strategy", "set", "*", "k", "v"],
             &["strategy", "repush", "*"],
             &["import", "rustdesk-api", "x.db"],
@@ -434,6 +438,7 @@ pub(super) mod tests {
             &["group", "list"],
             &["ab", "list"],
             &["device", "list", "--legacy"],
+            &["device", "key", "123456"],
             &["strategy", "show", "123"],
             &["relay", "status"],
             &["route", "test", "1.1.1.1", "8.8.8.8"],

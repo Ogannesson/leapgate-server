@@ -2,13 +2,16 @@
 //! Success: 200 + empty body (`ok_empty`); internal error or over the source's report budget: 200 +
 //! `{"error"}` (`ok_internal`, `admit`; the client retries); bad body: 400. Handlers return
 //! `Response` so `?` cannot produce a plain 400.
+//! The Porta clients' signed audits (`porta_*`, phase 3 contract 01 §3.7) write the same way:
+//! signed 200 + `{"api":1}`, 503 on a failed write.
 
 use super::{
-    device::{report_allowed, uuid_matches},
+    devauth::{parse_body, porta_internal, signed_json, SignedBody},
+    device::{report_allowed, uuid_matches, UuidCheck},
     ok_empty, ok_error, ok_internal, parse_json, ClientIp,
 };
 use crate::{conn_tracker::clip, peer::MAX_PEER_ID_LEN, state::AppState};
-use axum::{body::Bytes, extract::State, response::Response};
+use axum::{body::Bytes, extract::State, http::StatusCode, response::Response};
 use once_cell::sync::Lazy;
 use serde::de::{DeserializeOwned, Deserializer, IgnoredAny, SeqAccess, Visitor};
 use serde_derive::{Deserialize, Serialize};
@@ -247,33 +250,70 @@ impl<'de> serde::Deserialize<'de> for FirstTwo {
     }
 }
 
-/// Shared by the device-side audits: a repeated nonce is a success without writing; a failed
-/// `uuid_matches` (unregistered id or wrong uuid) answers success without writing; the nonce is registered only after `write` succeeded, so
-/// the client's retry of a failed write gets stored. No nonce (1.4.x), `""` or one longer than
+/// Who sent a device-side audit.
+enum Identity<'a> {
+    /// A compatibility report: passes on `uuid_matches` giving `Match` only (an unregistered id, a
+    /// wrong uuid, or a device whose key is pinned is skipped).
+    Compat { uuid: Option<&'a str> },
+    /// A Porta report whose signature verified (`SignedBody`): nothing more to check.
+    Verified,
+}
+
+enum ReportOutcome {
+    Written,
+    /// A repeated nonce, or the compatibility identity check failed: nothing written.
+    Skipped,
+    /// Nothing written and the nonce not registered, so the client's retry gets stored.
+    Failed(sqlx::Error),
+}
+
+/// Shared by the device-side audits of both paths, which share the nonce table too (a record that
+/// arrives on both is stored once): a repeated nonce is skipped; then the identity; the nonce is
+/// registered only after `write` succeeded. No nonce (1.4.x), `""` or one longer than
 /// `MAX_NONCE_LEN`: no dedupe.
 async fn report(
     db: &SqlitePool,
     id: &str,
-    uuid: Option<&str>,
+    identity: Identity<'_>,
     nonce: Option<&str>,
     write: impl Future<Output = Result<(), sqlx::Error>>,
-) -> Response {
+) -> ReportOutcome {
     let nonce = nonce.filter(|n| !n.is_empty() && n.len() <= MAX_NONCE_LEN);
     if nonce.is_some_and(nonce_seen) {
-        return ok_empty();
+        return ReportOutcome::Skipped;
     }
-    match uuid_matches(db, id, uuid).await {
-        Ok(true) => {}
-        Ok(false) => return ok_empty(),
-        Err(err) => return ok_internal(err),
+    if let Identity::Compat { uuid } = identity {
+        match uuid_matches(db, id, uuid).await {
+            Ok(UuidCheck::Match) => {}
+            Ok(_) => return ReportOutcome::Skipped,
+            Err(err) => return ReportOutcome::Failed(err),
+        }
     }
     if let Err(err) = write.await {
-        return ok_internal(err);
+        return ReportOutcome::Failed(err);
     }
     if let Some(nonce) = nonce {
         remember_nonce(nonce);
     }
-    ok_empty()
+    ReportOutcome::Written
+}
+
+/// A compatibility audit's answer: 200 + empty body, or 200 + `{"error"}` (the client retries).
+fn compat_answer(outcome: ReportOutcome) -> Response {
+    match outcome {
+        ReportOutcome::Written | ReportOutcome::Skipped => ok_empty(),
+        ReportOutcome::Failed(err) => ok_internal(err),
+    }
+}
+
+/// A Porta audit's answer: signed 200 + `{"api":1}`, or 503 (the client retries).
+fn porta_answer(state: &AppState, signed: &SignedBody, outcome: ReportOutcome) -> Response {
+    match outcome {
+        ReportOutcome::Written | ReportOutcome::Skipped => {
+            signed_json(state, &signed.sig, StatusCode::OK, &serde_json::json!({ "api": 1 }))
+        }
+        ReportOutcome::Failed(err) => porta_internal(err),
+    }
 }
 
 /// `/api/audit/conn` body (note 03 §5.2): new / authed (no `action`) / close from the controlled
@@ -282,6 +322,8 @@ async fn report(
 /// 2 MB body into ~80 MB of `Value`s, before any identity check).
 #[derive(Deserialize)]
 struct ConnReq {
+    /// Missing: `""`, which no registered device has. On the Porta path the signed id replaces it.
+    #[serde(default)]
     id: String,
     uuid: Option<String>,
     nonce: Option<String>,
@@ -311,13 +353,7 @@ pub(crate) async fn conn(State(state): State<AppState>, ClientIp(ip): ClientIp, 
         Ok(req) => req,
         Err(resp) => return resp,
     };
-    if let Some(note) = &mut req.note {
-        clip(note, MAX_TEXT_LEN);
-    }
-    clip(&mut req.ip, MAX_IP_LEN);
-    for (field, max) in req.peer.0.iter_mut().zip([MAX_PEER_ID_LEN, MAX_PEER_NAME_LEN]) {
-        clip(field, max);
-    }
+    clip_conn(&mut req);
     let db = &state.db;
     if let (Some(note), None) = (&req.note, &req.uuid) {
         // Session note: no identity to check; updates the newest `NOTE_ROWS` records of the session
@@ -336,7 +372,35 @@ pub(crate) async fn conn(State(state): State<AppState>, ClientIp(ip): ClientIp, 
             Err(err) => ok_internal(err),
         };
     }
-    report(db, &req.id, req.uuid.as_deref(), req.nonce.as_deref(), write_conn(db, &req)).await
+    let identity = Identity::Compat { uuid: req.uuid.as_deref() };
+    compat_answer(conn_inner(db, &req, identity).await)
+}
+
+/// `POST /api/porta/v1/audit/conn`: new / authed / close of a signed device; no note branch (a `note`
+/// key is ignored).
+pub(crate) async fn porta_conn(State(state): State<AppState>, signed: SignedBody) -> Response {
+    let mut req: ConnReq = match parse_body(&signed.body) {
+        Ok(req) => req,
+        Err(resp) => return resp,
+    };
+    req.id.clone_from(&signed.id);
+    clip_conn(&mut req);
+    let outcome = conn_inner(&state.db, &req, Identity::Verified).await;
+    porta_answer(&state, &signed, outcome)
+}
+
+fn clip_conn(req: &mut ConnReq) {
+    if let Some(note) = &mut req.note {
+        clip(note, MAX_TEXT_LEN);
+    }
+    clip(&mut req.ip, MAX_IP_LEN);
+    for (field, max) in req.peer.0.iter_mut().zip([MAX_PEER_ID_LEN, MAX_PEER_NAME_LEN]) {
+        clip(field, max);
+    }
+}
+
+async fn conn_inner(db: &SqlitePool, req: &ConnReq, identity: Identity<'_>) -> ReportOutcome {
+    report(db, &req.id, identity, req.nonce.as_deref(), write_conn(db, req)).await
 }
 
 /// The latest record of a connection still open, `?` device and `?` conn_id (`conn_id` restarts with
@@ -417,6 +481,7 @@ async fn write_conn(db: &SqlitePool, req: &ConnReq) -> Result<(), sqlx::Error> {
 /// `/api/audit/file` body (note 03 §5.3); `info` is a JSON string, stored as is.
 #[derive(Deserialize)]
 struct FileReq {
+    #[serde(default)]
     id: String,
     uuid: Option<String>,
     nonce: Option<String>,
@@ -436,15 +501,31 @@ struct FileReq {
 
 /// `POST /api/audit/file`.
 pub(crate) async fn file(State(state): State<AppState>, ClientIp(ip): ClientIp, body: Bytes) -> Response {
-    let mut req: FileReq = match admit(ip, &body) {
+    let req: FileReq = match admit(ip, &body) {
         Ok(req) => req,
         Err(resp) => return resp,
     };
+    let uuid = req.uuid.clone();
+    compat_answer(file_inner(&state.db, req, Identity::Compat { uuid: uuid.as_deref() }).await)
+}
+
+/// `POST /api/porta/v1/audit/file`.
+pub(crate) async fn porta_file(State(state): State<AppState>, signed: SignedBody) -> Response {
+    let mut req: FileReq = match parse_body(&signed.body) {
+        Ok(req) => req,
+        Err(resp) => return resp,
+    };
+    req.id.clone_from(&signed.id);
+    let outcome = file_inner(&state.db, req, Identity::Verified).await;
+    porta_answer(&state, &signed, outcome)
+}
+
+async fn file_inner(db: &SqlitePool, mut req: FileReq, identity: Identity<'_>) -> ReportOutcome {
     clip(&mut req.peer_id, MAX_PEER_ID_LEN);
     clip(&mut req.path, MAX_TEXT_LEN);
     clip(&mut req.info, MAX_TEXT_LEN);
     let write = async {
-        make_room(&state.db, "audit_file").await?;
+        make_room(db, "audit_file").await?;
         sqlx::query(
             "insert into audit_file(device_id, conn_id, peer_id, type, path, is_file, info, created_at)
              values(?, ?, ?, ?, ?, ?, ?, ?)",
@@ -457,16 +538,17 @@ pub(crate) async fn file(State(state): State<AppState>, ClientIp(ip): ClientIp, 
         .bind(req.is_file)
         .bind(&req.info)
         .bind(crate::common::now() as i64)
-        .execute(&state.db)
+        .execute(db)
         .await
         .map(|_| ())
     };
-    report(&state.db, &req.id, req.uuid.as_deref(), req.nonce.as_deref(), write).await
+    report(db, &req.id, identity, req.nonce.as_deref(), write).await
 }
 
 /// `/api/audit/alarm` body (note 03 §5.4): the field is `typ` here; unknown values are kept.
 #[derive(Deserialize)]
 struct AlarmReq {
+    #[serde(default)]
     id: String,
     uuid: Option<String>,
     nonce: Option<String>,
@@ -478,24 +560,40 @@ struct AlarmReq {
 
 /// `POST /api/audit/alarm`.
 pub(crate) async fn alarm(State(state): State<AppState>, ClientIp(ip): ClientIp, body: Bytes) -> Response {
-    let mut req: AlarmReq = match admit(ip, &body) {
+    let req: AlarmReq = match admit(ip, &body) {
         Ok(req) => req,
         Err(resp) => return resp,
     };
+    let uuid = req.uuid.clone();
+    compat_answer(alarm_inner(&state.db, req, Identity::Compat { uuid: uuid.as_deref() }).await)
+}
+
+/// `POST /api/porta/v1/audit/alarm`.
+pub(crate) async fn porta_alarm(State(state): State<AppState>, signed: SignedBody) -> Response {
+    let mut req: AlarmReq = match parse_body(&signed.body) {
+        Ok(req) => req,
+        Err(resp) => return resp,
+    };
+    req.id.clone_from(&signed.id);
+    let outcome = alarm_inner(&state.db, req, Identity::Verified).await;
+    porta_answer(&state, &signed, outcome)
+}
+
+async fn alarm_inner(db: &SqlitePool, mut req: AlarmReq, identity: Identity<'_>) -> ReportOutcome {
     clip(&mut req.info, MAX_TEXT_LEN);
     let write = async {
-        make_room(&state.db, "audit_alarm").await?;
+        make_room(db, "audit_alarm").await?;
         sqlx::query("insert into audit_alarm(device_id, conn_id, typ, info, created_at) values(?, ?, ?, ?, ?)")
             .bind(&req.id)
             .bind(req.conn_id)
             .bind(req.typ)
             .bind(&req.info)
             .bind(crate::common::now() as i64)
-            .execute(&state.db)
+            .execute(db)
             .await
             .map(|_| ())
     };
-    report(&state.db, &req.id, req.uuid.as_deref(), req.nonce.as_deref(), write).await
+    report(db, &req.id, identity, req.nonce.as_deref(), write).await
 }
 
 #[cfg(test)]
@@ -1075,5 +1173,98 @@ mod tests {
         assert_eq!(newest.0, "5");
         assert!(newest.1.is_some_and(|c| c > 0));
         assert_eq!(count(db, "audit_conn").await, MAX_ROWS);
+    }
+
+    // ---- Phase 3 contract 01 §3.5, §3.7 ----
+
+    /// A device whose key is pinned: its unsigned audits are answered like a mismatch, not stored.
+    #[tokio::test]
+    async fn pinned_device_unsigned_audits_dropped() {
+        let t = testutil::app().await;
+        let db = &t.state.db;
+        add_peer(db, "111").await;
+        sqlx::query("update peer set pk_pinned_at = 1 where id = '111'").execute(db).await.unwrap();
+        let uuid = base64::encode(UUID);
+        ok(&t.app, "/api/audit/file", file_body("111", Some(UUID), Some(&nonce()))).await;
+        ok(&t.app, "/api/audit/alarm", json!({"id": "111", "uuid": uuid, "typ": 0, "info": "{}"})).await;
+        ok(&t.app, "/api/audit/conn", json!({"id": "111", "uuid": uuid, "action": "new", "conn_id": 1})).await;
+        for table in TABLES {
+            assert_eq!(count(db, table).await, 0, "{table}");
+        }
+        // A body without `id` is no longer a 400: an id no device has, success shape, nothing stored.
+        ok(&t.app, "/api/audit/alarm", json!({"uuid": uuid, "typ": 0})).await;
+        assert_eq!(count(db, "audit_alarm").await, 0);
+    }
+
+    /// Signed 200 + `{"api":1}`.
+    fn assert_porta_ok(t: &testutil::TestApp, r: &testutil::PortaResp) {
+        assert_eq!(r.status, StatusCode::OK, "{}", String::from_utf8_lossy(&r.body));
+        assert_eq!(&r.body[..], br#"{"api":1}"#);
+        assert!(testutil::verify_server_sig(&t.state, &r.sig, &r.headers, &r.body));
+    }
+
+    #[tokio::test]
+    async fn porta_audits() {
+        let t = testutil::app().await;
+        let db = &t.state.db;
+        let dev = testutil::porta_device(&t.state, "pa0001", UUID).await;
+
+        // A nonce first seen on the compatibility path (before the key is pinned) is not stored again.
+        let n = nonce();
+        ok(&t.app, "/api/audit/file", file_body("pa0001", Some(UUID), Some(&n))).await;
+        let r = dev.post(&t.app, "audit/file", file_body("pa0001", None, Some(&n)).to_string().as_bytes()).await;
+        assert_porta_ok(&t, &r);
+        assert_eq!(count(db, "audit_file").await, 1);
+
+        // The id in the body is ignored: stored under the signed one.
+        let r = dev.post(&t.app, "audit/file", file_body("someone", None, Some(&nonce())).to_string().as_bytes()).await;
+        assert_porta_ok(&t, &r);
+        let ids: Vec<String> = sqlx::query_scalar("select device_id from audit_file").fetch_all(db).await.unwrap();
+        assert_eq!(ids, ["pa0001", "pa0001"]);
+        let r = dev.post(&t.app, "audit/alarm", br#"{"typ":3,"info":"x","conn_id":2}"#).await;
+        assert_porta_ok(&t, &r);
+        let alarm: (String, i64) = sqlx::query_as("select device_id, typ from audit_alarm").fetch_one(db).await.unwrap();
+        assert_eq!(alarm, ("pa0001".into(), 3));
+
+        // A failed write: 503, unsigned, and the nonce not registered, so the retry is stored.
+        sqlx::query("alter table audit_file rename to audit_file_away").execute(db).await.unwrap();
+        let n = nonce();
+        let body = file_body("pa0001", None, Some(&n)).to_string();
+        let r = dev.post(&t.app, "audit/file", body.as_bytes()).await;
+        assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(r.json()["error"], "internal");
+        assert!(!r.headers.contains_key(crate::api::devauth::SIG_HEADER));
+        sqlx::query("alter table audit_file_away rename to audit_file").execute(db).await.unwrap();
+        // Signed a second later than the first try, as the client's retry is (the same signature
+        // within one second would be a replay).
+        let (auth, sig) = dev.auth("audit/file", crate::common::now() as i64 + 1, body.as_bytes());
+        let (status, headers, resp) = testutil::send_porta(&t.app, "/api/porta/v1/audit/file", Some(&auth), body.as_bytes()).await;
+        assert_porta_ok(&t, &testutil::PortaResp { status, headers, body: resp, sig });
+        assert_eq!(count(db, "audit_file").await, 3);
+
+        // conn: new / authed / close as on the compatibility path, and no note branch: a body with a
+        // note and no uuid is an authed report like any other, and notes nothing.
+        for body in [
+            json!({"action": "new", "conn_id": 1, "ip": "203.0.113.5"}),
+            json!({"conn_id": 1, "session_id": 77, "peer": ["999", "bob"], "type": 0}),
+            json!({"note": "hi", "session_id": 77, "conn_id": 2}),
+        ] {
+            assert_porta_ok(&t, &dev.post(&t.app, "audit/conn", body.to_string().as_bytes()).await);
+        }
+        let rows: Vec<(String, i64, String, String, String)> =
+            sqlx::query_as("select device_id, conn_id, session_id, peer_id, note from audit_conn order by id")
+                .fetch_all(db)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            [
+                ("pa0001".into(), 1, "77".into(), "999".into(), String::new()),
+                ("pa0001".into(), 2, "77".into(), String::new(), String::new()),
+            ]
+        );
+        // A bad body: 400, unsigned.
+        let r = dev.post(&t.app, "audit/alarm", b"{").await;
+        assert_eq!((r.status, &r.json()["error"]), (StatusCode::BAD_REQUEST, &json!("bad_request")));
     }
 }

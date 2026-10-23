@@ -4,7 +4,7 @@ use crate::{config::Config, state::AppState};
 use axum::{
     body::{Body, Bytes},
     extract::ConnectInfo,
-    http::{header, Request, StatusCode},
+    http::{header, HeaderMap, Request, StatusCode},
 };
 use sqlx::SqlitePool;
 use std::net::SocketAddr;
@@ -27,12 +27,13 @@ pub(crate) async fn pool() -> (TempDir, SqlitePool) {
     (dir, pool)
 }
 
-/// Full `AppState` (skeleton-level Router/ConnTracker, default `Config`, temporary secret key) and the router.
+/// Full `AppState` (skeleton-level Router/ConnTracker, default `Config`, a fresh rendezvous private
+/// key, temporary secret key) and the router.
 pub(crate) async fn app() -> TestApp {
     let (dir, db) = pool().await;
-    let state = AppState::new(db, Config::default(), &dir.path().join(crate::crypto::SECRET_KEY_FILE))
-        .await
-        .unwrap();
+    let (_, sk) = sodiumoxide::crypto::sign::gen_keypair();
+    let key_file = dir.path().join(crate::crypto::SECRET_KEY_FILE);
+    let state = AppState::new(db, Config::default(), Some(sk), &key_file).await.unwrap();
     let app = crate::api::router(state.clone());
     TestApp { dir, state, app }
 }
@@ -68,6 +69,97 @@ pub(crate) async fn create_user(db: &SqlitePool, name: &str, password: &str, is_
         .await
         .unwrap();
     (id, token)
+}
+
+/// A Porta device: its id and signing key pair.
+pub(crate) struct Device {
+    pub id: String,
+    pub pk: sodiumoxide::crypto::sign::PublicKey,
+    pub sk: sodiumoxide::crypto::sign::SecretKey,
+}
+
+/// A signed Porta answer and the signature of the request it answers.
+pub(crate) struct PortaResp {
+    pub status: StatusCode,
+    pub headers: HeaderMap,
+    pub body: Bytes,
+    pub sig: [u8; 64],
+}
+
+impl PortaResp {
+    pub fn json(&self) -> serde_json::Value {
+        serde_json::from_slice(&self.body).unwrap()
+    }
+}
+
+impl Device {
+    /// A fresh key pair, not registered anywhere.
+    pub fn new(id: &str) -> Self {
+        let (pk, sk) = sodiumoxide::crypto::sign::gen_keypair();
+        Self { id: id.to_owned(), pk, sk }
+    }
+
+    /// The `Porta-Device-Auth` header value and the signature, for `POST /api/porta/v1/<endpoint>`.
+    pub fn auth(&self, endpoint: &str, t: i64, body: &[u8]) -> (String, [u8; 64]) {
+        use crate::api::devauth::{b64url, request_message};
+        let message = request_message("POST", endpoint, &self.id, t, body);
+        let sig = sodiumoxide::crypto::sign::sign_detached(&message, &self.sk).to_bytes();
+        (format!("v1 id={}, t={t}, s={}", b64url(self.id.as_bytes()), b64url(&sig)), sig)
+    }
+
+    /// Signs (now) and posts `body` to `/api/porta/v1/<endpoint>`.
+    pub async fn post(&self, app: &axum::Router, endpoint: &str, body: &[u8]) -> PortaResp {
+        let (auth, sig) = self.auth(endpoint, crate::common::now() as i64, body);
+        let (status, headers, body) = send_porta(app, &format!("/api/porta/v1/{endpoint}"), Some(&auth), body).await;
+        PortaResp { status, headers, body, sig }
+    }
+}
+
+/// A device registered with hbbs (a `peer` row with its public key and `uuid`).
+pub(crate) async fn porta_device(state: &AppState, id: &str, uuid: &[u8]) -> Device {
+    let dev = Device::new(id);
+    crate::database::Database::new(state.db.clone())
+        .insert_peer(id, uuid, &dev.pk.0, "{}")
+        .await
+        .unwrap();
+    dev
+}
+
+/// Posts like the Porta client (`Content-Type: application/json`, optional `Porta-Device-Auth`),
+/// from TCP peer `127.0.0.1:50000`. Returns `(status, headers, body)`.
+pub(crate) async fn send_porta(
+    app: &axum::Router,
+    uri: &str,
+    auth: Option<&str>,
+    body: &[u8],
+) -> (StatusCode, HeaderMap, Bytes) {
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(auth) = auth {
+        req = req.header("Porta-Device-Auth", auth);
+    }
+    let mut req = req.body(Body::from(body.to_vec())).unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 50000))));
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let (status, headers) = (resp.status(), resp.headers().clone());
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    (status, headers, body)
+}
+
+/// Whether `headers` carry a `Porta-Server-Sig` over `body` for the request signed `req_sig`, by
+/// the state's rendezvous key.
+pub(crate) fn verify_server_sig(state: &AppState, req_sig: &[u8; 64], headers: &HeaderMap, body: &[u8]) -> bool {
+    use sodiumoxide::crypto::sign;
+    let Some(sig) = headers.get(crate::api::devauth::SIG_HEADER) else {
+        return false;
+    };
+    let sig = base64::decode_config(sig.to_str().unwrap(), base64::URL_SAFE_NO_PAD).unwrap();
+    let pk = state.sk.as_ref().unwrap().public_key();
+    let message = crate::api::devauth::response_message(req_sig, body);
+    sign::verify_detached(&sign::Signature::from_bytes(&sig).unwrap(), &message, &pk)
 }
 
 /// Sends one request like the client does (`Content-Type: application/json`, optional Bearer token;

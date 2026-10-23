@@ -1,7 +1,7 @@
 //! Account endpoints (PORTA.md §9.2, §11; note 03 §2).
 
 use super::{
-    device::{make_room, uuid_matches, BEGIN_WRITE, MAX_UUID_LEN},
+    device::{make_room, uuid_matches, UuidCheck, BEGIN_WRITE, MAX_UUID_LEN},
     ok_json, parse_json, ApiError, ApiResult, CurrentUser,
 };
 use crate::{
@@ -358,7 +358,8 @@ pub(crate) async fn login(State(state): State<AppState>, body: Bytes) -> ApiResu
     // user has no token on it left (at most 50 tokens a user; §9.3). A new row is kept to the
     // device table's limit like a report's (`make_room`, review D-7): with no room the login still
     // succeeds, without a row or a binding.
-    if !req.id.is_empty() && uuid_matches(&state.db, &req.id, Some(&req.uuid)).await? {
+    // A pinned key does not matter here (phase 3 contract 01 §3.5): the binding is as before.
+    if !req.id.is_empty() && uuid_matches(&state.db, &req.id, Some(&req.uuid)).await? != UuidCheck::Mismatch {
         let mut tx = state.db.begin_with(BEGIN_WRITE).await?;
         if make_room(&mut tx, &req.id).await? {
             sqlx::query(

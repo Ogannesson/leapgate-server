@@ -275,7 +275,6 @@ struct Inner {
     software_url: String,
     mask: Option<Ipv4Network>,
     local_ip: String,
-    sk: Option<sign::SecretKey>,
 }
 
 #[derive(Clone)]
@@ -324,7 +323,7 @@ impl RendezvousServer {
         let db = crate::database::open(&crate::database::db_url(), true).await?;
         let cfg = crate::config::Config::from_args()?;
         let api_listen = cfg.api.listen_addr(port)?;
-        let state = AppState::new(db, cfg, std::path::Path::new(crate::crypto::SECRET_KEY_FILE)).await?;
+        let state = AppState::new(db, cfg, sk, std::path::Path::new(crate::crypto::SECRET_KEY_FILE)).await?;
         let pm = state.pm.clone();
         log::info!("serial={}", serial);
         let rendezvous_servers = get_servers(&get_arg("rendezvous-servers"), "rendezvous-servers");
@@ -355,7 +354,6 @@ impl RendezvousServer {
                 serial,
                 version,
                 software_url,
-                sk,
                 mask,
                 local_ip,
             }),
@@ -645,6 +643,19 @@ impl RendezvousServer {
                     };
                     let (changed, ip_changed) = {
                         let peer = peer.read().await;
+                        // A key pinned by a signed report takes no other: saves a write that
+                        // `update_pk` would refuse anyway (the database decides).
+                        if peer.pinned && peer.pk != rk.pk {
+                            throttled_log!(
+                                Duration::from_secs(60),
+                                warn,
+                                "Peer {:?} has a pinned key, refused another from {}",
+                                log_id(&id),
+                                ip
+                            );
+                            drop(peer);
+                            return send_rk_res(socket, addr, UUID_MISMATCH).await;
+                        }
                         if peer.uuid.is_empty() {
                             (true, false)
                         } else {
@@ -1385,15 +1396,26 @@ impl RendezvousServer {
         match fds.next() {
             Some("h") => {
                 res = format!(
-                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
                     "relay-servers(rs) <separated by ,>",
                     "geo-update(gu)",
                     "ip-blocker(ib) [<ip>|<number>] [-]",
                     "ip-changes(ic) [<id>|<number>] [-]",
                     "punch-requests(pr) [<number>] [-]",
                     "always-use-relay(aur)",
-                    "test-geo(tg) <ip1> <ip2>"
+                    "test-geo(tg) <ip1> <ip2>",
+                    "key-reset(kr) <id>",
+                    "key-forget(kf) <id>"
                 )
+            }
+            Some(cmd @ ("key-reset" | "kr" | "key-forget" | "kf")) => {
+                let forget = matches!(cmd, "key-forget" | "kf");
+                res = match fds.next().filter(|id| !id.is_empty()) {
+                    Some(id) => crate::peer::reset_key(&self.state.db, Some(&self.pm), id, forget)
+                        .await
+                        .unwrap_or_else(|err| format!("Failed: {err}\n")),
+                    None => format!("{cmd} needs a device id\n"),
+                };
             }
             Some("relay-servers" | "rs") => {
                 if let Some(rs) = fds.next() {
@@ -1676,7 +1698,7 @@ impl RendezvousServer {
             // KeyExchange (note 02 §6.2): offer first; the client's first frame either answers
             // it or is a plaintext message from a client that skips the offer.
             let mut offer = None;
-            if let Some(sk) = &self.inner.sk {
+            if let Some(sk) = &self.state.sk {
                 let (o, msg) = crate::kx::Offer::new(sk)?;
                 a.send(Bytes::from(msg.write_to_bytes()?)).await?;
                 offer = Some(o);
@@ -1730,29 +1752,28 @@ impl RendezvousServer {
 
     #[inline]
     async fn get_pk(&mut self, version: &str, id: String) -> Bytes {
-        if version.is_empty() || self.inner.sk.is_none() {
-            Bytes::new()
-        } else {
-            // Memory only (review D-15): the callers relay B's answer to a request just forwarded
-            // to it, so B is online, in memory; an id not there is signed nothing, without a lookup
-            // (these connection tasks would queue `io_loop` on the rendezvous pool).
-            match self.pm.get_in_memory(&id).await {
-                Some(peer) => {
-                    let pk = peer.read().await.pk.clone();
-                    sign::sign(
-                        &IdPk {
-                            id,
-                            pk,
-                            ..Default::default()
-                        }
-                        .write_to_bytes()
-                        .unwrap_or_default(),
-                        self.inner.sk.as_ref().unwrap(),
-                    )
-                    .into()
-                }
-                None => Bytes::new(),
+        let Some(sk) = self.state.sk.as_ref().filter(|_| !version.is_empty()) else {
+            return Bytes::new();
+        };
+        // Memory only (review D-15): the callers relay B's answer to a request just forwarded
+        // to it, so B is online, in memory; an id not there is signed nothing, without a lookup
+        // (these connection tasks would queue `io_loop` on the rendezvous pool).
+        match self.pm.get_in_memory(&id).await {
+            Some(peer) => {
+                let pk = peer.read().await.pk.clone();
+                sign::sign(
+                    &IdPk {
+                        id,
+                        pk,
+                        ..Default::default()
+                    }
+                    .write_to_bytes()
+                    .unwrap_or_default(),
+                    sk,
+                )
+                .into()
             }
+            None => Bytes::new(),
         }
     }
 
@@ -2045,6 +2066,8 @@ mod tests {
         app.state.router.set_configured(vec![RELAY.to_owned()]);
         let (server_pk, sk) = sign::gen_keypair();
         let (tx, rx) = mpsc::channel(UDP_SEND_QUEUE);
+        let mut state = app.state.clone();
+        state.sk = with_sk.then(|| Arc::new(sk));
         let rs = RendezvousServer {
             tcp_punch: Default::default(),
             pm: app.state.pm.clone(),
@@ -2056,9 +2079,8 @@ mod tests {
                 software_url: String::new(),
                 mask,
                 local_ip: String::new(),
-                sk: with_sk.then_some(sk),
             }),
-            state: app.state.clone(),
+            state,
             conns,
             new_ids: (Instant::now(), 0),
             lookups: LookupBudget::new(),
@@ -3086,5 +3108,87 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert!(offered);
+    }
+
+    /// Pins `id`'s key as a signed report does (database and memory).
+    async fn pin(h: &Harness, id: &str) {
+        sqlx::query("update peer set pk_pinned_at = 1 where id = ?")
+            .bind(id)
+            .execute(&h.rs.state.db)
+            .await
+            .unwrap();
+        h.rs.pm.set_pinned(id, true).await;
+    }
+
+    async fn peer_row(h: &Harness, id: &str) -> (Vec<u8>, Vec<u8>, Option<i64>) {
+        sqlx::query_as("select uuid, pk, pk_pinned_at from peer where id = ?")
+            .bind(id)
+            .fetch_one(&h.rs.state.db)
+            .await
+            .unwrap()
+    }
+
+    /// Phase 3 contract 01 §3.4: a pinned key takes no other `RegisterPk` (memory refuses it before
+    /// the database; with memory not knowing, the database does); the same key from a new IP is fine.
+    #[hbb_common::tokio::test]
+    async fn pinned_key_refuses_another() {
+        let mut h = harness(true, None).await;
+        let mut server = FramedSocket::new("127.0.0.1:0").await.unwrap();
+        let mut a = FramedSocket::new("127.26.0.1:0").await.unwrap();
+        let mut b = FramedSocket::new("127.26.0.2:0").await.unwrap();
+        let (from_a, from_b) = (a.local_addr().unwrap(), b.local_addr().unwrap());
+        let (pk, pk2) = ([1u8; 32], [2u8; 32]);
+        h.rs.handle_udp(&register_pk("pinned1", b"uuid-pin", &pk), from_a, &mut server, "").await.unwrap();
+        assert_eq!(register_reply(&mut a).await, Some(register_pk_response::Result::OK));
+        pin(&h, "pinned1").await;
+
+        // Same uuid, same IP, another key: OK before the pin, refused now.
+        h.rs.handle_udp(&register_pk("pinned1", b"uuid-pin", &pk2), from_a, &mut server, "").await.unwrap();
+        assert_eq!(register_reply(&mut a).await, Some(UUID_MISMATCH));
+        assert_eq!(peer_row(&h, "pinned1").await.1, pk.to_vec());
+        // The pinned key from another address.
+        h.rs.handle_udp(&register_pk("pinned1", b"uuid-pin", &pk), from_b, &mut server, "").await.unwrap();
+        assert_eq!(register_reply(&mut b).await, Some(register_pk_response::Result::OK));
+        // Memory not knowing of the pin: the database refuses, and memory learns it.
+        h.rs.pm.set_pinned("pinned1", false).await;
+        h.rs.handle_udp(&register_pk("pinned1", b"uuid-pin", &pk2), from_b, &mut server, "").await.unwrap();
+        assert_eq!(register_reply(&mut b).await, Some(UUID_MISMATCH));
+        assert_eq!(peer_row(&h, "pinned1").await.1, pk.to_vec());
+        assert!(h.rs.pm.get_in_memory("pinned1").await.unwrap().read().await.pinned);
+    }
+
+    /// `device key reset` / `--forget` through the console (`kr` / `kf`): database and memory.
+    #[hbb_common::tokio::test]
+    async fn key_reset_and_forget_through_the_console() {
+        let mut h = harness(true, None).await;
+        let mut server = FramedSocket::new("127.0.0.1:0").await.unwrap();
+        let mut a = FramedSocket::new("127.26.1.1:0").await.unwrap();
+        let from = a.local_addr().unwrap();
+        let (pk, pk2, pk3) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        h.rs.handle_udp(&register_pk("reset01", b"uuid-rst", &pk), from, &mut server, "").await.unwrap();
+        assert_eq!(register_reply(&mut a).await, Some(register_pk_response::Result::OK));
+        pin(&h, "reset01").await;
+
+        let out = h.rs.check_cmd("kr reset01").await;
+        assert!(out.contains("no longer pinned"), "{out}");
+        assert_eq!(peer_row(&h, "reset01").await, (b"uuid-rst".to_vec(), pk.to_vec(), None));
+        assert!(!h.rs.pm.get_in_memory("reset01").await.unwrap().read().await.pinned);
+        // The reinstall (same uuid, same IP, new key) keeps the id.
+        h.rs.handle_udp(&register_pk("reset01", b"uuid-rst", &pk2), from, &mut server, "").await.unwrap();
+        assert_eq!(register_reply(&mut a).await, Some(register_pk_response::Result::OK));
+        assert_eq!(peer_row(&h, "reset01").await.1, pk2.to_vec());
+
+        pin(&h, "reset01").await;
+        let out = h.rs.check_cmd("key-forget reset01").await;
+        assert!(out.contains("forgotten"), "{out}");
+        assert!(!h.rs.pm.is_in_memory("reset01").await);
+        assert_eq!(peer_rows(&h, "reset01").await, 0);
+        // Registered again as a new device, with another uuid and key.
+        h.rs.handle_udp(&register_pk("reset01", b"uuid-new", &pk3), from, &mut server, "").await.unwrap();
+        assert_eq!(register_reply(&mut a).await, Some(register_pk_response::Result::OK));
+        assert_eq!(peer_row(&h, "reset01").await, (b"uuid-new".to_vec(), pk3.to_vec(), None));
+
+        assert!(h.rs.check_cmd("kr nosuch1").await.contains("No registered device"));
+        assert!(h.rs.check_cmd("kf").await.contains("needs a device id"));
     }
 }

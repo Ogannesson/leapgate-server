@@ -174,6 +174,8 @@ pub struct Peer {
     pub user: Option<Vec<u8>>,
     pub info: String,
     pub status: Option<i64>,
+    /// When the first signed report pinned `pk` (unix seconds); `None` while not pinned.
+    pub pk_pinned_at: Option<i64>,
 }
 
 impl Database {
@@ -189,7 +191,7 @@ impl Database {
 
     pub async fn get_peer(&self, id: &str) -> ResultType<Option<Peer>> {
         Ok(sqlx::query_as::<_, Peer>(
-            "select guid, id, uuid, pk, user, status, info from peer where id = ?",
+            "select guid, id, uuid, pk, user, status, info, pk_pinned_at from peer where id = ?",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -215,21 +217,25 @@ impl Database {
         Ok(guid)
     }
 
+    /// Writes a registration; the rows written. A pinned row (`pk_pinned_at`) only takes its own key
+    /// (a new IP), so a key change of a pinned peer writes nothing (0): guarded here, in the database,
+    /// whatever the caller's copy of the peer says (PORTA.md §6 item 7).
     pub async fn update_pk(
         &self,
         guid: &Vec<u8>,
         id: &str,
         pk: &[u8],
         info: &str,
-    ) -> ResultType<()> {
-        sqlx::query("update peer set id=?, pk=?, info=? where guid=?")
+    ) -> ResultType<u64> {
+        Ok(sqlx::query("update peer set id=?, pk=?, info=? where guid=? and (pk_pinned_at is null or pk=?)")
             .bind(id)
             .bind(pk)
             .bind(info)
             .bind(guid)
+            .bind(pk)
             .execute(&self.pool)
-            .await?;
-        Ok(())
+            .await?
+            .rows_affected())
     }
 }
 
@@ -255,12 +261,44 @@ mod tests {
         assert_eq!(peer.user, None);
         assert_eq!(peer.status, None);
         assert_eq!(peer.info, r#"{"ip":"1.2.3.4"}"#);
-        db.update_pk(&guid, "654321", b"pk2", "{}").await.unwrap();
+        assert_eq!(db.update_pk(&guid, "654321", b"pk2", "{}").await.unwrap(), 1);
         assert!(db.get_peer("123456").await.unwrap().is_none());
         let peer = db.get_peer("654321").await.unwrap().unwrap();
         assert_eq!(peer.guid, guid);
         assert_eq!(peer.pk, b"pk2");
         assert_eq!(peer.info, "{}");
+        assert_eq!(peer.pk_pinned_at, None);
+
+        // Pinned: another key writes nothing, the same key (a new IP) is written.
+        sqlx::query("update peer set pk_pinned_at = 5 where guid = ?").bind(&guid).execute(&db.pool).await.unwrap();
+        assert_eq!(db.update_pk(&guid, "654321", b"pk3", "{}").await.unwrap(), 0);
+        assert_eq!(db.update_pk(&guid, "654321", b"pk2", r#"{"ip":"5.6.7.8"}"#).await.unwrap(), 1);
+        let peer = db.get_peer("654321").await.unwrap().unwrap();
+        assert_eq!((peer.pk.as_slice(), peer.info.as_str(), peer.pk_pinned_at), (&b"pk2"[..], r#"{"ip":"5.6.7.8"}"#, Some(5)));
+    }
+
+    // Migration 0004 on a phase-1 database (0001~0003 applied, with peers): the column is added, the
+    // rows are kept and not pinned.
+    #[tokio::test]
+    async fn migration_0004_on_a_phase_1_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite3");
+        let url = path.to_str().unwrap();
+        {
+            let opt = sqlx::sqlite::SqliteConnectOptions::new().filename(url).create_if_missing(true);
+            let pool = sqlx::SqlitePool::connect_with(opt).await.unwrap();
+            let mut phase1 = sqlx::migrate!("./migrations");
+            phase1.migrations = phase1.migrations.iter().filter(|m| m.version < 4).cloned().collect::<Vec<_>>().into();
+            phase1.run(&pool).await.unwrap();
+            sqlx::query("insert into peer(guid, id, uuid, pk, info) values(x'01', '123456', x'02', x'03', '{}')")
+                .execute(&pool)
+                .await
+                .unwrap();
+            pool.close().await;
+        }
+        let pool = super::open(url, true).await.unwrap();
+        let peer = super::Database::new(pool).get_peer("123456").await.unwrap().unwrap();
+        assert_eq!((peer.pk, peer.pk_pinned_at), (b"\x03".to_vec(), None));
     }
 
     // Review D-11: both pools cut the WAL back on restart and leave checkpoints to

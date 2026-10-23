@@ -96,6 +96,21 @@ pub(crate) struct Peer {
     pub(crate) info: PeerInfo,
     // pub(crate) disabled: bool,
     pub(crate) reg_pk: (u32, Instant), // how often register_pk
+    /// The row's `pk_pinned_at` is set: a `RegisterPk` with another key is refused. A copy of the
+    /// database, which alone decides (`Database::update_pk`); this one only saves a write bound to fail.
+    pub(crate) pinned: bool,
+    /// The last signed Porta heartbeat (`api::device::porta_heartbeat`), memory only: gone with the
+    /// entry, written again by the next heartbeat. Read by the UDP punch work (phase 3 block 04).
+    #[allow(dead_code)]
+    pub(crate) porta_hb: Option<PortaHb>,
+}
+
+/// A signed Porta heartbeat: when, and the Porta version it reported (`get_version_number` of the
+/// client's `libs/porta` version, 0 when unreadable).
+#[allow(dead_code)]
+pub(crate) struct PortaHb {
+    pub at: Instant,
+    pub porta_ver: u32,
 }
 
 impl Default for Peer {
@@ -110,6 +125,8 @@ impl Default for Peer {
             // user: None,
             // disabled: false,
             reg_pk: (0, get_expired_time()),
+            pinned: false,
+            porta_hb: None,
         }
     }
 }
@@ -205,9 +222,29 @@ impl PeerMap {
                 }
             }
         } else {
-            if let Err(err) = self.db.update_pk(&guid, &id, &pk, &info_str).await {
-                throttled_log!(Duration::from_secs(60), error, "db.update_pk failed: {}", err);
-                return register_pk_response::Result::SERVER_ERROR;
+            match self.db.update_pk(&guid, &id, &pk, &info_str).await {
+                Ok(0) => {
+                    // Not written: the row is pinned to another key (pinned after this entry was
+                    // read, or this entry is a stale copy), or it is gone (`device key reset
+                    // --forget`). Memory takes the row's state either way.
+                    if self.reload(&id, &peer).await {
+                        throttled_log!(
+                            Duration::from_secs(60),
+                            warn,
+                            "Peer {:?} has a pinned key, refused another from {}",
+                            log_id(&id),
+                            addr
+                        );
+                        return register_pk_response::Result::UUID_MISMATCH;
+                    }
+                    // Gone: the client's next round registers it as a new device, keeping its id.
+                    return register_pk_response::Result::SERVER_ERROR;
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    throttled_log!(Duration::from_secs(60), error, "db.update_pk failed: {}", err);
+                    return register_pk_response::Result::SERVER_ERROR;
+                }
             }
             throttled_log!(Duration::from_secs(60), info, "pk updated instead of insert");
         }
@@ -221,16 +258,19 @@ impl PeerMap {
         register_pk_response::Result::OK
     }
 
-    /// Replaces `peer`'s stored fields (guid, uuid, pk, info) with the database row of `id`, if
-    /// one can be read.
-    async fn reload(&self, id: &str, peer: &LockPeer) {
-        if let Ok(Some(v)) = self.db.get_peer(id).await {
-            let mut w = peer.write().await;
-            w.guid = v.guid;
-            w.uuid = v.uuid.into();
-            w.pk = v.pk.into();
-            w.info = serde_json::from_str::<PeerInfo>(&v.info).unwrap_or_default();
-        }
+    /// Replaces `peer`'s stored fields (guid, uuid, pk, info, pinned) with the database row of
+    /// `id`, if one can be read; whether one was.
+    async fn reload(&self, id: &str, peer: &LockPeer) -> bool {
+        let Ok(Some(v)) = self.db.get_peer(id).await else {
+            return false;
+        };
+        let mut w = peer.write().await;
+        w.guid = v.guid;
+        w.uuid = v.uuid.into();
+        w.pk = v.pk.into();
+        w.info = serde_json::from_str::<PeerInfo>(&v.info).unwrap_or_default();
+        w.pinned = v.pk_pinned_at.is_some();
+        true
     }
 
     /// The entry of `id`, from memory or else loaded from the database (`io_loop`: the rendezvous
@@ -262,6 +302,7 @@ impl PeerMap {
             // user: v.user,
             info: serde_json::from_str::<PeerInfo>(&v.info).unwrap_or_default(),
             // disabled: v.status == Some(0),
+            pinned: v.pk_pinned_at.is_some(),
             ..Default::default()
         };
         // An entry added while the database was read (a registration in `io_loop`) is newer than
@@ -327,4 +368,50 @@ impl PeerMap {
     pub(crate) async fn is_in_memory(&self, id: &str) -> bool {
         self.map.read().await.contains_key(id)
     }
+
+    /// Sets the in-memory `pinned` of `id`, if in memory (`reset_key`).
+    pub(crate) async fn set_pinned(&self, id: &str, pinned: bool) {
+        if let Some(p) = self.get_in_memory(id).await {
+            p.write().await.pinned = pinned;
+        }
+    }
+
+    /// Drops the entry of `id` (`reset_key --forget`, after its row was deleted).
+    pub(crate) async fn remove(&self, id: &str) {
+        self.map.write().await.remove(id);
+    }
+}
+
+/// `device key reset <id>` (console `kr`) and `--forget` (console `kf`), PORTA.md §14: unpins the key
+/// of `id`, keeping its uuid and key (a reinstall keeps its id by the usual rule: same uuid, same IP
+/// may change the key), or with `forget` deletes its row (the uuid changed too; the next registration
+/// of the id is a new device). The database first, then the running server's memory (`pm`; `None`
+/// when the command line changes the database itself because the server is not running). Returns
+/// what the console / command line prints.
+pub(crate) async fn reset_key(
+    db: &sqlx::SqlitePool,
+    pm: Option<&PeerMap>,
+    id: &str,
+    forget: bool,
+) -> Result<String, sqlx::Error> {
+    let sql = if forget {
+        "delete from peer where id = ?"
+    } else {
+        "update peer set pk_pinned_at = null where id = ?"
+    };
+    let n = sqlx::query(sql).bind(id).execute(db).await?.rows_affected();
+    if let Some(pm) = pm {
+        if forget {
+            pm.remove(id).await;
+        } else {
+            pm.set_pinned(id, false).await;
+        }
+    }
+    Ok(match (n, forget) {
+        (0, _) => format!("No registered device {id}\n"),
+        (_, false) => format!(
+            "{id}: key no longer pinned (uuid and key kept); the next signed report pins the key it is signed with\n"
+        ),
+        (_, true) => format!("{id}: forgotten; the next registration of this id is taken as a new device\n"),
+    })
 }
