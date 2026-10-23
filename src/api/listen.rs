@@ -62,7 +62,7 @@ pub(super) const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// `REQUEST_TIMEOUT` for the device reports (`super::is_report`: heartbeat, sysinfo, audit). The
 /// client sends those from its Rust side, which gives up after 12 s, connecting and the TLS
 /// handshake included (rustdesk `src/common.rs` `post_request_`); an answer after that is never
-/// read, the client tries its TCP fallback on 21116 instead (which Porta closes), and over HTTPS a
+/// read, the client tries its TCP fallback on 21116 instead (which Leapgate closes), and over HTTPS a
 /// client that has not yet cached its TLS setting resends the request up to 4 times. Bodies are at
 /// most 64 KB.
 pub(super) const REPORT_TIMEOUT: Duration = Duration::from_secs(10);

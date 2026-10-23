@@ -1,6 +1,6 @@
-//! 地址簿黑盒测试（tests/bb_ab.rs）的辅助代码：起真实的 porta-server 进程，直接写它的 SQLite 造数据，
+//! 地址簿黑盒测试（tests/bb_ab.rs）的辅助代码：起真实的 leapgate-server 进程，直接写它的 SQLite 造数据，
 //! 照原版客户端的方式发请求，按笔记 04 §1.2 的三种解析器判定回包。
-//! 只依据 PORTA.md、migrations/0001_init.sql 和笔记 04，不依赖任何模块的实现。
+//! 只依据 LEAPGATE.md、migrations/0001_init.sql 和笔记 04，不依赖任何模块的实现。
 #![allow(dead_code)]
 
 use serde_json::{Map, Value};
@@ -18,7 +18,7 @@ use std::{
 /// 本进程里已经分出去的会合端口 P，避免并行的测试互相撞端口。
 static RESERVED: Mutex<Vec<u16>> = Mutex::new(Vec::new());
 
-/// 个人簿的固定名字（PORTA.md §12.1，客户端按名字认个人簿）。
+/// 个人簿的固定名字（LEAPGATE.md §12.1，客户端按名字认个人簿）。
 pub const PERSONAL_NAME: &str = "My address book";
 
 pub fn now() -> i64 {
@@ -85,7 +85,7 @@ pub struct User {
     pub token: String,
 }
 
-/// 一个真实的 porta-server 进程（临时工作目录、随机端口、TEST_HBBS=no、geo 不自动更新），
+/// 一个真实的 leapgate-server 进程（临时工作目录、随机端口、TEST_HBBS=no、geo 不自动更新），
 /// 以及连到它的 SQLite 的连接池。Drop 时杀掉进程。
 pub struct Server {
     child: Child,
@@ -126,11 +126,11 @@ impl Server {
         let mut last_log = String::new();
         for _ in 0..3 {
             let dir = tempfile::tempdir().unwrap();
-            std::fs::write(dir.path().join("porta.toml"), "[geo]\nauto_update = false\n").unwrap();
+            std::fs::write(dir.path().join("leapgate.toml"), "[geo]\nauto_update = false\n").unwrap();
             let port = pick_port();
             let db_path = dir.path().join("db.sqlite3");
             let log = File::create(dir.path().join("server.log")).unwrap();
-            let mut child = Command::new(env!("CARGO_BIN_EXE_porta-server"))
+            let mut child = Command::new(env!("CARGO_BIN_EXE_leapgate-server"))
                 .arg("-p")
                 .arg(port.to_string())
                 .current_dir(dir.path())
@@ -169,7 +169,7 @@ impl Server {
             let _ = child.wait();
             last_log = std::fs::read_to_string(dir.path().join("server.log")).unwrap_or_default();
         }
-        panic!("porta-server 起不来，最后一次的日志：\n{last_log}");
+        panic!("leapgate-server 起不来，最后一次的日志：\n{last_log}");
     }
 
     fn url(&self, path: &str) -> String {
@@ -297,7 +297,7 @@ impl Server {
 
     // ---- 直接写库造数据（表结构见 migrations/0001_init.sql） ----
 
-    /// 建一个启用的用户和一个令牌（库里只存 sha256 hex，PORTA.md §11）。
+    /// 建一个启用的用户和一个令牌（库里只存 sha256 hex，LEAPGATE.md §11）。
     pub async fn user(&self, name: &str, is_admin: bool) -> User {
         let id: i64 = sqlx::query_scalar(
             "insert into user(name, is_admin, created_at, updated_at) values(?, ?, ?, ?) returning id",
@@ -493,10 +493,10 @@ impl Server {
             .unwrap()
     }
 
-    // ---- 密码字段加密（PORTA.md §13：工作目录下的 porta_secret.key，secretbox，`sb1:` + base64(nonce ‖ 密文)） ----
+    // ---- 密码字段加密（LEAPGATE.md §13：工作目录下的 leapgate_secret.key，secretbox，`sb1:` + base64(nonce ‖ 密文)） ----
 
     fn key(&self) -> secretbox::Key {
-        let text = std::fs::read_to_string(self.dir.path().join("porta_secret.key")).unwrap();
+        let text = std::fs::read_to_string(self.dir.path().join("leapgate_secret.key")).unwrap();
         secretbox::Key::from_slice(&base64::decode(text.trim()).unwrap()).unwrap()
     }
 

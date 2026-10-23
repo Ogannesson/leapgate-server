@@ -1,5 +1,5 @@
 //! 黑盒测试：21114 的连接保护（审查 C-9）：连接总数和每来源上限、请求头超时、整请求超时、
-//! 按路由的请求体上限、慢读者断开、`/api/ab/peers` 的每用户名额。每个测试起一个真实的 porta-server
+//! 按路由的请求体上限、慢读者断开、`/api/ab/peers` 的每用户名额。每个测试起一个真实的 leapgate-server
 //! 进程（见 `bb_api_support`），用裸 TCP 看服务端什么时候关连接、回什么。
 //!
 //! 常量照实现的取值（src/api/listen.rs、src/api/mod.rs、src/api/ab.rs）：总数 512、每来源 32、

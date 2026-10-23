@@ -1,4 +1,4 @@
-//! Process-wide shared handles (PORTA.md §3), one copy given to `RendezvousServer` and to axum.
+//! Process-wide shared handles (LEAPGATE.md §3), one copy given to `RendezvousServer` and to axum.
 
 use crate::{
     api::ab::PageSlots, config::Config, conn_tracker::ConnTracker, crypto::SecretBox, peer::PeerMap,
@@ -22,7 +22,7 @@ pub(crate) struct AppState {
     /// slots go with the page's bytes.
     pub ab_pages: Arc<PageSlots>,
     /// The rendezvous private key (`RendezvousServer::get_server_sk`): KeyExchange offers, `IdPk`
-    /// signatures and the Porta API's response signatures. `None` when `-k` gave a public key only.
+    /// signatures and the Leapgate API's response signatures. `None` when `-k` gave a public key only.
     pub sk: Option<Arc<sign::SecretKey>>,
 }
 
@@ -36,7 +36,7 @@ impl AppState {
     ) -> ResultType<Self> {
         // No key file but ciphertext in the database means the key was lost (database restored
         // without it, another working directory): a new key would make every saved password
-        // unreadable without anyone noticing, so refuse to start (PORTA.md §13).
+        // unreadable without anyone noticing, so refuse to start (LEAPGATE.md §13).
         if !secret_key_file.try_exists()? {
             let encrypted: Option<i64> = sqlx::query_scalar(
                 "select 1 from ab_peer where hash_enc <> '' or password_enc <> '' limit 1",

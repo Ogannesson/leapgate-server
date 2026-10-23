@@ -1,5 +1,5 @@
-//! bb_rendezvous 的黑盒测试辅助：起真实的 porta-server 进程，模拟控制端 A（TCP / WebSocket）
-//! 和被控端 B（UDP 注册）。只依据 PORTA.md、笔记 02/06 和上游客户端代码
+//! bb_rendezvous 的黑盒测试辅助：起真实的 leapgate-server 进程，模拟控制端 A（TCP / WebSocket）
+//! 和被控端 B（UDP 注册）。只依据 LEAPGATE.md、笔记 02/06 和上游客户端代码
 //! （`rustdesk/src/common.rs` 的 `key_exchange`、`rendezvous_mediator.rs`），不依赖服务端实现。
 #![allow(dead_code)]
 
@@ -28,12 +28,12 @@ use std::{
 pub const A_IP: &str = "127.0.0.2";
 /// 被控端 B 的源地址（UDP 注册和回 `PunchHoleSent` 的 TCP 连接）。
 pub const B_IP: &str = "127.0.0.3";
-/// 每份 porta.toml 都要带：不在测试里下载 GeoIP 库。
+/// 每份 leapgate.toml 都要带：不在测试里下载 GeoIP 库。
 pub const GEO_OFF: &str = "[geo]\nauto_update = false\n";
 /// A 报的客户端版本（非空才会给 `PunchHoleResponse.pk` 签名，笔记 02 §6.1）。
 pub const VERSION: &str = "1.4.2";
 
-/// 一台运行中的 porta-server，Drop 时杀掉进程；测试失败时把服务日志尾部打到 stderr。
+/// 一台运行中的 leapgate-server，Drop 时杀掉进程；测试失败时把服务日志尾部打到 stderr。
 pub struct Server {
     child: Child,
     dir: tempfile::TempDir,
@@ -44,13 +44,13 @@ pub struct Server {
 }
 
 impl Server {
-    /// 在临时工作目录里起服务：写 `porta.toml`，设 `TEST_HBBS=no`，等端口和 `GET /` 就绪。
-    pub async fn start(porta_toml: &str, envs: &[(&str, &str)]) -> Server {
+    /// 在临时工作目录里起服务：写 `leapgate.toml`，设 `TEST_HBBS=no`，等端口和 `GET /` 就绪。
+    pub async fn start(leapgate_toml: &str, envs: &[(&str, &str)]) -> Server {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("porta.toml"), porta_toml).unwrap();
+        std::fs::write(dir.path().join("leapgate.toml"), leapgate_toml).unwrap();
         let port = free_port_block();
         let log = std::fs::File::create(dir.path().join("server.log")).unwrap();
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_porta-server"));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_leapgate-server"));
         cmd.current_dir(dir.path())
             .args(["-p", &port.to_string()])
             .env("TEST_HBBS", "no")
@@ -80,7 +80,7 @@ impl Server {
             .unwrap();
         loop {
             if let Some(status) = self.child.try_wait().unwrap() {
-                panic!("porta-server 提前退出：{status}");
+                panic!("leapgate-server 提前退出：{status}");
             }
             let key = std::fs::read_to_string(self.dir.path().join("id_ed25519.pub"))
                 .unwrap_or_default();
@@ -93,7 +93,7 @@ impl Server {
                 self.key = key.trim().to_owned();
                 return;
             }
-            assert!(Instant::now() < deadline, "porta-server 30 秒内没有就绪");
+            assert!(Instant::now() < deadline, "leapgate-server 30 秒内没有就绪");
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
@@ -125,7 +125,7 @@ impl Server {
         self.dir.path().join("db_v2.sqlite3")
     }
 
-    /// 直接打开服务的 SQLite（`DB_URL` 默认 `./db_v2.sqlite3`，PORTA.md §4.1）造数据、查结果。
+    /// 直接打开服务的 SQLite（`DB_URL` 默认 `./db_v2.sqlite3`，LEAPGATE.md §4.1）造数据、查结果。
     pub async fn db(&self) -> SqlitePool {
         let opts = SqliteConnectOptions::new()
             .filename(self.db_path())
@@ -166,7 +166,7 @@ impl Drop for Server {
             let log = std::fs::read_to_string(self.dir.path().join("server.log")).unwrap_or_default();
             let lines: Vec<&str> = log.lines().collect();
             let tail = &lines[lines.len().saturating_sub(120)..];
-            eprintln!("---- porta-server 日志（最后 {} 行）----\n{}", tail.len(), tail.join("\n"));
+            eprintln!("---- leapgate-server 日志（最后 {} 行）----\n{}", tail.len(), tail.join("\n"));
         }
     }
 }
@@ -211,7 +211,7 @@ pub enum Kx {
     V1,
 }
 
-/// 读服务端连上后先发的 `KeyExchange`（PORTA.md §6.1），按客户端 `key_exchange` 的规则验签：
+/// 读服务端连上后先发的 `KeyExchange`（LEAPGATE.md §6.1），按客户端 `key_exchange` 的规则验签：
 /// `keys` 只有一个，用服务端公钥验得过，里面是 32 字节临时公钥。
 pub async fn read_server_kx(s: &mut FramedStream, pk: &sign::PublicKey) -> (KeyExchange, [u8; 32]) {
     let bytes = s
@@ -405,7 +405,7 @@ impl PeerB {
     }
 }
 
-/// 一个假中继：在 127.0.0.1 上监听、accept 后立刻断开（健康检查只做 TCP 建连，PORTA.md §7）。
+/// 一个假中继：在 127.0.0.1 上监听、accept 后立刻断开（健康检查只做 TCP 建连，LEAPGATE.md §7）。
 pub struct FakeRelay {
     pub host: String,
     port: u16,

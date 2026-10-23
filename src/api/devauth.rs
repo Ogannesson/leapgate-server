@@ -1,9 +1,9 @@
-//! Porta device authentication (phase 3 contract 01 §2.1, §2.2, §3.2, §3.3): every request on
-//! `/api/porta/v1/` is signed with the device's own key, the one it registered with hbbs (`peer.pk`),
+//! Leapgate device authentication (phase 3 contract 01 §2.1, §2.2, §3.2, §3.3): every request on
+//! `/api/leapgate/v1/` is signed with the device's own key, the one it registered with hbbs (`peer.pk`),
 //! and the first one that verifies pins that key (`peer.pk_pinned_at`). Answers are signed with the
 //! rendezvous private key (`AppState::sk`), bound to the request's signature.
 //!
-//! Unlike the compatibility endpoints (PORTA.md §9.1 item 1) these answer 5xx: only Porta clients
+//! Unlike the compatibility endpoints (LEAPGATE.md §9.1 item 1) these answer 5xx: only Leapgate clients
 //! call them, and they back off on it. Error bodies are `{"error": <code>, "message": <text>}`.
 
 use super::{device::report_allowed, json, ClientIp};
@@ -30,14 +30,14 @@ use std::{
     time::Duration,
 };
 
-/// The Porta endpoints; what follows is the endpoint name the signature covers (`heartbeat`, `audit/conn`).
-pub(crate) const PREFIX: &str = "/api/porta/v1/";
-/// `Porta-Device-Auth: v1 id=<base64url(id)>, t=<unix seconds>, s=<base64url(signature)>`.
-const AUTH_HEADER: &str = "porta-device-auth";
-/// `Porta-Server-Sig: <base64url(signature)>` on the signed answers (`signed_json`).
-pub(crate) const SIG_HEADER: &str = "porta-server-sig";
-const REQUEST_DOMAIN: &[u8] = b"porta-device-v1\0";
-const RESPONSE_DOMAIN: &[u8] = b"porta-server-v1\0";
+/// The Leapgate endpoints; what follows is the endpoint name the signature covers (`heartbeat`, `audit/conn`).
+pub(crate) const PREFIX: &str = "/api/leapgate/v1/";
+/// `Leapgate-Device-Auth: v1 id=<base64url(id)>, t=<unix seconds>, s=<base64url(signature)>`.
+const AUTH_HEADER: &str = "leapgate-device-auth";
+/// `Leapgate-Server-Sig: <base64url(signature)>` on the signed answers (`signed_json`).
+pub(crate) const SIG_HEADER: &str = "leapgate-server-sig";
+const REQUEST_DOMAIN: &[u8] = b"leapgate-device-v1\0";
+const RESPONSE_DOMAIN: &[u8] = b"leapgate-server-v1\0";
 /// A request's timestamp is at most this many seconds off the server's clock (`stale_time`); the
 /// 401 carries the server's time, and the client corrects its offset and signs again.
 const MAX_CLOCK_SKEW: u64 = 60;
@@ -51,7 +51,7 @@ const REPLAY_RING: usize = 64;
 /// longest ago. Only verified requests add entries, so filling it takes that many registered keys.
 const MAX_REPLAY_IDS: usize = 4096;
 
-/// A request on a Porta endpoint whose signature verified: the device id (from the header only; an
+/// A request on a Leapgate endpoint whose signature verified: the device id (from the header only; an
 /// `id` in the body is ignored), the request's signature (`signed_json` binds the answer to it), the
 /// raw body, the client address (`ClientIp`) and the device's in-memory entry. Last argument of the
 /// handler; any failed check answers for the handler (§3.2 of the contract):
@@ -85,24 +85,24 @@ impl FromRequest<AppState> for SignedBody {
             .and_then(|v| v.to_str().ok())
             .and_then(parse_auth)
         else {
-            throttled_log!(Duration::from_secs(60), info, "Porta report from {ip}: bad or missing auth header");
-            return Err(porta_error(
+            throttled_log!(Duration::from_secs(60), info, "Leapgate report from {ip}: bad or missing auth header");
+            return Err(leapgate_error(
                 StatusCode::UNAUTHORIZED,
                 "bad_auth",
-                "Missing or malformed Porta-Device-Auth header",
+                "Missing or malformed Leapgate-Device-Auth header",
             ));
         };
         if !report_allowed(ip) {
-            return Err(porta_error(StatusCode::TOO_MANY_REQUESTS, "too_many_requests", "Too many requests"));
+            return Err(leapgate_error(StatusCode::TOO_MANY_REQUESTS, "too_many_requests", "Too many requests"));
         }
         let method = parts.method.as_str().to_owned();
         let endpoint = parts.uri.path().strip_prefix(PREFIX).unwrap_or_default().to_owned();
         let body = match Bytes::from_request(Request::from_parts(parts, body), state).await {
             Ok(body) => body,
             Err(err) if err.status() == StatusCode::PAYLOAD_TOO_LARGE => {
-                return Err(porta_error(StatusCode::PAYLOAD_TOO_LARGE, "too_large", "Request body too large"))
+                return Err(leapgate_error(StatusCode::PAYLOAD_TOO_LARGE, "too_large", "Request body too large"))
             }
-            Err(err) => return Err(porta_error(StatusCode::BAD_REQUEST, "bad_request", &err.body_text())),
+            Err(err) => return Err(leapgate_error(StatusCode::BAD_REQUEST, "bad_request", &err.body_text())),
         };
         let now = crate::common::now() as i64;
         if !fresh(t, now) {
@@ -111,7 +111,7 @@ impl FromRequest<AppState> for SignedBody {
         let peer = match state.pm.get_from_main(&id).await {
             Ok(Some(peer)) => peer,
             Ok(None) => return Err(rejected(state, &sig, Reason::UnknownDevice, ip, &id)),
-            Err(err) => return Err(porta_internal(err)),
+            Err(err) => return Err(leapgate_internal(err)),
         };
         // `update_pk` writes the database before memory, so this key is never newer than the row's.
         let (pk, pinned) = {
@@ -169,7 +169,7 @@ pub(crate) fn b64url(raw: &[u8]) -> String {
     base64::encode_config(raw, base64::URL_SAFE_NO_PAD)
 }
 
-/// What a device signs: `"porta-device-v1\0" ‖ method ‖ "\0" ‖ endpoint ‖ "\0" ‖ id ‖ "\0" ‖ t (decimal)
+/// What a device signs: `"leapgate-device-v1\0" ‖ method ‖ "\0" ‖ endpoint ‖ "\0" ‖ id ‖ "\0" ‖ t (decimal)
 /// ‖ "\0" ‖ sha256(body)`.
 pub(crate) fn request_message(method: &str, endpoint: &str, id: &str, t: i64, body: &[u8]) -> Vec<u8> {
     let mut m = Vec::with_capacity(REQUEST_DOMAIN.len() + method.len() + endpoint.len() + id.len() + 60);
@@ -182,7 +182,7 @@ pub(crate) fn request_message(method: &str, endpoint: &str, id: &str, t: i64, bo
     m
 }
 
-/// What the server signs: `"porta-server-v1\0" ‖ the request's signature ‖ sha256(body)`.
+/// What the server signs: `"leapgate-server-v1\0" ‖ the request's signature ‖ sha256(body)`.
 pub(crate) fn response_message(req_sig: &[u8], body: &[u8]) -> Vec<u8> {
     let mut m = Vec::with_capacity(RESPONSE_DOMAIN.len() + req_sig.len() + 32);
     m.extend_from_slice(RESPONSE_DOMAIN);
@@ -210,13 +210,13 @@ async fn pin(state: &AppState, id: &str, pk: &[u8], peer: &LockPeer, now: i64) {
                 w.pinned = true;
             }
             drop(w);
-            throttled_log!(Duration::from_secs(60), info, "Porta report: key of {:?} pinned", log_id(id));
+            throttled_log!(Duration::from_secs(60), info, "Leapgate report: key of {:?} pinned", log_id(id));
         }
         Ok(_) => {}
         Err(err) => throttled_log!(
             Duration::from_secs(60),
             warn,
-            "Porta report: pinning the key of {:?} failed: {}",
+            "Leapgate report: pinning the key of {:?} failed: {}",
             log_id(id),
             err
         ),
@@ -260,20 +260,20 @@ struct AuthError {
 }
 
 /// The signed 401 of steps 4~7, with the server's time; each reason logged at most once a minute
-/// (the id clipped and escaped, PORTA.md §6 item 7; no signature or key).
+/// (the id clipped and escaped, LEAPGATE.md §6 item 7; no signature or key).
 fn rejected(state: &AppState, req_sig: &[u8; 64], reason: Reason, ip: IpAddr, id: &str) -> Response {
     let id = log_id(id);
     match reason {
         Reason::StaleTime => {
-            throttled_log!(Duration::from_secs(60), info, "Porta report from {ip}: stale timestamp for {id:?}")
+            throttled_log!(Duration::from_secs(60), info, "Leapgate report from {ip}: stale timestamp for {id:?}")
         }
         Reason::UnknownDevice => {
-            throttled_log!(Duration::from_secs(60), info, "Porta report from {ip}: unknown device {id:?}")
+            throttled_log!(Duration::from_secs(60), info, "Leapgate report from {ip}: unknown device {id:?}")
         }
         Reason::BadSignature => {
-            throttled_log!(Duration::from_secs(60), info, "Porta report from {ip}: bad signature for {id:?}")
+            throttled_log!(Duration::from_secs(60), info, "Leapgate report from {ip}: bad signature for {id:?}")
         }
-        Reason::Replay => throttled_log!(Duration::from_secs(60), info, "Porta report from {ip}: replay for {id:?}"),
+        Reason::Replay => throttled_log!(Duration::from_secs(60), info, "Leapgate report from {ip}: replay for {id:?}"),
     }
     let body = AuthError {
         error: reason.code(),
@@ -283,13 +283,13 @@ fn rejected(state: &AppState, req_sig: &[u8; 64], reason: Reason, ip: IpAddr, id
     signed_json(state, req_sig, StatusCode::UNAUTHORIZED, &body)
 }
 
-/// JSON (`charset=utf-8`) signed for the request signed `req_sig` (`Porta-Server-Sig`, §2.2 of the
+/// JSON (`charset=utf-8`) signed for the request signed `req_sig` (`Leapgate-Server-Sig`, §2.2 of the
 /// contract): the 2xx answers and the 401s other than `bad_auth`. No header without a private key
 /// (`-k` gave a public key; such a server cannot serve logged-in clients anyway).
 pub(crate) fn signed_json<T: Serialize>(state: &AppState, req_sig: &[u8], status: StatusCode, v: &T) -> Response {
     let body = match serde_json::to_vec(v) {
         Ok(body) => body,
-        Err(err) => return porta_internal(err),
+        Err(err) => return leapgate_internal(err),
     };
     let sig = state
         .sk
@@ -307,21 +307,21 @@ fn json_bytes(status: StatusCode, body: Vec<u8>) -> Response {
 }
 
 /// `{"error": code, "message": message}`, unsigned: `bad_auth`, 400, 404, 405, 413, 429, 503.
-pub(crate) fn porta_error(status: StatusCode, code: &'static str, message: &str) -> Response {
+pub(crate) fn leapgate_error(status: StatusCode, code: &'static str, message: &str) -> Response {
     json(status, &serde_json::json!({ "error": code, "message": message }))
 }
 
 /// Logged at most once a minute (signed requests can trigger it at the report budget's rate); 503
 /// `internal` (database error, panic). The client retries later.
-pub(crate) fn porta_internal(err: impl Display) -> Response {
-    throttled_log!(Duration::from_secs(60), error, "Porta API internal error: {err}");
-    porta_error(StatusCode::SERVICE_UNAVAILABLE, "internal", "Server error")
+pub(crate) fn leapgate_internal(err: impl Display) -> Response {
+    throttled_log!(Duration::from_secs(60), error, "Leapgate API internal error: {err}");
+    leapgate_error(StatusCode::SERVICE_UNAVAILABLE, "internal", "Server error")
 }
 
-/// Parses a Porta request body; failure → 400 `bad_request`.
+/// Parses a Leapgate request body; failure → 400 `bad_request`.
 pub(crate) fn parse_body<T: DeserializeOwned>(body: &[u8]) -> Result<T, Response> {
     serde_json::from_slice(body)
-        .map_err(|err| porta_error(StatusCode::BAD_REQUEST, "bad_request", &format!("Invalid request body: {err}")))
+        .map_err(|err| leapgate_error(StatusCode::BAD_REQUEST, "bad_request", &format!("Invalid request body: {err}")))
 }
 
 /// Recent requests of one device (§3.3 of the contract). Accepted: `t ≥ max_ts − MAX_REORDER`,
@@ -392,18 +392,18 @@ static REPLAY: Lazy<Mutex<ReplayTable>> = Lazy::new(Default::default);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{self, porta_device, send_porta, verify_server_sig, Device};
+    use crate::testutil::{self, leapgate_device, send_leapgate, verify_server_sig, Device};
     use hbb_common::{rendezvous_proto::register_pk_response::Result as RegisterResult, tokio};
     use serde_json::Value;
 
-    /// The fixed vector the client's tests share (contract 01 §6.1/§6.2; porta-client
-    /// `libs/porta/src/sign.rs`, computed there independently): device key from seed `[7; 32]`, id
+    /// The fixed vector the client's tests share (contract 01 §6.1/§6.2; leapgate-client
+    /// `libs/leapgate/src/sign.rs`, computed there independently): device key from seed `[7; 32]`, id
     /// `123456789`, `t` 1761200000, `POST heartbeat`; server key from seed `[9; 32]`.
     const VECTOR_REQUEST_BODY: &[u8] = br#"{"uuid":"dGVzdA==","ver":1005010}"#;
-    const VECTOR_HEADER: &str = "v1 id=MTIzNDU2Nzg5, t=1761200000, s=yx-Mzyt9ynHD1FCErdyWCz_Kx_iNzF7b4ZfZfJfCQaL2vH3VLHVBadR5BYSAbk5fdqXUHU7ImS9W2Wy46mw9Aw";
+    const VECTOR_HEADER: &str = "v1 id=MTIzNDU2Nzg5, t=1761200000, s=wnN1NCsqJK0GqftKsoijUTZ_6qG7lHvOKBIpRVkcePzp7S0I8ix9B6XyYStSzy4ZHFkVdV9wJ8m0fDFeJORBBQ";
     const VECTOR_SERVER_PK: &str = "/RckOFqgx1tk+3jNYC+h2ZH96/drE8WO1wLqyDXp9hg=";
     const VECTOR_RESPONSE_BODY: &[u8] = br#"{"api":1,"features":[],"time":1761200000}"#;
-    const VECTOR_SERVER_SIG: &str = "zATBKIx6xPyFbAQVV7koFw0iuqmyvNQwuufqcxG-NNKjaI6BUx0uJiHThezCfpTmtYgZZmR2ApOOgEPNMKdsDA";
+    const VECTOR_SERVER_SIG: &str = "aFgYDDXBlXs2_mGlZO8inNUyWobzQXawooaM6RVRxjgGbpjWkNY1ZyGdhEAr14B3d4x4SJfjFJs6Z4WZxsBTDQ";
 
     #[test]
     fn signature_vector() {
@@ -451,13 +451,13 @@ mod tests {
     }
 
     async fn post(t: &testutil::TestApp, auth: Option<&str>, body: &[u8]) -> (StatusCode, axum::http::HeaderMap, Value) {
-        let (status, headers, body) = send_porta(&t.app, "/api/porta/v1/audit/alarm", auth, body).await;
+        let (status, headers, body) = send_leapgate(&t.app, "/api/leapgate/v1/audit/alarm", auth, body).await;
         (status, headers, serde_json::from_slice(&body).unwrap_or(Value::Null))
     }
 
     /// The signed 401 of a chain step: code, `time`, and a server signature bound to `req_sig`.
     async fn assert_signed_401(t: &testutil::TestApp, auth: &str, sig: &[u8; 64], body: &[u8], code: &str) {
-        let (status, headers, raw) = send_porta(&t.app, "/api/porta/v1/audit/alarm", Some(auth), body).await;
+        let (status, headers, raw) = send_leapgate(&t.app, "/api/leapgate/v1/audit/alarm", Some(auth), body).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{code}");
         let v: Value = serde_json::from_slice(&raw).unwrap();
         assert_eq!(v["error"], code, "{v}");
@@ -468,7 +468,7 @@ mod tests {
     #[tokio::test]
     async fn every_rejection_of_the_chain() {
         let t = testutil::app().await;
-        let dev = porta_device(&t.state, "chain01", b"uuid-chain").await;
+        let dev = leapgate_device(&t.state, "chain01", b"uuid-chain").await;
         let body = br#"{"typ":1,"info":"{}"}"#;
         let now = crate::common::now() as i64;
 
@@ -502,7 +502,7 @@ mod tests {
         let (auth3, sig3) = other.auth("audit/alarm", now, body);
         assert_signed_401(&t, &auth3, &sig3, body, "bad_signature").await;
         // The same request twice: the second is a replay.
-        let (status, headers, raw) = send_porta(&t.app, "/api/porta/v1/audit/alarm", Some(&auth), body).await;
+        let (status, headers, raw) = send_leapgate(&t.app, "/api/leapgate/v1/audit/alarm", Some(&auth), body).await;
         assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&raw));
         assert!(verify_server_sig(&t.state, &sig, &headers, &raw));
         assert_signed_401(&t, &auth, &sig, body, "replay").await;
@@ -514,10 +514,10 @@ mod tests {
         let mut t = testutil::app().await;
         t.state.sk = None;
         let app = crate::api::router(t.state.clone());
-        let dev = porta_device(&t.state, "nosk01", b"uuid").await;
+        let dev = leapgate_device(&t.state, "nosk01", b"uuid").await;
         let body = br#"{"typ":1}"#;
         let (auth, _) = dev.auth("audit/alarm", crate::common::now() as i64, body);
-        let (status, headers, _) = send_porta(&app, "/api/porta/v1/audit/alarm", Some(&auth), body).await;
+        let (status, headers, _) = send_leapgate(&app, "/api/leapgate/v1/audit/alarm", Some(&auth), body).await;
         assert_eq!(status, StatusCode::OK);
         assert!(!headers.contains_key(SIG_HEADER));
     }
@@ -590,7 +590,7 @@ mod tests {
     #[tokio::test]
     async fn first_verified_request_pins_the_key() {
         let t = testutil::app().await;
-        let dev = porta_device(&t.state, "pin001", b"uuid-pin").await;
+        let dev = leapgate_device(&t.state, "pin001", b"uuid-pin").await;
         assert_eq!(pinned_at(&t, "pin001").await, None);
         let status = dev.post(&t.app, "audit/alarm", br#"{"typ":1}"#).await.status;
         assert_eq!(status, StatusCode::OK);
@@ -605,7 +605,7 @@ mod tests {
 
         // The row's key changed behind the entry's back: the pin writes nothing, the request still
         // goes through (verified against the entry's key).
-        let dev2 = porta_device(&t.state, "pin002", b"uuid-pin2").await;
+        let dev2 = leapgate_device(&t.state, "pin002", b"uuid-pin2").await;
         t.state.pm.get_from_main("pin002").await.unwrap().unwrap();
         sqlx::query("update peer set pk = ? where id = 'pin002'").bind(&[9u8; 32][..]).execute(&t.state.db).await.unwrap();
         let status = dev2.post(&t.app, "audit/alarm", br#"{"typ":1}"#).await.status;
@@ -620,7 +620,7 @@ mod tests {
     async fn update_pk_is_guarded_by_the_database() {
         let t = testutil::app().await;
         let pm = &t.state.pm;
-        let dev = porta_device(&t.state, "guard01", b"uuid-guard").await;
+        let dev = leapgate_device(&t.state, "guard01", b"uuid-guard").await;
         let addr: std::net::SocketAddr = "198.51.100.1:5000".parse().unwrap();
         let stale = pm.get_from_main("guard01").await.unwrap().unwrap();
         stale.write().await.info.ip = "198.51.100.1".to_owned();
@@ -651,8 +651,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn porta_errors_are_json() {
-        let v = porta_internal("x");
+    async fn leapgate_errors_are_json() {
+        let v = leapgate_internal("x");
         assert_eq!(v.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = axum::body::to_bytes(v.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], br#"{"error":"internal","message":"Server error"}"#);

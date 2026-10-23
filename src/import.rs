@@ -1,4 +1,4 @@
-//! One-off import from rustdesk-api's SQLite (PORTA.md §15, note 05 §8).
+//! One-off import from rustdesk-api's SQLite (LEAPGATE.md §15, note 05 §8).
 //!
 //! Everything is read into a [`Plan`] first (old rustdesk-api ids), the report is printed, and unless
 //! `--dry-run` the plan is written in one transaction, mapping old ids to new ones as rows are inserted.
@@ -25,8 +25,8 @@ use std::{
 /// The rustdesk-api schema version note 05 was written against.
 const EXPECTED_VERSION: i64 = 265;
 
-/// `porta-server import rustdesk-api <src> [--dry-run]`: opens `src` read-only and imports into an
-/// empty Porta database `db` in one transaction; `dry_run` only prints counts and conflicts.
+/// `leapgate-server import rustdesk-api <src> [--dry-run]`: opens `src` read-only and imports into an
+/// empty Leapgate database `db` in one transaction; `dry_run` only prints counts and conflicts.
 pub(crate) async fn rustdesk_api(
     db: &SqlitePool,
     secret: &SecretBox,
@@ -131,7 +131,7 @@ async fn open_source(src: &Path) -> ResultType<SqliteConnection> {
 async fn plan(db: &SqlitePool, src_path: &Path) -> ResultType<Plan> {
     let existing: i64 = sqlx::query_scalar("select count(*) from user").fetch_one(db).await?;
     if existing > 0 {
-        bail!("The Porta database already has {existing} user(s); importing is only supported once, into an empty database");
+        bail!("The Leapgate database already has {existing} user(s); importing is only supported once, into an empty database");
     }
     let src = &mut open_source(src_path).await?;
     let now = crate::common::now() as i64;
@@ -277,7 +277,7 @@ async fn plan(db: &SqlitePool, src_path: &Path) -> ResultType<Plan> {
     }
     let book_ids: HashSet<i64> = books.iter().map(|b| b.old_id).collect();
 
-    // ---- Rules (not expanded: group rules stay group rules, PORTA.md §15) ----
+    // ---- Rules (not expanded: group rules stay group rules, LEAPGATE.md §15) ----
     let rows = sqlx::query_as::<_, (i64, i64, i64)>(
         "SELECT r.collection_id, r.to_id, MAX(r.rule) FROM address_book_collection_rules r
          JOIN address_book_collections c ON c.id=r.collection_id AND c.user_id=r.user_id
@@ -354,11 +354,11 @@ async fn plan(db: &SqlitePool, src_path: &Path) -> ResultType<Plan> {
     .fetch_all(&mut *src)
     .await?;
     let mut entries = Vec::new();
-    // Tags that Porta's address book writes refuse (`ab::check_tag`), by book and name: imported as
+    // Tags that Leapgate's address book writes refuse (`ab::check_tag`), by book and name: imported as
     // they are, only reported (review C-6).
     let mut refused_tags: BTreeMap<(BookRef, String), &str> = BTreeMap::new();
     let mut too_many_tags = false;
-    // Entries over what Porta's writes take (review E-4): imported as they are, only reported.
+    // Entries over what Leapgate's writes take (review E-4): imported as they are, only reported.
     let mut long_ids = false;
     let mut per_book: BTreeMap<BookRef, i64> = BTreeMap::new();
     let rows = personal_rows
@@ -379,7 +379,7 @@ async fn plan(db: &SqlitePool, src_path: &Path) -> ResultType<Plan> {
             long_ids = true;
             let _ = writeln!(
                 r,
-                "Over the limits: entry {:?}… in {} has an id of {} bytes (Porta takes at most {MAX_PEER_ID_LEN})",
+                "Over the limits: entry {:?}… in {} has an id of {} bytes (Leapgate takes at most {MAX_PEER_ID_LEN})",
                 id.chars().take(32).collect::<String>(),
                 book_name(book),
                 id.len()
@@ -400,7 +400,7 @@ async fn plan(db: &SqlitePool, src_path: &Path) -> ResultType<Plan> {
             too_many_tags = true;
             let _ = writeln!(
                 r,
-                "Over the limits: entry {id:?} in {} has {} tags (Porta takes at most {MAX_PEER_TAGS} on a peer)",
+                "Over the limits: entry {id:?} in {} has {} tags (Leapgate takes at most {MAX_PEER_TAGS} on a peer)",
                 book_name(book),
                 tags.len()
             );
@@ -421,7 +421,7 @@ async fn plan(db: &SqlitePool, src_path: &Path) -> ResultType<Plan> {
     }
     let full: Vec<(BookRef, i64)> = per_book.into_iter().filter(|(_, n)| *n > MAX_PEERS).collect();
     for (book, n) in &full {
-        let _ = writeln!(r, "Over the limits: {} has {n} entries (Porta takes at most {MAX_PEERS} in a book)", book_name(*book));
+        let _ = writeln!(r, "Over the limits: {} has {n} entries (Leapgate takes at most {MAX_PEERS} in a book)", book_name(*book));
     }
     if long_ids || !full.is_empty() {
         let _ = writeln!(
@@ -498,7 +498,7 @@ async fn plan(db: &SqlitePool, src_path: &Path) -> ResultType<Plan> {
     if !refused_tags.is_empty() || too_many_tags {
         let _ = writeln!(
             r,
-            "Entries and tags over the limits are imported as they are, but Porta refuses them in a peer's \
+            "Entries and tags over the limits are imported as they are, but Leapgate refuses them in a peer's \
              tags (400): editing the tags of such an entry fails as long as it keeps such a tag or more than \
              {MAX_PEER_TAGS} tags, and so does adding the entry to a book that has the tag. After the import, \
              rename these tags (client: tag menu > Rename) and untick tags on those entries."
@@ -582,7 +582,7 @@ async fn plan(db: &SqlitePool, src_path: &Path) -> ResultType<Plan> {
         })
         .collect();
     if !no_pw.is_empty() {
-        let _ = writeln!(r, "Users without a password (set one with `porta-server user passwd <name>`): {}", no_pw.join(", "));
+        let _ = writeln!(r, "Users without a password (set one with `leapgate-server user passwd <name>`): {}", no_pw.join(", "));
     }
     let _ = writeln!(
         r,
@@ -603,7 +603,7 @@ async fn plan(db: &SqlitePool, src_path: &Path) -> ResultType<Plan> {
     let _ = writeln!(r, "Entries: {}, tags: {}", entries.len(), tags.len());
     let _ = writeln!(
         r,
-        "Devices: {} ({} with an owner; {} already known to Porta, only their owner is filled in)",
+        "Devices: {} ({} with an owner; {} already known to Leapgate, only their owner is filled in)",
         devices.len(),
         devices.iter().filter(|d| d.user.is_some()).count(),
         devices.iter().filter(|d| d.known).count()
@@ -632,7 +632,7 @@ fn book_name(book: BookRef) -> String {
     }
 }
 
-/// Duplicate group names get `-<old id>` appended (PORTA.md §15).
+/// Duplicate group names get `-<old id>` appended (LEAPGATE.md §15).
 fn unique_group_name(taken: &mut HashSet<String>, base: String, old_id: i64) -> String {
     let mut name = base;
     while taken.contains(&name) {
@@ -761,7 +761,7 @@ async fn write(db: &SqlitePool, secret: &SecretBox, plan: &Plan) -> ResultType<(
             .await?;
     }
     for d in &plan.devices {
-        // Devices that already reported to Porta keep their fresher data; only the owner is filled in.
+        // Devices that already reported to Leapgate keep their fresher data; only the owner is filled in.
         sqlx::query(
             "insert into device(id, uuid, user_id, hostname, username, os, version, first_seen_at, last_seen_at, last_ip)
              values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -890,7 +890,7 @@ INSERT INTO peers(row_id, id, uuid, user_id, hostname, os, username, version, la
     async fn imports_everything() {
         let f = fixture().await;
         let db = &f.db;
-        // A device that already reported to Porta before the import.
+        // A device that already reported to Leapgate before the import.
         sqlx::query("insert into device(id, hostname, first_seen_at, last_seen_at) values('900', 'fresh', 10, 20)")
             .execute(db)
             .await
@@ -1187,7 +1187,7 @@ INSERT INTO peers(row_id, id, uuid, user_id, hostname, os, username, version, la
         assert_eq!(count(&f.db, "select max(length(cast(name as blob))) from user").await, MAX_NAME_LEN as i64);
     }
 
-    /// Tags Porta's writes refuse (over 64 bytes, control characters) and entries with more than 64
+    /// Tags Leapgate's writes refuse (over 64 bytes, control characters) and entries with more than 64
     /// tags are imported unchanged and listed in the report (review C-6).
     #[tokio::test]
     async fn over_limit_tags_reported() {
@@ -1258,7 +1258,7 @@ INSERT INTO peers(row_id, id, uuid, user_id, hostname, os, username, version, la
         let short: String = long.chars().take(32).collect();
         for needle in [
             format!("Over the limits: entry {short:?}… in the personal book of user_id 1 has an id of {} bytes", long.len()),
-            format!("Over the limits: collection 10 has {} entries (Porta takes at most {MAX_PEERS} in a book)", MAX_PEERS + 1),
+            format!("Over the limits: collection 10 has {} entries (Leapgate takes at most {MAX_PEERS} in a book)", MAX_PEERS + 1),
             format!("delete them in batches of at most {MAX_PEERS}"),
         ] {
             assert!(p.report.contains(&needle), "missing {needle:?} in:\n{}", p.report);

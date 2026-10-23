@@ -1,4 +1,4 @@
-//! Group panel (PORTA.md §12.3; note 03 §3).
+//! Group panel (LEAPGATE.md §12.3; note 03 §3).
 //!
 //! Visibility: an admin sees every user and every device; anyone else sees themselves plus the
 //! users sharing any `share_devices=1` group with them, and the devices owned (`device.user_id`)

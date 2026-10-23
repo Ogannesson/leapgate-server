@@ -1,5 +1,5 @@
-//! 黑盒测试：账号、组面板、设备上报、审计（PORTA.md §9.1~§9.3、§10、§11、§12.3；笔记 01、03）。
-//! 每个测试起一个真实的 porta-server 进程（见 `bb_api_support`），只看 HTTP 响应和数据库，不看实现。
+//! 黑盒测试：账号、组面板、设备上报、审计（LEAPGATE.md §9.1~§9.3、§10、§11、§12.3；笔记 01、03）。
+//! 每个测试起一个真实的 leapgate-server 进程（见 `bb_api_support`），只看 HTTP 响应和数据库，不看实现。
 
 mod bb_api_support;
 
@@ -107,7 +107,7 @@ fn assert_audit_ok(r: &Resp, what: &str) {
 
 // ===================== 进程管理与请求发送的自检 =====================
 
-/// 自检（§9.4、§5）：API 监听在 P-2；`GET /` 回 HTML 说明页，含服务名 Porta 和 DB-IP 署名链接。
+/// 自检（§9.4、§5）：API 监听在 P-2；`GET /` 回 HTML 说明页，含服务名 Leapgate 和 DB-IP 署名链接。
 /// 这条不依赖任何并行模块，用来证明进程管理和请求发送本身是对的。
 #[tokio::test]
 async fn harness_index_page() {
@@ -117,7 +117,7 @@ async fn harness_index_page() {
     assert_eq!(r.status, 200);
     assert!(norm_ct(&r.ct).starts_with("text/html"), "ct {}", r.ct);
     let body = r.text();
-    assert!(body.contains("Porta") && body.contains("https://db-ip.com"), "{body}");
+    assert!(body.contains("Leapgate") && body.contains("https://db-ip.com"), "{body}");
     // 库已迁移：迁移种下的全局 relay-server 墓碑在（§4.2）；顺带验证读库辅助函数。
     let rows = s.rows("select scope, key, value, 7 as n, null as z from strategy_option").await;
     assert_eq!(rows.len(), 1);
@@ -687,14 +687,14 @@ async fn group_panel_pagination() {
 
 /// §9.1.7、§10：sysinfo 成功回纯文本 `SYSINFO_UPDATED`（逐字节，无换行无引号）、`text/plain; charset=utf-8`；
 /// 存原文，拆出 hostname/username/os/version，uuid 存上报里的 base64，client_type 一律 rustdesk；
-/// 未知字段（preset-*、以后 Porta 的键）照收。
+/// 未知字段（preset-*、以后 Leapgate 的键）照收。
 #[tokio::test]
 async fn sysinfo_stores_and_answers_exactly() {
     let s = Server::start().await;
     let uuid = registered(&s, "600000001").await;
     let mut body = sysinfo_body("600000001", &uuid);
     body["preset-address-book-name"] = json!("team");
-    body["porta"] = json!({"ver": "0.1.0", "proto": 1});
+    body["leapgate"] = json!({"ver": "0.1.0", "proto": 1});
     let r = s.post_json("/api/sysinfo", None, &body).await;
     assert_eq!(r.status, 200, "{:?}", r.text());
     assert_eq!(r.body, b"SYSINFO_UPDATED".to_vec(), "body must be exactly SYSINFO_UPDATED, got {:?}", r.text());

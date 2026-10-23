@@ -1,6 +1,6 @@
-//! 会合协议与路由的黑盒测试：起真实的 porta-server 进程，在回环地址上模拟控制端 A 和被控端 B。
-//! 依据 PORTA.md §6（会合）、§7（路由）、§8（结果记录），笔记 02、06，以及上游客户端代码；
-//! 不看服务端实现。下文"§6.1""§6.2"指 PORTA.md §6 的第 1、2 条，"§6.5a"指第 5a 条。
+//! 会合协议与路由的黑盒测试：起真实的 leapgate-server 进程，在回环地址上模拟控制端 A 和被控端 B。
+//! 依据 LEAPGATE.md §6（会合）、§7（路由）、§8（结果记录），笔记 02、06，以及上游客户端代码；
+//! 不看服务端实现。下文"§6.1""§6.2"指 LEAPGATE.md §6 的第 1、2 条，"§6.5a"指第 5a 条。
 //! 现阶段各模块还没实现，除 `harness_server_starts_and_serves_index` 外大多会失败，这是预期的。
 
 mod bb_rendezvous_support;
@@ -22,7 +22,7 @@ fn ip(s: &str) -> IpAddr {
     s.parse().unwrap()
 }
 
-/// 进程管理和请求发送本身是对的：骨架已有的 `GET /` 说明页（PORTA.md §9.4）能取到，
+/// 进程管理和请求发送本身是对的：骨架已有的 `GET /` 说明页（LEAPGATE.md §9.4）能取到，
 /// 21116 在监听，`id_ed25519.pub` 已生成（`Server::start` 等的就是这三样）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn harness_server_starts_and_serves_index() {
@@ -30,7 +30,7 @@ async fn harness_server_starts_and_serves_index() {
     let resp = reqwest::get(server.api_url("/")).await.unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
-    assert!(body.contains("Porta"), "说明页里应有服务名 Porta");
+    assert!(body.contains("Leapgate"), "说明页里应有服务名 Leapgate");
     assert_eq!(server.pk().0.len(), 32);
 }
 
@@ -114,7 +114,7 @@ async fn harness_client_kx_matches_reference_server() {
     }
 }
 
-// ---------------------------------------------------------------- KeyExchange（PORTA.md §6.1）
+// ---------------------------------------------------------------- KeyExchange（LEAPGATE.md §6.1）
 
 /// §6.1、笔记 02 §6.2 步骤 1：21116/TCP 连上后服务端先发 v1 的 KeyExchange：
 /// 签名的临时公钥（最高位置 1）、`version = 1`、`signed_params` = 签过名的
@@ -223,7 +223,7 @@ async fn ws_does_not_send_key_exchange() {
     );
 }
 
-// ---------------------------------------------------------------- 打洞信令（PORTA.md §6.2）
+// ---------------------------------------------------------------- 打洞信令（LEAPGATE.md §6.2）
 
 /// §6.2、笔记 02 §6.5 的表：
 /// - `PunchHoleRequest` → `PunchHole`：补 `socket_addr_v6`（A 的）、`force_relay`；
@@ -371,7 +371,7 @@ async fn always_use_relay_clears_v6_and_forces_relay() {
     assert_eq!(hole.relay_server, relay.host);
 }
 
-// ---------------------------------------------------------------- 路由（PORTA.md §7）
+// ---------------------------------------------------------------- 路由（LEAPGATE.md §7）
 
 /// 发一次打洞请求，返回 B 收到的 `PunchHole.relay_server`（路由的选择）。
 async fn select_once(server: &Server, b: &mut PeerB) -> String {
@@ -485,7 +485,7 @@ async fn route_health_check_drops_dead_relay() {
     }
 }
 
-// ---------------------------------------------------------------- 结果记录（PORTA.md §8）
+// ---------------------------------------------------------------- 结果记录（LEAPGATE.md §8）
 
 /// §8、笔记 02 §4.4：hbbs 直接回失败的请求（目标离线 → `fail_offline`，id 不存在 →
 /// `fail_id_not_exist`）定稿为 `outcome = 'rejected'`。离线的 B = `peer` 表里有、内存里不在线。
@@ -607,7 +607,7 @@ async fn conn_attempt_records_rejected() {
     }
 }
 
-// ---------------------------------------------------------------- 21118 来源 IP（PORTA.md §6.5a）
+// ---------------------------------------------------------------- 21118 来源 IP（LEAPGATE.md §6.5a）
 
 /// 经 21118 发一次打洞请求（带 `X-Real-IP`），返回 B 收到的 `PunchHole.socket_addr` 里的 A 地址。
 async fn ws_punch_seen_by_b(server: &Server, b: &mut PeerB, host: &str, real_ip: &str) -> IpAddr {
@@ -652,7 +652,7 @@ async fn ws_x_real_ip_trusted_only_from_loopback() {
     assert_eq!(seen, local, "直连 21118 时伪造的 X-Real-IP 不能被信任，应使用 TCP 对端地址");
 }
 
-// ---------------------------------------------------------------- 资源上限（PORTA.md §6 第 8 条）
+// ---------------------------------------------------------------- 资源上限（LEAPGATE.md §6 第 8 条）
 
 /// 21116 的帧上限 16 KB：带 8 KB WebRTC offer 的 `PunchHoleRequest` 照常应答；
 /// 帧头声明 20 KB 的帧一到，连接就被断开。
@@ -702,7 +702,7 @@ async fn ws_without_handshake_times_out() {
 }
 
 /// 审查 C-1/C-7/C-8：未认证、每个包都能触发的日志每分钟最多一行，攻击者给的 id 截断后才进日志
-/// （PORTA.md §6 第 7 条）。
+/// （LEAPGATE.md §6 第 7 条）。
 /// - 21116 上许可证不符的 `PunchHoleRequest`：一条连接连发 300 条，每条 id 约 16 KB；
 /// - 别的地址替一台在线设备发 `RegisterPeer`（"IP change"）：连发 2000 个。回环来源不算换 IP，
 ///   要用本机的非回环地址；没有时注明跳过这一半。
@@ -749,7 +749,7 @@ async fn unauthenticated_floods_log_once_a_minute() {
     }
 }
 
-// ---------------------------------------------------------------- 会合不等 API（PORTA.md §4.1）
+// ---------------------------------------------------------------- 会合不等 API（LEAPGATE.md §4.1）
 
 /// UDP 发一条 `RegisterPk`，返回结果（`timeout_ms` 内没回包为 None）和耗时。
 async fn register_pk_from(
@@ -817,7 +817,7 @@ async fn first_byte(server: &Server, timeout_ms: u64) -> Option<Duration> {
 
 /// 审查 C-21：未认证的 `/api/audit/alarm` 被几百个并发连接灌着（每条两次写库）时，要查库的
 /// `RegisterPk` 不能让会合主循环跟着等库：它自己、同时到的 `RegisterPeer` 回包、21116 新连接的
-/// 首字节都要在几十毫秒内。会合用自己的小连接池，不和 API 排同一个队（PORTA.md §4.1）。洪水请求
+/// 首字节都要在几十毫秒内。会合用自己的小连接池，不和 API 排同一个队（LEAPGATE.md §4.1）。洪水请求
 /// 各带一个来源，每条都真的写库；测量期写库次数为 0 时测试判失败（审查 D-1/D-17）。
 /// `RegisterPk` 的设备只在库里、不在内存里（服务重启后的样子），uuid、pk、IP（按服务存的映射地址
 /// 格式）都对得上，只查库不写库：写库还要等 §4.1 的 checkpoint 放开写锁，那不是这里要测的排队。
@@ -842,7 +842,7 @@ async fn api_write_flood_does_not_stall_rendezvous() {
         let db = sqlx::SqlitePool::connect_with(opts).await.unwrap();
         for i in 0..10 {
             let (id, pk, from) = (unique_id(""), sign::gen_keypair().0 .0, format!("127.0.1.{}", i + 1));
-            // 服务绑双栈 [::]，IPv4 来源存成映射地址（原版会合逻辑的 ip 比较不规范化，PORTA.md §3）。
+            // 服务绑双栈 [::]，IPv4 来源存成映射地址（原版会合逻辑的 ip 比较不规范化，LEAPGATE.md §3）。
             let info = format!(r#"{{"ip":"::ffff:{from}"}}"#);
             sqlx::query("insert into peer(guid, id, uuid, pk, info) values(?, ?, ?, ?, ?)")
                 .bind(hbb_common::rand::random::<[u8; 16]>().to_vec())
@@ -983,7 +983,7 @@ async fn api_write_flood_does_not_stall_rendezvous() {
 /// 审查 D-15：持 key 的客户端在 21116 的几百条连接上不停发目标不存在的 `PunchHoleRequest`
 /// （每条都要查库），同时很多来源发新 id 的 `RegisterPk`（会合主循环每条查一次库）。会合主循环的
 /// 查库不能排在连接任务的查库后面：在线设备的 `RegisterPeer` 照常在几十毫秒内回包。连接任务的
-/// 查库走主池，会合池只给主循环用（PORTA.md §4.1）。
+/// 查库走主池，会合池只给主循环用（LEAPGATE.md §4.1）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn punch_lookup_flood_does_not_stall_rendezvous() {
     use std::sync::{
@@ -1062,13 +1062,13 @@ async fn punch_lookup_flood_does_not_stall_rendezvous() {
     assert!(worst < WORST, "打洞查库拖住了会合主循环：{rtts:?}");
 }
 
-/// 审查 E-3：服务进程里真的起了 checkpoint 任务（PORTA.md §4.1，每 5 秒一次）。自动 checkpoint
+/// 审查 E-3：服务进程里真的起了 checkpoint 任务（LEAPGATE.md §4.1，每 5 秒一次）。自动 checkpoint
 /// 关掉了，这个任务一丢，`-wal` 只增不减。注册一批新 id（每个写一次库）后不再写，10 秒内 `-wal`
 /// 要被截成 0 字节（或删掉）。测试侧不开连接（它默认自动 checkpoint，会掩盖问题），只看文件大小。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn service_checkpoints_the_wal() {
     let server = Server::start(GEO_OFF, &[]).await;
-    // 新 id 全服每分钟最多 20 个（PORTA.md §6 第 7 条）。
+    // 新 id 全服每分钟最多 20 个（LEAPGATE.md §6 第 7 条）。
     for i in 0..15 {
         let pk = sign::gen_keypair().0 .0;
         let from = format!("127.0.3.{}", i + 1);

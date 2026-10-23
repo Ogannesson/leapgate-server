@@ -1,11 +1,11 @@
-//! Encryption of password fields at rest (PORTA.md §13): `ab_peer.hash_enc`, `ab_peer.password_enc`.
-//! Protects database files and backups; the operator can still decrypt with `porta_secret.key`.
+//! Encryption of password fields at rest (LEAPGATE.md §13): `ab_peer.hash_enc`, `ab_peer.password_enc`.
+//! Protects database files and backups; the operator can still decrypt with `leapgate_secret.key`.
 
 use hbb_common::{anyhow::Context, bail, ResultType};
 use sodiumoxide::crypto::secretbox;
 use std::{io::Write, path::Path};
 
-pub const SECRET_KEY_FILE: &str = "porta_secret.key";
+pub const SECRET_KEY_FILE: &str = "leapgate_secret.key";
 const PREFIX: &str = "sb1:";
 
 pub struct SecretBox {

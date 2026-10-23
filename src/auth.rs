@@ -1,4 +1,4 @@
-//! Passwords and API tokens (PORTA.md §11).
+//! Passwords and API tokens (LEAPGATE.md §11).
 
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},

@@ -30,7 +30,7 @@ const JOURNAL_SIZE_LIMIT: u64 = 64 * 1024 * 1024;
 /// So `open` turns them off and this task is the only checkpointer (`checkpoint`): a PASSIVE run,
 /// then a TRUNCATE one, which takes the write lock, copies the rest, waits for the readers still on
 /// the log (later ones read the database file) and truncates the file to zero.
-/// - Interval: between two runs the WAL holds about this long's writes (PORTA.md §4.1 has the
+/// - Interval: between two runs the WAL holds about this long's writes (LEAPGATE.md §4.1 has the
 ///   measured peak), and a run on an empty log costs nothing. Longer means a bigger file and a
 ///   longer copy; shorter, more fsyncs for nothing.
 /// - Busy timeout: while it waits for the write lock or for readers, the TRUNCATE run holds up
@@ -106,7 +106,7 @@ pub(crate) async fn open(url: &str, create: bool) -> ResultType<SqlitePool> {
     Ok(pool)
 }
 
-/// The rendezvous module's own pool on the database of `main` (PORTA.md §4.1): `PeerMap` looks up
+/// The rendezvous module's own pool on the database of `main` (LEAPGATE.md §4.1): `PeerMap` looks up
 /// and writes peers from `io_loop`, which must not queue behind unauthenticated API requests in
 /// `main`'s fair queue (review C-21). Short waits (`RENDEZVOUS_*`); connections open on first use.
 pub(crate) fn rendezvous_pool(main: &SqlitePool) -> SqlitePool {
@@ -119,7 +119,7 @@ pub(crate) fn rendezvous_pool(main: &SqlitePool) -> SqlitePool {
         .connect_lazy_with(opt)
 }
 
-/// Checkpoints `main`'s database every `CHECKPOINT_INTERVAL`, truncating the WAL (PORTA.md §4.1).
+/// Checkpoints `main`'s database every `CHECKPOINT_INTERVAL`, truncating the WAL (LEAPGATE.md §4.1).
 /// On a connection of its own: one of the rendezvous pool's would be taken from `io_loop`, and the
 /// main pool's queue behind an API flood and wait 5 s for locks.
 pub(crate) fn spawn_checkpoints(main: &SqlitePool) {
@@ -219,7 +219,7 @@ impl Database {
 
     /// Writes a registration; the rows written. A pinned row (`pk_pinned_at`) only takes its own key
     /// (a new IP), so a key change of a pinned peer writes nothing (0): guarded here, in the database,
-    /// whatever the caller's copy of the peer says (PORTA.md §6 item 7).
+    /// whatever the caller's copy of the peer says (LEAPGATE.md §6 item 7).
     pub async fn update_pk(
         &self,
         guid: &Vec<u8>,

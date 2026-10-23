@@ -1,4 +1,4 @@
-//! 地址簿 12 个接口的黑盒测试：起真实的 porta-server 进程，只依据 PORTA.md（§9.1 第 6、9、10 条，§12.1，§12.2）、
+//! 地址簿 12 个接口的黑盒测试：起真实的 leapgate-server 进程，只依据 LEAPGATE.md（§9.1 第 6、9、10 条，§12.1，§12.2）、
 //! migrations/0001_init.sql 和笔记 04（docs/research/第一期服务端/04-地址簿接口.md）断言，
 //! 请求体照笔记 04 引用的客户端代码（flutter/lib/models/ab_model.dart、peer_model.dart、common/widgets/dialog.dart）构造。
 
@@ -95,7 +95,7 @@ async fn smoke_server_process_and_index_page() {
     assert_eq!(r.status, 200, "{}", r.text());
     assert!(r.content_type.starts_with("text/html"), "{}", r.content_type);
     let page = r.text();
-    assert!(page.contains("Porta") && page.contains("https://db-ip.com"), "{page}");
+    assert!(page.contains("Leapgate") && page.contains("https://db-ip.com"), "{page}");
     for p in [s.port - 1, s.port, s.port + 2] {
         TcpStream::connect(("127.0.0.1", p)).unwrap_or_else(|e| panic!("端口 {p} 没在监听：{e}"));
     }
@@ -298,7 +298,7 @@ async fn pagination_total_is_int_and_pages_lose_nothing() {
 /// §12.1 / §9.1 第 9 条：读接口按对象型（peers）和数组型（tags）解析器回；`peers` 每条 = data 的全部键 + id + tags
 /// + 个人簿的 hash 或共享簿的 password（解密后）；`hash_enc`/`password_enc` 为 '' 时省略。
 /// §9.1 第 10 条：纯数字字符串保持字符串。笔记 04 §3.4：只读成员也要拿到共享密码。
-/// 数据直接写库（用服务的 porta_secret.key 加密），所以只考读路径。
+/// 数据直接写库（用服务的 leapgate_secret.key 加密），所以只考读路径。
 #[tokio::test]
 async fn peers_response_composition_and_decryption() {
     let s = Server::start().await;

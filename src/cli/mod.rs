@@ -1,4 +1,4 @@
-//! Command line management (PORTA.md §14): `porta-server <subcommand> …`.
+//! Command line management (LEAPGATE.md §14): `leapgate-server <subcommand> …`.
 //! Opens the same database as the server (`DB_URL`, read the same way: `.env`, `-c` INI, environment,
 //! command line; migrations run on open; a missing database is an error, not created); subcommands
 //! that write print its absolute path; subcommands that need runtime state talk to the local
@@ -30,7 +30,7 @@ use std::{
 /// Names the client treats as the personal address book; a shared book may not use them (§12.1).
 pub(crate) const RESERVED_BOOK_NAMES: [&str; 2] = ["My address book", "Legacy address book"];
 
-const USAGE: &str = "Usage: porta-server <command> [options]
+const USAGE: &str = "Usage: leapgate-server <command> [options]
 
   user add <name> [--admin] [--display-name <s>] [--email <s>]   (password: one line on stdin)
   user passwd <name>                                             (password: one line on stdin)
@@ -49,7 +49,7 @@ const USAGE: &str = "Usage: porta-server <command> [options]
   import rustdesk-api <db path> [--dry-run]
 
 Options read like the server's: -p/--port (console = 127.0.0.1:port-1), -c/--config <INI>,
---porta-config <file>; DB_URL from the environment or .env.
+--leapgate-config <file>; DB_URL from the environment or .env.
 ";
 
 /// `args` starts at the subcommand (`["user", "add", "alice", …]`); `main` only dispatches here when
@@ -64,8 +64,8 @@ pub fn run(argv: Vec<String>) -> ResultType<()> {
     if let Some(port) = args.value(&["-p", "--port"]) {
         set_arg("port", &port);
     }
-    if let Some(path) = args.value(&["--porta-config"]) {
-        set_arg("porta-config", &path);
+    if let Some(path) = args.value(&["--leapgate-config"]) {
+        set_arg("leapgate-config", &path);
     }
     let port: u16 = get_arg_or("port", RENDEZVOUS_PORT.to_string()).parse()?;
     if port < 3 {
@@ -78,24 +78,24 @@ pub fn run(argv: Vec<String>) -> ResultType<()> {
     let changes = changes_database(&args);
     rt.block_on(async {
         let console = SocketAddr::from(([127, 0, 0, 1], port - 1));
-        let porta_config = PathBuf::from(get_arg_or("porta-config", "porta.toml".to_owned()));
+        let leapgate_config = PathBuf::from(get_arg_or("leapgate-config", "leapgate.toml".to_owned()));
         let mut out = match args.pos.front().map(String::as_str) {
             // No database needed, so none is required or opened (review R2-6).
             Some(cmd @ ("relay" | "route" | "geo")) => {
                 let cmd = cmd.to_owned();
                 args.pos.pop_front();
-                ops::runtime(console, &porta_config, &cmd, args).await?
+                ops::runtime(console, &leapgate_config, &cmd, args).await?
             }
             _ => {
                 let ctx = Ctx {
                     db: crate::database::open(&db_url, false).await?,
                     console,
-                    porta_config,
+                    leapgate_config,
                     secret_key: PathBuf::from(crate::crypto::SECRET_KEY_FILE),
                 };
                 let stdin = std::io::stdin();
                 let out = exec(&ctx, args, &mut stdin.lock()).await;
-                // No automatic checkpoints (PORTA.md §4.1), and dropping the pool does not wait for
+                // No automatic checkpoints (LEAPGATE.md §4.1), and dropping the pool does not wait for
                 // the connections to close: copy the WAL into the database before exiting, so that
                 // with the service stopped the database file alone has every change. PASSIVE: with
                 // the service running it holds up no writer (its own task checkpoints then).
@@ -141,8 +141,8 @@ pub(super) struct Ctx {
     pub db: SqlitePool,
     /// The running server's console, 127.0.0.1:`port-1`.
     pub console: SocketAddr,
-    pub porta_config: PathBuf,
-    /// `porta_secret.key` in the working directory; only `import` needs it.
+    pub leapgate_config: PathBuf,
+    /// `leapgate_secret.key` in the working directory; only `import` needs it.
     pub secret_key: PathBuf,
 }
 
@@ -152,7 +152,7 @@ pub(super) async fn exec(ctx: &Ctx, mut args: Args, input: &mut dyn BufRead) -> 
     match cmd.as_str() {
         "user" | "group" | "ab" => manage::exec(ctx, &cmd, args, input).await,
         "device" | "strategy" | "stats" => ops::exec(ctx, &cmd, args).await,
-        "relay" | "route" | "geo" => ops::runtime(ctx.console, &ctx.porta_config, &cmd, args).await,
+        "relay" | "route" | "geo" => ops::runtime(ctx.console, &ctx.leapgate_config, &cmd, args).await,
         "import" => {
             let kind = args.next("source kind")?;
             if kind != "rustdesk-api" {
@@ -178,7 +178,7 @@ pub(super) async fn exec(ctx: &Ctx, mut args: Args, input: &mut dyn BufRead) -> 
 
 /// Flags that take a value (`--name value` or `--name=value`).
 const VALUE_FLAGS: &[&str] = &[
-    "-p", "--port", "-c", "--config", "--porta-config", "--display-name", "--email", "--owner",
+    "-p", "--port", "-c", "--config", "--leapgate-config", "--display-name", "--email", "--owner",
     "--note", "--user", "--group", "--days", "--a", "--b",
 ];
 const BOOL_FLAGS: &[&str] = &[
@@ -291,7 +291,7 @@ async fn console(addr: SocketAddr, cmd: &str, wait: Duration) -> ResultType<Stri
 async fn console_connect(addr: SocketAddr) -> ResultType<TcpStream> {
     match tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(addr)).await {
         Ok(Ok(s)) => Ok(s),
-        Ok(Err(e)) => bail!("Cannot reach the server console at {addr} ({e}); is porta-server running with this -p?"),
+        Ok(Err(e)) => bail!("Cannot reach the server console at {addr} ({e}); is leapgate-server running with this -p?"),
         Err(_) => bail!("Cannot reach the server console at {addr} (timed out)"),
     }
 }
@@ -373,7 +373,7 @@ pub(super) mod tests {
         Ctx {
             db,
             console: SocketAddr::from(([127, 0, 0, 1], 1)),
-            porta_config: dir.join("porta.toml"),
+            leapgate_config: dir.join("leapgate.toml"),
             secret_key: dir.join(crate::crypto::SECRET_KEY_FILE),
         }
     }

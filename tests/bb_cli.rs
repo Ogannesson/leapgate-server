@@ -1,7 +1,7 @@
-//! 命令行与导入的黑盒测试（PORTA.md §13、§14、§15，笔记 05）。
+//! 命令行与导入的黑盒测试（LEAPGATE.md §13、§14、§15，笔记 05）。
 //!
 //! 只依据契约、笔记和上游客户端代码写，不看 `src/cli/`、`src/import.rs` 的实现：以子进程方式跑
-//! `porta-server <子命令>`（工作目录是临时目录，`DB_URL` 指向临时库，密码经标准输入传入），
+//! `leapgate-server <子命令>`（工作目录是临时目录，`DB_URL` 指向临时库，密码经标准输入传入），
 //! 再直接查 SQLite 断言结果；导入后的登录用真实的服务进程走 HTTP。
 
 mod bb_cli_support;
@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use sqlx::{sqlite::SqliteConnectOptions, SqlitePool};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// 客户端 `Peer.fromJson` 认的键（PORTA.md §15"条目"、§4.2 `ab_peer.data` 不含 id/tags/hash/password）。
+/// 客户端 `Peer.fromJson` 认的键（LEAPGATE.md §15"条目"、§4.2 `ab_peer.data` 不含 id/tags/hash/password）。
 const PEER_DATA_KEYS: &[&str] = &[
     "username",
     "hostname",
@@ -71,7 +71,7 @@ async fn option_value(db: &SqlitePool, scope: &str, key: &str) -> Option<String>
 // ---------------------------------------------------------------------------------------------
 
 /// 自检：假 rustdesk-api 库按笔记 05 §2 的实测 DDL 建成，笔记 05 §8 / 契约 §15 的读取 SQL 在上面
-/// 读出的行数和夹具设计一致；Porta 库迁移后是空的；服务进程能起来，`GET /` 回说明页（§9.4）。
+/// 读出的行数和夹具设计一致；Leapgate 库迁移后是空的；服务进程能起来，`GET /` 回说明页（§9.4）。
 #[tokio::test]
 async fn harness_fixture_and_server_process() {
     let work = Work::new();
@@ -171,14 +171,14 @@ async fn harness_fixture_and_server_process() {
         .map(|v| v.to_str().unwrap().to_owned())
         .unwrap_or_default();
     assert!(ct.starts_with("text/html"), "content-type {ct}");
-    assert!(resp.text().await.unwrap().contains("Porta"));
+    assert!(resp.text().await.unwrap().contains("Leapgate"));
 }
 
 // ---------------------------------------------------------------------------------------------
 // §13：命令行只读已有的密钥文件
 // ---------------------------------------------------------------------------------------------
 
-/// §13：命令行（含 import）只读已有的 `porta_secret.key`，不存在就报错退出，不生成密钥
+/// §13：命令行（含 import）只读已有的 `leapgate_secret.key`，不存在就报错退出，不生成密钥
 /// （否则在别处跑命令行会多出一把密钥，导入的密码解不开）。
 #[tokio::test]
 async fn cli_without_secret_key_refuses_and_never_creates_one() {
@@ -187,13 +187,13 @@ async fn cli_without_secret_key_refuses_and_never_creates_one() {
     let db = work.pool().await;
 
     work.cli(&["import", "rustdesk-api", src_arg(&fx)], "").refused();
-    assert!(!work.key_path().exists(), "import must not create porta_secret.key");
+    assert!(!work.key_path().exists(), "import must not create leapgate_secret.key");
     assert_eq!(count(&db, "select count(*) from user").await, 0, "nothing imported");
 
     // 其他子命令也不能生成密钥（是否因此报错，契约只对"命令行"整体说了报错退出，这里只断言不生成）。
     work.cli(&["user", "add", "zed"], "zedpw123\n");
     work.cli(&["user", "list"], "");
-    assert!(!work.key_path().exists(), "command line must never create porta_secret.key");
+    assert!(!work.key_path().exists(), "command line must never create leapgate_secret.key");
 }
 
 /// 命令行不新建数据库（同 §13 不生成密钥的理由：在别的目录下跑，改动会落进服务看不到的新库）：
@@ -220,7 +220,7 @@ async fn cli_never_creates_the_database_and_writes_name_it() {
     let left: Vec<_> = std::fs::read_dir(work.path())
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|n| n.starts_with("porta.sqlite3"))
+        .filter(|n| n.starts_with("leapgate.sqlite3"))
         .collect();
     assert!(left.is_empty(), "command line created {left:?}");
 
@@ -550,11 +550,11 @@ async fn device_commands() {
     let db = work.pool().await;
     let alice = insert_user(&db, "alice", "").await;
     const D1: &str = "111222333"; // 原版客户端，归 alice
-    const D2: &str = "987654321"; // Porta 客户端
+    const D2: &str = "987654321"; // Leapgate 客户端
     let t = now();
     for (id, uid, host, ver, ty) in [
         (D1, Some(alice), "host-d1", "1.4.2", "rustdesk"),
-        (D2, None, "host-d2", "0.1.0", "porta"),
+        (D2, None, "host-d2", "0.1.0", "leapgate"),
     ] {
         sqlx::query(
             "insert into device(id, user_id, hostname, version, client_type, first_seen_at, last_seen_at)
@@ -594,7 +594,7 @@ async fn device_commands() {
 
     let out = work.cli(&["device", "list"], "");
     out.ok();
-    for s in [D1, "host-d1", "alice", "rustdesk", "1.4.2", D2, "host-d2", "porta", "0.1.0"] {
+    for s in [D1, "host-d1", "alice", "rustdesk", "1.4.2", D2, "host-d2", "leapgate", "0.1.0"] {
         assert!(out.stdout.contains(s), "device list lacks {s:?}:\n{}", out.stdout);
     }
 
@@ -604,7 +604,7 @@ async fn device_commands() {
         assert!(out.stdout.contains(s), "device list --legacy lacks {s:?}:\n{}", out.stdout);
     }
     for s in [D2, "host-d2"] {
-        assert!(!out.stdout.contains(s), "device list --legacy must not list the Porta client {s:?}:\n{}", out.stdout);
+        assert!(!out.stdout.contains(s), "device list --legacy must not list the Leapgate client {s:?}:\n{}", out.stdout);
     }
 
     let pin = |db: SqlitePool| async move {
@@ -627,7 +627,7 @@ async fn device_commands() {
 // §15：从 rustdesk-api 导入
 // ---------------------------------------------------------------------------------------------
 
-/// §15 全部规则，逐项查 Porta 库（夹具见 `bb_cli_support::build_rustdesk_api`，每行的用意写在那里）。
+/// §15 全部规则，逐项查 Leapgate 库（夹具见 `bb_cli_support::build_rustdesk_api`，每行的用意写在那里）。
 #[tokio::test]
 async fn import_rustdesk_api_applies_section_15() {
     let work = Work::new();
@@ -939,7 +939,7 @@ async fn import_rustdesk_api_applies_section_15() {
     assert_eq!((d4.1.clone(), d4.6, d4.8.as_str(), d4.9.as_str()), (s("bob"), 1650000000, "2408:8256::1", ""));
 }
 
-/// §15：Porta 库里已有用户时拒绝执行（只支持往空库导入一次），库不被改动。
+/// §15：Leapgate 库里已有用户时拒绝执行（只支持往空库导入一次），库不被改动。
 #[tokio::test]
 async fn import_refuses_non_empty_database() {
     let work = Work::new();

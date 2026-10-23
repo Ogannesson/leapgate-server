@@ -1,4 +1,4 @@
-//! Address book, the 12 endpoints of the new protocol (PORTA.md §12; note 04).
+//! Address book, the 12 endpoints of the new protocol (LEAPGATE.md §12; note 04).
 //! Writes succeed with 200 + empty body only; `personal`, `settings`, `shared/profiles` never 404.
 
 use super::{ok_empty, ok_json, parse_json, ApiError, ApiResult, CurrentUser, PageQuery, JSON};
@@ -215,7 +215,7 @@ pub(crate) async fn peers(
         let mut peer: Map<String, Value> = serde_json::from_str(&fields).map_err(ApiError::internal)?;
         peer.insert("id".to_owned(), Value::String(id.clone()));
         peer.insert("tags".to_owned(), serde_json::from_str(&tags).map_err(ApiError::internal)?);
-        // A value that does not decrypt (lost or replaced porta_secret.key, corrupt row) only loses
+        // A value that does not decrypt (lost or replaced leapgate_secret.key, corrupt row) only loses
         // that password: the key is omitted ("no saved password") and the rest of the book still lists.
         match state.secret.decrypt(&secret) {
             Ok(plain) if !plain.is_empty() => {
@@ -1459,7 +1459,7 @@ mod tests {
         ] {
             write_ok(&t.app, "POST", &format!("/api/ab/peer/add/{book}"), &token, body).await;
         }
-        // Peer 2 of each book: encrypted with another key (a replaced porta_secret.key), or corrupt.
+        // Peer 2 of each book: encrypted with another key (a replaced leapgate_secret.key), or corrupt.
         let other = crate::crypto::SecretBox::load_or_create(&t.dir.path().join("other.key")).unwrap();
         sqlx::query("update ab_peer set hash_enc = ? where ab_guid = ? and id = '2'")
             .bind(other.encrypt("h2"))

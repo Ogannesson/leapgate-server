@@ -1,15 +1,15 @@
-//! Device reports: sysinfo and heartbeat / strategy push (PORTA.md §9.3, §10; notes 01, 03 §4).
+//! Device reports: sysinfo and heartbeat / strategy push (LEAPGATE.md §9.3, §10; notes 01, 03 §4).
 //! No authentication (compatibility debt); only devices registered with hbbs, checked by `uuid`.
-//! Porta clients' signed heartbeat (`porta_heartbeat`, phase 3 contract 01 §3.6) shares the row
+//! Leapgate clients' signed heartbeat (`leapgate_heartbeat`, phase 3 contract 01 §3.6) shares the row
 //! writes (`touch`, `store_sysinfo`).
 
 use super::{
-    devauth::{parse_body, porta_error, porta_internal, signed_json, SignedBody},
+    devauth::{parse_body, leapgate_error, leapgate_internal, signed_json, SignedBody},
     ok_json, parse_json, text, ApiResult, ClientIp,
 };
 use crate::{
     conn_tracker::{clip, has_room, now_ms, source_key, IP_WINDOW_MS},
-    peer::{PortaHb, MAX_PEER_ID_LEN},
+    peer::{LeapgateHb, MAX_PEER_ID_LEN},
     state::AppState,
 };
 use axum::{
@@ -118,7 +118,7 @@ pub(crate) fn report_allowed(ip: IpAddr) -> bool {
 pub(crate) enum UuidCheck {
     Mismatch,
     Match,
-    /// Matches, and a signed Porta report pinned the device's key: the unsigned reports of the id are
+    /// Matches, and a signed Leapgate report pinned the device's key: the unsigned reports of the id are
     /// refused from then on (phase 3 contract 01 §3.5: they are what a downgrade would fall back to),
     /// the login's binding is not.
     MatchPinned,
@@ -270,7 +270,7 @@ pub(crate) async fn sysinfo(State(state): State<AppState>, ClientIp(ip): ClientI
 
 /// `device.client_type`: the path the device reported on last (`touch`, `store_sysinfo`).
 const CLIENT_RUSTDESK: &str = "rustdesk";
-const CLIENT_PORTA: &str = "porta";
+const CLIENT_LEAPGATE: &str = "leapgate";
 
 /// The sysinfo values stored again in their own columns (clipped to `MAX_SYSINFO_FIELD_LEN`).
 #[derive(Default, Deserialize)]
@@ -356,7 +356,7 @@ struct Strategy {
 
 /// `POST /api/heartbeat`: always a JSON object (at least `{}`); strategy only when `modified_at != rev`.
 /// Over the source's budget, not a registered device or one whose key is pinned (it reports signed
-/// on `/api/porta/v1/`): `{}`. The client has no branch for either
+/// on `/api/leapgate/v1/`): `{}`. The client has no branch for either
 /// (rustdesk@bd92623:src/hbbs_http/sync.rs `start_hbbs_sync_async` only looks for keys) and sends
 /// the next one 15 s later. No room for a new row (`make_room`): served without the row, so without
 /// the `sysinfo` key.
@@ -457,21 +457,21 @@ pub(crate) async fn touch(
     }
 }
 
-/// Features of this server the Porta client may use (response `features`); block 04 adds
+/// Features of this server the Leapgate client may use (response `features`); block 04 adds
 /// `"udp-punch"`.
-const PORTA_FEATURES: &[&str] = &[];
+const LEAPGATE_FEATURES: &[&str] = &[];
 
-/// `POST /api/porta/v1/heartbeat` body (contract 01 §2.3, 02 §2.2); absent keys are absent values.
+/// `POST /api/leapgate/v1/heartbeat` body (contract 01 §2.3, 02 §2.2); absent keys are absent values.
 /// The id comes from the signature (`SignedBody`). `conns` is not used.
 #[derive(Deserialize)]
-struct PortaHeartbeatReq {
+struct LeapgateHeartbeatReq {
     #[serde(default)]
     uuid: String,
     #[serde(default)]
     ver: i64,
-    /// The client's `libs/porta` version (`PortaHb::porta_ver`), not stored.
+    /// The client's `libs/leapgate` version (`LeapgateHb::leapgate_ver`), not stored.
     #[serde(default)]
-    porta: String,
+    leapgate: String,
     #[serde(default)]
     strategy_rev: i64,
     /// Standard base64 of the sha256 of the client's `sysinfo` bytes.
@@ -488,7 +488,7 @@ struct PortaHeartbeatReq {
 }
 
 #[derive(Serialize)]
-struct PortaHeartbeatResp {
+struct LeapgateHeartbeatResp {
     api: u32,
     features: &'static [&'static str],
     time: i64,
@@ -496,14 +496,14 @@ struct PortaHeartbeatResp {
     #[serde(skip_serializing_if = "Option::is_none")]
     need_sysinfo: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    strategy: Option<PortaStrategy>,
+    strategy: Option<LeapgateStrategy>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    routing: Option<PortaRouting>,
+    routing: Option<LeapgateRouting>,
 }
 
 /// The relays to measure (routing level two), sent when the client's `routing_rev` is not `rev`.
 #[derive(Serialize)]
-struct PortaRouting {
+struct LeapgateRouting {
     rev: i64,
     probe_interval_secs: u64,
     relays: Vec<String>,
@@ -511,29 +511,29 @@ struct PortaRouting {
 
 /// Every effective option (values are strings, `''` deletes the key) and their `rev`.
 #[derive(Serialize)]
-struct PortaStrategy {
+struct LeapgateStrategy {
     rev: i64,
     options: BTreeMap<String, String>,
 }
 
-/// `POST /api/porta/v1/heartbeat` (contract 01 §3.6, 02 §3.4): a signed heartbeat. Records it in
-/// memory (`Peer::porta_hb`) along with its relay measurements (routing level two), stores a
-/// sysinfo that came with it, writes the device row (`touch`, as `porta`), and answers signed:
+/// `POST /api/leapgate/v1/heartbeat` (contract 01 §3.6, 02 §3.4): a signed heartbeat. Records it in
+/// memory (`Peer::leapgate_hb`) along with its relay measurements (routing level two), stores a
+/// sysinfo that came with it, writes the device row (`touch`, as `leapgate`), and answers signed:
 /// `need_sysinfo` when the stored sysinfo is missing or its hash is not the reported one, the
 /// effective options when their rev is not the reported one, the relays to measure when their rev
 /// is not the reported one. Bad body 400, sysinfo over `MAX_SYSINFO_LEN` 413, database error 503
 /// (all unsigned).
-pub(crate) async fn porta_heartbeat(State(state): State<AppState>, signed: SignedBody) -> Response {
-    let req: PortaHeartbeatReq = match parse_body(&signed.body) {
+pub(crate) async fn leapgate_heartbeat(State(state): State<AppState>, signed: SignedBody) -> Response {
+    let req: LeapgateHeartbeatReq = match parse_body(&signed.body) {
         Ok(req) => req,
         Err(resp) => return resp,
     };
     if req.uuid.len() > MAX_UUID_LEN {
-        return porta_error(StatusCode::BAD_REQUEST, "bad_request", "uuid too long");
+        return leapgate_error(StatusCode::BAD_REQUEST, "bad_request", "uuid too long");
     }
     let sysinfo = match &req.sysinfo {
         Some(raw) if raw.get().len() > MAX_SYSINFO_LEN => {
-            return porta_error(StatusCode::PAYLOAD_TOO_LARGE, "too_large", "sysinfo too large")
+            return leapgate_error(StatusCode::PAYLOAD_TOO_LARGE, "too_large", "sysinfo too large")
         }
         Some(raw) => match parse_body::<SysinfoFields>(raw.get().as_bytes()) {
             Ok(fields) => Some((raw.get(), fields)),
@@ -541,10 +541,10 @@ pub(crate) async fn porta_heartbeat(State(state): State<AppState>, signed: Signe
         },
         None => None,
     };
-    let porta_ver = hbb_common::get_version_number(&req.porta).clamp(0, u32::MAX as i64) as u32;
-    signed.peer.write().await.porta_hb = Some(PortaHb {
+    let leapgate_ver = hbb_common::get_version_number(&req.leapgate).clamp(0, u32::MAX as i64) as u32;
+    signed.peer.write().await.leapgate_hb = Some(LeapgateHb {
         at: Instant::now(),
-        porta_ver,
+        leapgate_ver,
     });
     // Under the verified id: nobody can report measurements for another device.
     if let Some(probes) = &req.probes {
@@ -552,29 +552,29 @@ pub(crate) async fn porta_heartbeat(State(state): State<AppState>, signed: Signe
     }
     let db = &state.db;
     if let Some((raw, fields)) = sysinfo {
-        if let Err(err) = store_sysinfo(db, &signed.id, &req.uuid, raw, fields, CLIENT_PORTA).await {
-            return porta_internal(err);
+        if let Err(err) = store_sysinfo(db, &signed.id, &req.uuid, raw, fields, CLIENT_LEAPGATE).await {
+            return leapgate_internal(err);
         }
     }
-    let stored = match touch(db, &signed.id, &req.uuid, req.ver, &signed.ip.to_string(), CLIENT_PORTA).await {
+    let stored = match touch(db, &signed.id, &req.uuid, req.ver, &signed.ip.to_string(), CLIENT_LEAPGATE).await {
         Ok(stored) => stored,
-        Err(err) => return porta_internal(err),
+        Err(err) => return leapgate_internal(err),
     };
     let need_sysinfo = stored
         .is_some_and(|s| s.is_empty() || base64::encode(Sha256::digest(s.as_bytes())) != req.sysinfo_hash)
         .then_some(true);
     let (rev, options) = match crate::strategy::effective(db, &signed.id).await {
         Ok(v) => v,
-        Err(err) => return porta_internal(format!("{err:#}")),
+        Err(err) => return leapgate_internal(format!("{err:#}")),
     };
     let (routing_rev, relays) = state.router.routing();
-    let resp = PortaHeartbeatResp {
+    let resp = LeapgateHeartbeatResp {
         api: 1,
-        features: PORTA_FEATURES,
+        features: LEAPGATE_FEATURES,
         time: crate::common::now() as i64,
         need_sysinfo,
-        strategy: (req.strategy_rev != rev).then_some(PortaStrategy { rev, options }),
-        routing: (req.routing_rev != routing_rev).then_some(PortaRouting {
+        strategy: (req.strategy_rev != rev).then_some(LeapgateStrategy { rev, options }),
+        routing: (req.routing_rev != routing_rev).then_some(LeapgateRouting {
             rev: routing_rev,
             probe_interval_secs: crate::router::PROBE_INTERVAL_SECS,
             relays,
@@ -1279,7 +1279,7 @@ mod tests {
         assert_eq!(rev, rev5);
     }
 
-    // ---- Phase 3 contract 01: pinned devices on the compatibility path, the Porta heartbeat ----
+    // ---- Phase 3 contract 01: pinned devices on the compatibility path, the Leapgate heartbeat ----
 
     async fn pin(db: &SqlitePool, id: &str) {
         sqlx::query("update peer set pk_pinned_at = 1 where id = ?").bind(id).execute(db).await.unwrap();
@@ -1325,8 +1325,8 @@ mod tests {
     /// ones its hash is over. `hash` overrides the hash sent; returns the body and the own hash.
     /// Carries a key nobody reads (`conns`) and bad `probes`; `routing_rev` is the server's (`rr`),
     /// so no `routing` comes back.
-    fn porta_body(rev: i64, rr: i64, sysinfo: Option<&Value>, hash: Option<&str>) -> (String, String) {
-        let mut v = json!({"uuid": b64(UUID), "ver": 1005010, "porta": "0.3.0", "strategy_rev": rev,
+    fn leapgate_body(rev: i64, rr: i64, sysinfo: Option<&Value>, hash: Option<&str>) -> (String, String) {
+        let mut v = json!({"uuid": b64(UUID), "ver": 1005010, "leapgate": "0.3.0", "strategy_rev": rev,
                            "conns": [3], "routing_rev": rr, "probes": "not an object"});
         let raw = sysinfo.map(|s| serde_json::to_string(s).unwrap()).unwrap_or_default();
         let own_hash = sha256_b64(&raw);
@@ -1348,10 +1348,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn porta_heartbeat_sysinfo_and_strategy() {
+    async fn leapgate_heartbeat_sysinfo_and_strategy() {
         let t = testutil::app().await;
         let db = &t.state.db;
-        let dev = testutil::porta_device(&t.state, "porta1", UUID).await;
+        let dev = testutil::leapgate_device(&t.state, "leapgate1", UUID).await;
         let hb = |body: String| {
             let (dev, app) = (&dev, &t.app);
             async move { dev.post(app, "heartbeat", body.as_bytes()).await }
@@ -1359,58 +1359,58 @@ mod tests {
 
         let rr = t.state.router.routing().0;
         // No row yet: sysinfo wanted, every option pushed; signed, `features` empty, `time` now.
-        let r = hb(porta_body(0, rr, None, Some("")).0).await;
+        let r = hb(leapgate_body(0, rr, None, Some("")).0).await;
         assert_eq!(r.status, StatusCode::OK);
         assert_eq!(r.headers["content-type"], "application/json; charset=utf-8");
         assert!(testutil::verify_server_sig(&t.state, &r.sig, &r.headers, &r.body));
         let v = r.json();
         let rev = v["strategy"]["rev"].as_i64().unwrap();
-        assert_eq!(rev, crate::strategy::effective(db, "porta1").await.unwrap().0);
+        assert_eq!(rev, crate::strategy::effective(db, "leapgate1").await.unwrap().0);
         assert_eq!(v["strategy"]["options"], json!({"relay-server": ""}));
         assert_eq!((&v["api"], &v["features"], &v["need_sysinfo"]), (&json!(1), &json!([]), &json!(true)));
         assert!((v["time"].as_i64().unwrap() - crate::common::now() as i64).abs() <= 2);
-        assert_eq!(device_row(db, "porta1").await, (String::new(), String::new(), "porta".into(), 1005010));
+        assert_eq!(device_row(db, "leapgate1").await, (String::new(), String::new(), "leapgate".into(), 1005010));
 
         // The rev echoed back: no strategy; the row has no sysinfo yet, so it is still wanted.
-        let v = hb(porta_body(rev, rr, None, Some("")).0).await.json();
+        let v = hb(leapgate_body(rev, rr, None, Some("")).0).await.json();
         assert_eq!(v.get("strategy"), None);
         assert_eq!(v["need_sysinfo"], json!(true));
 
         // With the sysinfo: stored byte for byte (the hash the client computed is the stored text's),
         // not wanted any more; the answer is just api, features, time.
         let s = sysinfo_obj("h1");
-        let (body, hash) = porta_body(rev, rr, Some(&s), None);
+        let (body, hash) = leapgate_body(rev, rr, Some(&s), None);
         let v = hb(body).await.json();
         assert_eq!(v.as_object().unwrap().keys().collect::<Vec<_>>(), ["api", "features", "time"]);
-        let (stored, host, client, _) = device_row(db, "porta1").await;
+        let (stored, host, client, _) = device_row(db, "leapgate1").await;
         assert_eq!(
             (stored.as_str(), host.as_str(), client.as_str()),
-            (serde_json::to_string(&s).unwrap().as_str(), "h1", "porta")
+            (serde_json::to_string(&s).unwrap().as_str(), "h1", "leapgate")
         );
         assert_eq!(sha256_b64(&stored), hash);
         // Without the sysinfo: the same hash wants nothing, another one wants it again.
-        assert_eq!(hb(porta_body(rev, rr, None, Some(&hash)).0).await.json().get("need_sysinfo"), None);
-        assert_eq!(hb(porta_body(rev, rr, None, Some("other")).0).await.json()["need_sysinfo"], json!(true));
+        assert_eq!(hb(leapgate_body(rev, rr, None, Some(&hash)).0).await.json().get("need_sysinfo"), None);
+        assert_eq!(hb(leapgate_body(rev, rr, None, Some("other")).0).await.json()["need_sysinfo"], json!(true));
 
         // An option changed: pushed again, with every effective option. (Not the body sent just
         // above, which within the same second would be a replay.)
-        set_option(db, "porta1", "allow-auto-disconnect", "Y").await;
-        let v = hb(porta_body(rev, rr, None, None).0).await.json();
+        set_option(db, "leapgate1", "allow-auto-disconnect", "Y").await;
+        let v = hb(leapgate_body(rev, rr, None, None).0).await.json();
         let rev2 = v["strategy"]["rev"].as_i64().unwrap();
         assert_ne!(rev2, rev);
         assert_eq!(v["strategy"]["options"], json!({"allow-auto-disconnect": "Y", "relay-server": ""}));
 
         // The path the device reported on last: a compatibility heartbeat (key unpinned for it)
         // makes it `rustdesk` again.
-        sqlx::query("update peer set pk_pinned_at = null where id = 'porta1'").execute(db).await.unwrap();
-        heartbeat(&t.app, json!({"id": "porta1", "uuid": b64(UUID), "ver": 1005010, "modified_at": 0})).await;
-        assert_eq!(device_row(db, "porta1").await.2, "rustdesk");
+        sqlx::query("update peer set pk_pinned_at = null where id = 'leapgate1'").execute(db).await.unwrap();
+        heartbeat(&t.app, json!({"id": "leapgate1", "uuid": b64(UUID), "ver": 1005010, "modified_at": 0})).await;
+        assert_eq!(device_row(db, "leapgate1").await.2, "rustdesk");
     }
 
     #[tokio::test]
-    async fn porta_heartbeat_bad_bodies() {
+    async fn leapgate_heartbeat_bad_bodies() {
         let t = testutil::app().await;
-        let dev = testutil::porta_device(&t.state, "porta2", UUID).await;
+        let dev = testutil::leapgate_device(&t.state, "leapgate2", UUID).await;
         let bad = [
             ("nope".to_owned(), StatusCode::BAD_REQUEST, "bad_request"),
             (json!({"uuid": "u".repeat(MAX_UUID_LEN + 1)}).to_string(), StatusCode::BAD_REQUEST, "bad_request"),
@@ -1426,48 +1426,48 @@ mod tests {
             assert!(!r.headers.contains_key(crate::api::devauth::SIG_HEADER));
         }
         // None of them recorded a heartbeat or made a row.
-        assert!(t.state.pm.get_in_memory("porta2").await.unwrap().read().await.porta_hb.is_none());
-        assert!(!has_row(&t.state.db, "porta2").await);
+        assert!(t.state.pm.get_in_memory("leapgate2").await.unwrap().read().await.leapgate_hb.is_none());
+        assert!(!has_row(&t.state.db, "leapgate2").await);
         // A sysinfo at the limit is stored.
         let mut s = json!({"pad": ""});
         s["pad"] = json!("p".repeat(MAX_SYSINFO_LEN - s.to_string().len()));
         let r = dev.post(&t.app, "heartbeat", json!({"sysinfo": s}).to_string().as_bytes()).await;
         assert_eq!(r.status, StatusCode::OK);
-        assert_eq!(device_row(&t.state.db, "porta2").await.0, s.to_string());
+        assert_eq!(device_row(&t.state.db, "leapgate2").await.0, s.to_string());
     }
 
     /// The in-memory record of the last signed heartbeat (for block 04): written by the heartbeat
-    /// only, not by a refused one or by a Porta audit.
+    /// only, not by a refused one or by a Leapgate audit.
     #[tokio::test]
-    async fn porta_heartbeat_is_recorded_in_memory() {
+    async fn leapgate_heartbeat_is_recorded_in_memory() {
         let t = testutil::app().await;
-        let dev = testutil::porta_device(&t.state, "porta3", UUID).await;
+        let dev = testutil::leapgate_device(&t.state, "leapgate3", UUID).await;
         let audit = dev.post(&t.app, "audit/alarm", br#"{"typ":1}"#).await;
         assert_eq!(audit.status, StatusCode::OK);
-        let peer = t.state.pm.get_in_memory("porta3").await.unwrap();
-        assert!(peer.read().await.porta_hb.is_none());
-        let r = dev.post(&t.app, "heartbeat", json!({"porta": "0.3.1", "ver": 1}).to_string().as_bytes()).await;
+        let peer = t.state.pm.get_in_memory("leapgate3").await.unwrap();
+        assert!(peer.read().await.leapgate_hb.is_none());
+        let r = dev.post(&t.app, "heartbeat", json!({"leapgate": "0.3.1", "ver": 1}).to_string().as_bytes()).await;
         assert_eq!(r.status, StatusCode::OK);
         {
             let p = peer.read().await;
-            let hb = p.porta_hb.as_ref().unwrap();
+            let hb = p.leapgate_hb.as_ref().unwrap();
             assert!(hb.at.elapsed() < std::time::Duration::from_secs(5));
-            assert_eq!(hb.porta_ver, hbb_common::get_version_number("0.3.1") as u32);
+            assert_eq!(hb.leapgate_ver, hbb_common::get_version_number("0.3.1") as u32);
         }
         // An unreadable version is 0.
-        dev.post(&t.app, "heartbeat", json!({"porta": "x", "ver": 2}).to_string().as_bytes()).await;
-        assert_eq!(peer.read().await.porta_hb.as_ref().unwrap().porta_ver, 0);
+        dev.post(&t.app, "heartbeat", json!({"leapgate": "x", "ver": 2}).to_string().as_bytes()).await;
+        assert_eq!(peer.read().await.leapgate_hb.as_ref().unwrap().leapgate_ver, 0);
     }
 
     /// Contract 02 §3.4: `routing` when the client's `routing_rev` is not the server's; `probes` are
     /// kept under the verified id, and bad ones never fail the heartbeat.
     #[tokio::test]
-    async fn porta_heartbeat_routing_and_probes() {
+    async fn leapgate_heartbeat_routing_and_probes() {
         let t = testutil::app().await;
         let router = &t.state.router;
         router.set_configured(vec!["r1.example:21117".to_owned(), "r2.example".to_owned()]);
         let (rev, _) = router.routing();
-        let dev = testutil::porta_device(&t.state, "porta4", UUID).await;
+        let dev = testutil::leapgate_device(&t.state, "leapgate4", UUID).await;
 
         let r = dev.post(&t.app, "heartbeat", json!({"routing_rev": 0}).to_string().as_bytes()).await;
         assert_eq!(r.status, StatusCode::OK);
@@ -1498,7 +1498,7 @@ mod tests {
         assert_eq!(dev.post(&t.app, "heartbeat", body.as_bytes()).await.status, StatusCode::OK);
         assert!(router.status_text().ends_with("measurements: 1 devices, 1 fresh\n"));
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
-        let mine = router.test(ip, ip, "porta4", "").await;
+        let mine = router.test(ip, ip, "leapgate4", "").await;
         assert!(mine.contains("(rtt_a)") && mine.contains("[A rtt 23ms, B est ?]"), "{mine}");
         let other = router.test(ip, ip, "other", "").await;
         assert!(other.contains("(rr)"), "{other}");
