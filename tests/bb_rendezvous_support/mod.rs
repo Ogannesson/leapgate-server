@@ -177,7 +177,9 @@ static USED_PORTS: Mutex<Vec<u16>> = Mutex::new(Vec::new());
 /// 同一测试进程里并行的测试不会挑到重叠的端口组。
 pub fn free_port_block() -> u16 {
     loop {
-        let p = 30000 + (hbb_common::rand::random::<u16>() % 25000);
+        // 20000~32699：避开 Linux 的临时端口段（32768~60999）。测试发起的连接从那里取本地端口，
+        // 可能在这里检查完、服务端还没绑定之间占掉其中一个。
+        let p = 20000 + (hbb_common::rand::random::<u16>() % 12700);
         let mut used = USED_PORTS.lock().unwrap();
         if used.iter().any(|u| u.abs_diff(p) <= 4) {
             continue;

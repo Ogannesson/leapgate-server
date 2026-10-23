@@ -36,7 +36,9 @@ fn tcp_free(port: u16) -> bool {
 fn pick_port() -> u16 {
     let mut reserved = RESERVED.lock().unwrap();
     loop {
-        let p = (uuid::Uuid::new_v4().as_u128() % 40_000) as u16 + 20_000;
+        // 20000~32699：避开 Linux 的临时端口段（32768~60999）。测试发起的连接从那里取本地端口，
+        // 可能在这里检查完、服务端还没绑定之间占掉其中一个。
+        let p = (uuid::Uuid::new_v4().as_u128() % 12_700) as u16 + 20_000;
         if reserved.iter().any(|r| r.abs_diff(p) <= 5) {
             continue;
         }

@@ -343,7 +343,9 @@ fn free_base_port() -> u16 {
     let mut rng = hbb_common::rand::thread_rng();
     let mut reserved = RESERVED.lock().unwrap();
     for _ in 0..200 {
-        let p: u16 = rng.gen_range(20000..60000);
+        // Below Linux's ephemeral range (32768-60999): outgoing test connections take ports
+        // from there, and one could land on a block between this check and the server's bind.
+        let p: u16 = rng.gen_range(20000..32700);
         let ports = [p - 2, p - 1, p, p + 2];
         if ports.iter().any(|q| reserved.contains(q)) {
             continue;

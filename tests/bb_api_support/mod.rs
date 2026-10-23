@@ -37,7 +37,9 @@ static TAKEN: Mutex<Option<HashSet<u16>>> = Mutex::new(None);
 fn pick_port() -> u16 {
     let mut rng = rand::thread_rng();
     for _ in 0..500 {
-        let p: u16 = rng.gen_range(20000..60000);
+        // Below Linux's ephemeral range (32768-60999): outgoing test connections take ports
+        // from there, and one could land on a block between this check and the server's bind.
+        let p: u16 = rng.gen_range(20000..32700);
         let mut taken = TAKEN.lock().unwrap();
         let set = taken.get_or_insert_with(HashSet::new);
         if [p - 2, p - 1, p, p + 2].iter().any(|q| set.contains(q)) {
