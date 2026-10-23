@@ -732,6 +732,8 @@ async fn hourly_purge(db: &SqlitePool, now: i64) {
     use crate::api::audit;
     let mut steps = vec![("conn_attempt", purge(db, now).await)];
     for table in audit::TABLES {
+        // Lets other writers take the write lock between two tables, as between two batches.
+        tokio::time::sleep(audit::PURGE_PAUSE).await;
         steps.push((table, audit::purge(db, table, now / 1000).await.map_err(Into::into)));
     }
     let failed = steps.iter().any(|(_, r)| r.is_err());

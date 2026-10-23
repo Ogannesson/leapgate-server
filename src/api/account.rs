@@ -1,7 +1,7 @@
 //! Account endpoints (PORTA.md §9.2, §11; note 03 §2).
 
 use super::{
-    device::{uuid_matches, MAX_UUID_LEN},
+    device::{make_room, uuid_matches, BEGIN_WRITE, MAX_UUID_LEN},
     ok_json, parse_json, ApiError, ApiResult, CurrentUser,
 };
 use crate::{
@@ -355,19 +355,25 @@ pub(crate) async fn login(State(state): State<AppState>, body: Bytes) -> ApiResu
     // Only a device registered with hbbs, with a matching uuid, is bound: someone else's device is
     // not taken over, and ids hbbs does not know add no device rows (§11). Registering is not
     // authenticated, so a made-up id can still be bound here; the row kept for it goes once this
-    // user has no token on it left (`device::make_room`, at most 50 tokens a user; §9.3).
+    // user has no token on it left (at most 50 tokens a user; §9.3). A new row is kept to the
+    // device table's limit like a report's (`make_room`, review D-7): with no room the login still
+    // succeeds, without a row or a binding.
     if !req.id.is_empty() && uuid_matches(&state.db, &req.id, Some(&req.uuid)).await? {
-        sqlx::query(
-            "insert into device(id, uuid, user_id, first_seen_at, last_seen_at) values(?, ?, ?, ?, ?)
-             on conflict(id) do update set user_id = excluded.user_id",
-        )
-        .bind(&req.id)
-        .bind(&req.uuid)
-        .bind(uid)
-        .bind(now)
-        .bind(now)
-        .execute(&state.db)
-        .await?;
+        let mut tx = state.db.begin_with(BEGIN_WRITE).await?;
+        if make_room(&mut tx, &req.id).await? {
+            sqlx::query(
+                "insert into device(id, uuid, user_id, first_seen_at, last_seen_at) values(?, ?, ?, ?, ?)
+                 on conflict(id) do update set user_id = excluded.user_id",
+            )
+            .bind(&req.id)
+            .bind(&req.uuid)
+            .bind(uid)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+        }
     }
 
     let Some(user) = load_user(&state.db, uid).await? else {
