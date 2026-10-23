@@ -44,7 +44,7 @@ const WRITE: i64 = 2;
 /// (`Ab.isFull`, note 04 §3.2). The client asks for the online state of a whole tab in one
 /// `OnlineRequest` on 21115, whose frames are capped at 128 KB (§6 item 8): 5000 ids of 16
 /// characters are about 90 KB, so a full book still gets its online state.
-const MAX_PEERS: i64 = 5000;
+pub(crate) const MAX_PEERS: i64 = 5000;
 /// Tags per book (`ab_tag` rows).
 const MAX_TAGS: i64 = 1000;
 /// A tag name, in bytes (`tag/add`, `tag/rename`, a peer's `tags`). Control characters are refused
@@ -605,10 +605,13 @@ pub(crate) async fn peer_delete(
     Ok(ok_empty())
 }
 
-/// Checks a `DELETE /api/ab/peer` body: a JSON array of at most `MAX_PEERS` strings of at most
-/// `MAX_PEER_ID_LEN` bytes; else 400. Counts as it reads and keeps nothing (review D-16): the 2 MB
-/// the route allows holds ~700,000 `""`, about 50 MB as a `Vec<String>` re-encoded, held while
-/// the statement waits for the database.
+/// Checks a `DELETE /api/ab/peer` body: a JSON array of at most `MAX_PEERS` strings; else 400.
+/// Counts as it reads and keeps nothing (review D-16): the 2 MB the route allows holds ~700,000
+/// `""`, about 50 MB as a `Vec<String>` re-encoded, held while the statement waits for the
+/// database. The count bounds what `json_each` goes through in the write lock. An id's length is
+/// not checked (review E-4): the import does not check it (§15), and an entry whose id is over
+/// `MAX_PEER_ID_LEN`, which `peer/update` refuses, can then at least be deleted; what a long id
+/// costs is bounded by the body limit.
 fn check_peer_ids(body: &[u8]) -> Result<(), ApiError> {
     struct Ids;
     impl<'de> Visitor<'de> for Ids {
@@ -618,33 +621,30 @@ fn check_peer_ids(body: &[u8]) -> Result<(), ApiError> {
         }
         fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
             let mut n = 0;
-            while let Some(IdLen(len)) = seq.next_element()? {
+            while let Some(Id) = seq.next_element()? {
                 n += 1;
                 if n > MAX_PEERS {
                     return Err(de::Error::custom("too many peer ids"));
-                }
-                if len > MAX_PEER_ID_LEN {
-                    return Err(de::Error::custom("peer id too long"));
                 }
             }
             Ok(())
         }
     }
-    /// A string's length; the string itself is not kept (escaped ones are not even allocated).
-    struct IdLen(usize);
-    impl<'de> de::Deserialize<'de> for IdLen {
+    /// A string, not kept (escaped ones are not even allocated).
+    struct Id;
+    impl<'de> de::Deserialize<'de> for Id {
         fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-            struct Len;
-            impl Visitor<'_> for Len {
-                type Value = IdLen;
+            struct Str;
+            impl Visitor<'_> for Str {
+                type Value = Id;
                 fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
                     f.write_str("a peer id")
                 }
-                fn visit_str<E>(self, s: &str) -> Result<IdLen, E> {
-                    Ok(IdLen(s.len()))
+                fn visit_str<E>(self, _: &str) -> Result<Id, E> {
+                    Ok(Id)
                 }
             }
-            d.deserialize_str(Len)
+            d.deserialize_str(Str)
         }
     }
     let mut parser = serde_json::Deserializer::from_slice(body);
@@ -1842,16 +1842,18 @@ mod tests {
         assert_eq!(stored(db, &book, "p1").await.1, tags[1..]);
     }
 
-    /// `DELETE /api/ab/peer` checks its array as it reads it (review D-16): over `MAX_PEERS` ids, an
-    /// id over `MAX_PEER_ID_LEN` or anything but an array of strings is a 400 that deletes nothing;
-    /// SQLite reads the ids out of the checked body, escapes included.
+    /// `DELETE /api/ab/peer` checks its array as it reads it (review D-16): over `MAX_PEERS` ids or
+    /// anything but an array of strings is a 400 that deletes nothing; SQLite reads the ids out of
+    /// the checked body, escapes included. An id over `MAX_PEER_ID_LEN`, as the import can bring
+    /// in, is deleted like any other (review E-4).
     #[tokio::test]
     async fn peer_delete_checks_the_ids() {
         let t = testutil::app().await;
         let db = &t.state.db;
         let (_, token) = testutil::create_user(db, "alice", "", false).await;
         let book = personal_guid(&t.app, &token).await;
-        for id in ["p1", "a\"b", "é"] {
+        let imported = "x".repeat(MAX_PEER_ID_LEN + 1);
+        for id in ["p1", "a\"b", "é", &imported] {
             sqlx::query("insert into ab_peer(ab_guid, id, created_at, updated_at) values(?, ?, 0, 0)")
                 .bind(&book)
                 .bind(id)
@@ -1865,11 +1867,9 @@ mod tests {
         let mut huge = "[".to_owned() + &r#""","#.repeat((2 << 20) / 3 - 2);
         huge.push_str(r#""p1"]"#);
         assert!(huge.len() <= super::super::AB_PEER_DELETE_BODY_LIMIT);
-        let long = serde_json::json!(["p1", "x".repeat(MAX_PEER_ID_LEN + 1)]).to_string();
         for (body, want) in [
             (too_many.as_str(), "too many peer ids"),
             (huge.as_str(), "too many peer ids"),
-            (long.as_str(), "peer id too long"),
             (r#"["p1",1]"#, "invalid type"),
             (r#"{"id":"p1"}"#, "invalid type"),
             (r#"["p1"] x"#, "trailing characters"),
@@ -1880,8 +1880,9 @@ mod tests {
             let msg = js(&resp)["error"].as_str().unwrap().to_owned();
             assert!(msg.starts_with("Invalid request body: ") && msg.contains(want), "{msg}");
         }
-        assert_eq!(list_peers(&t.app, &token, &book).await.len(), 3);
-        write_ok(&t.app, "DELETE", &delete, &token, r#"[ "a\"b", "é", "nope" ]"#).await;
+        assert_eq!(list_peers(&t.app, &token, &book).await.len(), 4);
+        let body = serde_json::json!(["a\"b", "é", "nope", imported, "y".repeat(10_000)]).to_string();
+        write_ok(&t.app, "DELETE", &delete, &token, &body).await;
         let left: Vec<Value> = list_peers(&t.app, &token, &book).await.iter().map(|p| p["id"].clone()).collect();
         assert_eq!(left, ["p1"]);
         write_ok(&t.app, "DELETE", &delete, &token, "[]").await;
