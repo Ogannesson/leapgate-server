@@ -231,6 +231,12 @@ const MAX_RELAY_REQUESTS: usize = 12;
 /// Longest `uuid`, `token` and `switch_code` forwarded in a `RequestRelay`; the first two as
 /// `conn_tracker` keeps them (`MAX_TEXT_LEN`): a uuid is 36 characters.
 const MAX_RELAY_TEXT: usize = 64;
+/// Longest `AddrMangle` encoding: a v6 address is 16 bytes of IP + 2 of port, a v4 one at most
+/// 16 (hbb_common `AddrMangle::encode`). A longer value is not an address.
+const MAX_MANGLED_ADDR: usize = 18;
+/// LAN candidates relayed from `LocalAddr.porta_local_addrs`; a Porta client sends at most 8
+/// (`client/PORTA.md` §3.3).
+const MAX_LAN_CANDIDATES: usize = 8;
 static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
 
 // Store punch hole requests. Up to `MAX_PUNCH_REQUESTS` (default 100,000: ~21 MB with 9-digit
@@ -1030,6 +1036,13 @@ impl RendezvousServer {
             pk: self.get_pk(&la.version, la.id).await,
             relay_server: la.relay_server,
             socket_addr_v6: la.socket_addr_v6,
+            // Porta clients' LAN candidates, passed on undecoded (`client/PORTA.md` §3).
+            porta_local_addrs: la
+                .porta_local_addrs
+                .into_iter()
+                .filter(|a| a.len() <= MAX_MANGLED_ADDR)
+                .take(MAX_LAN_CANDIDATES)
+                .collect(),
             ..Default::default()
         };
         p.set_is_local(true);
@@ -1090,7 +1103,7 @@ impl RendezvousServer {
         }
         // Forwarded to B: an `AddrMangle` v6 address is 18 bytes, a longer one is not an address
         // (and would sit in `UDP_SEND_QUEUE` at any length, review C-13).
-        if ph.socket_addr_v6.len() > 18 {
+        if ph.socket_addr_v6.len() > MAX_MANGLED_ADDR {
             ph.socket_addr_v6 = Default::default();
         }
         let id = ph.id;
@@ -2280,6 +2293,48 @@ mod tests {
         assert!(res.is_local());
         assert_eq!(AddrMangle::decode(&res.socket_addr), "192.168.1.2:21118".parse().unwrap());
         assert_eq!(res.socket_addr_v6, mangle("[2001:db8::b]:40002"));
+        // An upstream client sends no candidates: none in the response either.
+        assert!(res.porta_local_addrs.is_empty());
+    }
+
+    #[hbb_common::tokio::test]
+    async fn local_addr_relays_lan_candidates() {
+        let mut h = harness(true, None).await;
+        h.online("B1", "127.0.0.1:5000").await;
+        let mut a = h.connect(Client::V1).await;
+        a.send(&punch_request("B1")).await.unwrap();
+        let (msg, _) = h.to_b().await;
+        let Some(rendezvous_message::Union::FetchLocalAddr(fla)) = msg.union else {
+            panic!("expected FetchLocalAddr");
+        };
+
+        // 10 candidates, one of them 19 bytes long: it is dropped and the first 8 of the rest
+        // arrive as sent (a v6 address, 18 bytes, is the longest kept).
+        let mut sent: Vec<Bytes> = (1..=9)
+            .map(|i| mangle(&format!("192.168.1.{i}:21118")))
+            .collect();
+        sent.insert(1, Bytes::from(vec![1u8; MAX_MANGLED_ADDR + 1]));
+        sent[2] = mangle("[fd00::2]:21118");
+        assert_eq!(sent[2].len(), MAX_MANGLED_ADDR);
+        let mut la = RendezvousMessage::new();
+        la.set_local_addr(LocalAddr {
+            socket_addr: fla.socket_addr.clone(),
+            local_addr: sent[0].clone(),
+            id: "B1".to_owned(),
+            version: "1.4.2".to_owned(),
+            porta_local_addrs: sent.clone(),
+            ..Default::default()
+        });
+        b_sends(&h, la).await;
+        let Some(rendezvous_message::Union::PunchHoleResponse(res)) = recv(&mut a).await.union else {
+            panic!("expected PunchHoleResponse");
+        };
+        assert!(res.is_local());
+        assert_eq!(res.socket_addr, sent[0]);
+        let mut expected = sent.clone();
+        expected.remove(1);
+        expected.truncate(MAX_LAN_CANDIDATES);
+        assert_eq!(res.porta_local_addrs, expected);
     }
 
     #[test]

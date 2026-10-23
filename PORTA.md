@@ -308,6 +308,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
    - 并发连接：21116、21118 各最多 2048 条，21115 最多 256 条；每个端口上每个来源（IPv4 地址 / IPv6 /64）最多 32 条，回环来源只计入总数（同机反代承载所有 WSS 客户端）。超限的连接在 accept 后直接关闭，21116 上不发 KeyExchange、不做签名；每分钟最多打一条 warn。
    - 最坏情况下的缓冲（审查 C-2/C-15/C-27，按 Linux 实测修正）：21116 每条约 26 KB（`Framed` 写缓冲 8 KB + 读缓冲涨到 16 KB 一帧 + 任务），合计约 53 MB；21118 握手完成前每条最多 8 KB + 4 KB 读块，握手后每条约 4 KB 读缓冲 + 16 KB 帧 + 最多 16 KB 正在拼接的分片消息，合计约 74 MB；21115 每条约 136 KB，合计约 35 MB；三者合计约 160 MB。攻击结束后 glibc 不会把峰值 RSS 还给系统，选部署机时按峰值留余量。另有 `PUNCH_REQS`（默认最多 10 万条，约 21~45 MB），只记录带对 key、目标在线的打洞请求，不算在上面。
    - 发往 UDP 的消息（转发给 B 的 `PunchHole`、`RequestRelay` 等）进一个最多 4096 条的有界队列，连接任务不等、队列满了就丢弃（每分钟最多一条 warn），`io_loop` 卡住时内存不随攻击带宽增长。`RequestRelay` 不校验任何东西就转给 B，所以：每条连接最多 12 条，超过就断开（客户端每次尝试一条，最多 3 次）；转发时只带客户端会设的字段（`id`、`uuid`、`relay_server`、`secure`、`conn_type`、`token`、`switch_code`，加服务端填的 `socket_addr`），`uuid`、`token`、`switch_code` 截到 64 字节、`relay_server` 截到 253 字节，不带 `licence_key`；`PunchHoleRequest` 转发的 `socket_addr_v6` 超过 18 字节（`AddrMangle` 编码的 IPv6 地址长度）就清空（审查 C-13）。
+9. **局域网多候选地址**（第三期，porta-cardo `1a46681`）：`handle_local_addr` 把 `LocalAddr.porta_local_addrs`（字段号 1000，`repeated bytes`，Porta 被控端报的物理网卡局域网地址，`AddrMangle` 编码）原样放进发给控制端的 `PunchHoleResponse{is_local}` 的同名字段。只做限长，不解码、不打日志：超过 18 字节（`AddrMangle` 能编出的最长值，IPv6 地址 16 字节加 2 字节端口；IPv4 最多 16 字节）的丢掉，剩下的取前 8 个（Porta 客户端最多报 8 个）。原版客户端不发这个字段，响应和原来一样。用途和客户端两侧怎么用见 `client/PORTA.md` §3。
 
 ## 7. 路由第一级（`src/router/`）
 
