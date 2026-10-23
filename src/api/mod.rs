@@ -389,11 +389,19 @@ fn internal_error_is_200(path: &str) -> bool {
     path.starts_with("/api/audit/") || path == "/api/currentUser"
 }
 
-/// A request not answered within `listen::REQUEST_TIMEOUT` (receiving its body included) gets an
+/// The device reports, which the client sends only from its Rust side (12-second HTTP timeout):
+/// they get `listen::REPORT_TIMEOUT` instead of `listen::REQUEST_TIMEOUT`.
+fn is_report(path: &str) -> bool {
+    matches!(path, "/api/heartbeat" | "/api/sysinfo" | "/api/sysinfo_ver") || path.starts_with("/api/audit/")
+}
+
+/// A request not answered within its timeout (`is_report`; receiving its body included) gets an
 /// internal-error answer (`internal_error_is_200`).
 async fn request_timeout(req: Request<Body>, next: Next) -> Response {
-    let ok_status = internal_error_is_200(req.uri().path());
-    match tokio::time::timeout(listen::REQUEST_TIMEOUT, next.run(req)).await {
+    let path = req.uri().path();
+    let ok_status = internal_error_is_200(path);
+    let limit = if is_report(path) { listen::REPORT_TIMEOUT } else { listen::REQUEST_TIMEOUT };
+    match tokio::time::timeout(limit, next.run(req)).await {
         Ok(resp) => resp,
         Err(_) if ok_status => ok_error("Request timeout"),
         Err(_) => error(StatusCode::BAD_REQUEST, "Request timeout"),

@@ -9,15 +9,19 @@ use axum::{
     http::{header, StatusCode},
     response::IntoResponse,
 };
-use hbb_common::tokio::sync::OwnedSemaphorePermit;
+use hbb_common::tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use hyper::body::{Body as HttpBody, Frame, SizeHint};
+use serde::de::{self, Deserializer, SeqAccess, Visitor};
 use serde_derive::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sqlx::{SqliteConnection, SqlitePool};
 use std::{
+    collections::{HashMap, HashSet},
     convert::Infallible,
+    fmt,
     io::Write as _,
     pin::Pin,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
 };
 
@@ -183,7 +187,7 @@ pub(crate) async fn peers(
     let guid = page.ab.as_deref().unwrap_or_default();
     let personal = check(&state.db, &user, guid, READ).await?;
     // Waits in line; the request timeout (20 s, §9.4) bounds the wait.
-    let slot = state.ab_pages.clone().acquire_owned().await.map_err(ApiError::internal)?;
+    let slots = state.ab_pages.acquire(user.id).await?;
     let total: i64 = sqlx::query_scalar("select count(*) from ab_peer where ab_guid = ?")
         .bind(guid)
         .fetch_one(&state.db)
@@ -229,8 +233,7 @@ pub(crate) async fn peers(
     }
     out.extend_from_slice(b"]}");
     let body = PageBody {
-        rest: Bytes::from(out),
-        _slot: slot,
+        rest: Bytes::from_owner(PageBuf { buf: out, _slots: slots }),
     };
     Ok(([(header::CONTENT_TYPE, JSON)], axum::body::Body::new(body)).into_response())
 }
@@ -238,18 +241,103 @@ pub(crate) async fn peers(
 /// `/api/ab/peers` pages built or being sent at once, from all users (review C-14); more wait in
 /// line. A page of 1000 of the largest rows peaks at ~36 MB while built (rows read + response) and
 /// holds ~18 MB until sent, so at most ~8 × 36 MB; the client asks for 100 rows, a tenth of that.
-/// The slot goes with the response body: a client that stops reading keeps it until the socket
-/// timeout drops the connection (§9.4), so a per-handler limit would not bound this memory.
+/// The slots go with the page's bytes (`PageBuf`): a client that reads slowly or not at all keeps
+/// them until the socket's write floor or no-progress timeout drops the connection (§9.4,
+/// `listen.rs`), so a per-handler limit would not bound this memory.
 pub(crate) const MAX_PAGES: usize = 8;
+/// Of those, pages one user has built or being sent at once (review D-4): a user reading slowly
+/// holds up only their own requests, not everyone's. Their next request waits in line, within the
+/// request timeout. The client fetches one page at a time.
+const MAX_USER_PAGES: usize = 2;
 /// A page goes to hyper in frames of this size: it asks for the next one when the previous is
-/// written out, so the body (and its slot) ends with the last frame instead of when it is queued.
+/// written out, so the page is not copied into hyper's write queue whole.
 const PAGE_FRAME: usize = 64 * 1024;
 
-/// A page's response body, holding its `MAX_PAGES` slot until the last frame is taken or the
-/// connection drops. Frames share one allocation, freed with the last.
+/// The `/api/ab/peers` slots (`AppState::ab_pages`): `MAX_PAGES` in all, `MAX_USER_PAGES` per user.
+pub(crate) struct PageSlots {
+    all: Arc<Semaphore>,
+    /// Per user with a page built, being sent or waiting: their slots and how many requests hold
+    /// or wait for one. A user's key goes with the last, so this holds only users with pages.
+    users: Mutex<HashMap<i64, (Arc<Semaphore>, usize)>>,
+}
+
+impl PageSlots {
+    pub(crate) fn new() -> Self {
+        Self {
+            all: Arc::new(Semaphore::new(MAX_PAGES)),
+            users: Default::default(),
+        }
+    }
+
+    /// One of `user`'s slots, then one of all; both wait in line (the request timeout bounds it).
+    async fn acquire(self: &Arc<Self>, user: i64) -> Result<(UserSlot, OwnedSemaphorePermit), ApiError> {
+        let sem = {
+            let mut users = self.users.lock().unwrap();
+            let entry = users.entry(user).or_insert_with(|| (Arc::new(Semaphore::new(MAX_USER_PAGES)), 0));
+            entry.1 += 1;
+            entry.0.clone()
+        };
+        // Counted before waiting, so a request dropped while it waits (request timeout) still
+        // takes its count back.
+        let mut slot = UserSlot {
+            slots: self.clone(),
+            user,
+            sem,
+            held: false,
+        };
+        slot.sem.acquire().await.map_err(ApiError::internal)?.forget();
+        slot.held = true;
+        let all = self.all.clone().acquire_owned().await.map_err(ApiError::internal)?;
+        Ok((slot, all))
+    }
+
+    /// (Free slots of `MAX_PAGES`, users with a page in flight.)
+    #[cfg(test)]
+    pub(crate) fn free(&self) -> (usize, usize) {
+        (self.all.available_permits(), self.users.lock().unwrap().len())
+    }
+}
+
+/// A request's place among one user's `MAX_USER_PAGES`, waiting or (`held`) holding a slot.
+struct UserSlot {
+    slots: Arc<PageSlots>,
+    user: i64,
+    sem: Arc<Semaphore>,
+    held: bool,
+}
+
+impl Drop for UserSlot {
+    fn drop(&mut self) {
+        if self.held {
+            self.sem.add_permits(1);
+        }
+        let mut users = self.slots.users.lock().unwrap();
+        if let Some(entry) = users.get_mut(&self.user) {
+            entry.1 -= 1;
+            if entry.1 == 0 {
+                users.remove(&self.user);
+            }
+        }
+    }
+}
+
+/// A page's bytes with its slots. Every frame cut from it shares this allocation, so the slots go
+/// back with the memory: when the last frame is written out or the connection drops (review D-3:
+/// hyper drops the body as soon as it takes the last frame, up to ~80 KB of the page still queued).
+struct PageBuf {
+    buf: Vec<u8>,
+    _slots: (UserSlot, OwnedSemaphorePermit),
+}
+
+impl AsRef<[u8]> for PageBuf {
+    fn as_ref(&self) -> &[u8] {
+        &self.buf
+    }
+}
+
+/// A page's response body, cut into `PAGE_FRAME` frames.
 struct PageBody {
     rest: Bytes,
-    _slot: OwnedSemaphorePermit,
 }
 
 impl HttpBody for PageBody {
@@ -505,14 +593,65 @@ pub(crate) async fn peer_delete(
     body: Bytes,
 ) -> ApiResult {
     check(&state.db, &user, &guid, WRITE).await?;
-    let ids: Vec<String> = parse_json(&body)?;
+    check_peer_ids(&body)?;
+    // Checked above to be a JSON array of strings: SQLite reads the ids out of the body itself.
+    let ids = std::str::from_utf8(&body).map_err(|_| ApiError::bad_request("Invalid request body"))?;
     // One statement, so all of them go in one transaction.
     sqlx::query("delete from ab_peer where ab_guid = ? and id in (select value from json_each(?))")
         .bind(&guid)
-        .bind(serde_json::json!(ids).to_string())
+        .bind(ids)
         .execute(&state.db)
         .await?;
     Ok(ok_empty())
+}
+
+/// Checks a `DELETE /api/ab/peer` body: a JSON array of at most `MAX_PEERS` strings of at most
+/// `MAX_PEER_ID_LEN` bytes; else 400. Counts as it reads and keeps nothing (review D-16): the 2 MB
+/// the route allows holds ~700,000 `""`, about 50 MB as a `Vec<String>` re-encoded, held while
+/// the statement waits for the database.
+fn check_peer_ids(body: &[u8]) -> Result<(), ApiError> {
+    struct Ids;
+    impl<'de> Visitor<'de> for Ids {
+        type Value = ();
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("an array of peer ids")
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+            let mut n = 0;
+            while let Some(IdLen(len)) = seq.next_element()? {
+                n += 1;
+                if n > MAX_PEERS {
+                    return Err(de::Error::custom("too many peer ids"));
+                }
+                if len > MAX_PEER_ID_LEN {
+                    return Err(de::Error::custom("peer id too long"));
+                }
+            }
+            Ok(())
+        }
+    }
+    /// A string's length; the string itself is not kept (escaped ones are not even allocated).
+    struct IdLen(usize);
+    impl<'de> de::Deserialize<'de> for IdLen {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct Len;
+            impl Visitor<'_> for Len {
+                type Value = IdLen;
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    f.write_str("a peer id")
+                }
+                fn visit_str<E>(self, s: &str) -> Result<IdLen, E> {
+                    Ok(IdLen(s.len()))
+                }
+            }
+            d.deserialize_str(Len)
+        }
+    }
+    let mut parser = serde_json::Deserializer::from_slice(body);
+    parser
+        .deserialize_seq(Ids)
+        .and_then(|()| parser.end())
+        .map_err(|err| ApiError::bad_request(&format!("Invalid request body: {err}")))
 }
 
 /// `POST /api/ab/tag/add/<guid>`: an existing name keeps its color.
@@ -582,7 +721,8 @@ pub(crate) async fn tag_rename(
         }
         Err(e) => return Err(e.into()),
     }
-    cascade_tags(&mut tx, &guid, &[old.clone()], |t| Some(if t == old { new.clone() } else { t })).await?;
+    let names = serde_json::json!([&old]).to_string();
+    cascade_tags(&mut tx, &guid, &names, |t| Some(if t == old { new.clone() } else { t })).await?;
     tx.commit().await?;
     Ok(ok_empty())
 }
@@ -618,24 +758,37 @@ pub(crate) async fn tag_delete(
 ) -> ApiResult {
     check(&state.db, &user, &guid, WRITE).await?;
     let names: Vec<String> = parse_json(&body)?;
+    // Deduplicated and counted before the transaction (review D-14): the cascade looks up every tag
+    // of every affected peer, under the write lock, and 256 KB holds ~65,000 names. The client
+    // sends the selected tags of the book, at most MAX_TAGS. The names are not checked against the
+    // tag limits: an imported tag over them (§15) can still be deleted, and a lookup's cost does
+    // not depend on the name's length.
+    let mut set = HashSet::new();
+    for name in names {
+        set.insert(name);
+        if set.len() > MAX_TAGS as usize {
+            return Err(ApiError::bad_request("Too many tag names"));
+        }
+    }
+    let names = serde_json::to_string(&set).map_err(ApiError::internal)?;
     let mut tx = state.db.begin().await?;
     sqlx::query("delete from ab_tag where ab_guid = ? and name in (select value from json_each(?))")
         .bind(&guid)
-        .bind(serde_json::json!(names).to_string())
+        .bind(&names)
         .execute(&mut *tx)
         .await?;
-    cascade_tags(&mut tx, &guid, &names, |t| (!names.contains(&t)).then_some(t)).await?;
+    cascade_tags(&mut tx, &guid, &names, |t| (!set.contains(&t)).then_some(t)).await?;
     tx.commit().await?;
     Ok(ok_empty())
 }
 
-/// Rewrites the `tags` of every peer in the book that carries one of `names`: `map` gives each
-/// tag's replacement (None = drop it); duplicates are removed, keeping the first occurrence.
-/// Runs inside the caller's transaction, after its first write.
+/// Rewrites the `tags` of every peer in the book that carries one of `names` (a JSON array):
+/// `map` gives each tag's replacement (None = drop it); duplicates are removed, keeping the first
+/// occurrence. Runs inside the caller's transaction, after its first write.
 async fn cascade_tags(
     conn: &mut SqliteConnection,
     guid: &str,
-    names: &[String],
+    names: &str,
     map: impl Fn(String) -> Option<String>,
 ) -> Result<(), ApiError> {
     let rows = sqlx::query_as::<_, (String, String)>(
@@ -643,7 +796,7 @@ async fn cascade_tags(
          and exists (select 1 from json_each(tags) where value in (select value from json_each(?)))",
     )
     .bind(guid)
-    .bind(serde_json::json!(names).to_string())
+    .bind(names)
     .fetch_all(&mut *conn)
     .await?;
     let now = crate::common::now() as i64;
@@ -1372,43 +1525,150 @@ mod tests {
         assert_eq!(&body[..], br#"{"total":5,"data":[{"id":"p2","tags":[]},{"id":"p3","tags":[]}]}"#);
     }
 
+    /// A user's personal book with `n` peers of about `note` bytes each, written straight into the
+    /// database; returns (token, guid).
+    async fn big_book(t: &testutil::TestApp, name: &str, n: i64, note: usize) -> (String, String) {
+        let (_, token) = testutil::create_user(&t.state.db, name, "", false).await;
+        let book = personal_guid(&t.app, &token).await;
+        sqlx::query(
+            "with recursive n(i) as (select 1 union all select i + 1 from n where i < ?)
+             insert into ab_peer(ab_guid, id, data, tags, created_at, updated_at)
+             select ?, 'p' || i, json_object('note', hex(randomblob(?))), '[]', 0, 0 from n",
+        )
+        .bind(n)
+        .bind(&book)
+        .bind((note / 2) as i64)
+        .execute(&t.state.db)
+        .await
+        .unwrap();
+        (token, book)
+    }
+
+    fn page_request(token: &str, book: &str) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/api/ab/peers?current=1&pageSize=1000&ab={book}"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    /// The next frame of a response body, `None` at its end.
+    async fn next_frame(body: &mut axum::body::Body) -> Option<Bytes> {
+        let frame = std::future::poll_fn(|cx| Pin::new(&mut *body).poll_frame(cx)).await?;
+        Some(frame.unwrap().into_data().unwrap())
+    }
+
     /// At most `MAX_PAGES` pages at once, counted until their response bodies are gone: the next
     /// request waits for one to be read out or dropped (a client that stops reading).
     #[tokio::test]
     async fn pages_in_flight_are_capped() {
         use tower::ServiceExt as _;
         let t = testutil::app().await;
-        let (_, token) = testutil::create_user(&t.state.db, "alice", "", false).await;
-        let book = personal_guid(&t.app, &token).await;
-        write_ok(&t.app, "POST", &format!("/api/ab/peer/add/{book}"), &token, r#"{"id":"p0"}"#).await;
-        let request = || {
-            axum::http::Request::builder()
-                .method("POST")
-                .uri(format!("/api/ab/peers?ab={book}"))
-                .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                .body(axum::body::Body::empty())
-                .unwrap()
-        };
+        let all = &t.state.ab_pages.all;
+        // `MAX_USER_PAGES` each, so the users together fill every slot.
+        let mut users = Vec::new();
+        for i in 0..=MAX_PAGES / MAX_USER_PAGES {
+            users.push(big_book(&t, &format!("u{i}"), 1, 10).await);
+        }
         // Answered, bodies not read: every slot held.
         let mut held = Vec::new();
-        for _ in 0..MAX_PAGES {
-            let resp = t.app.clone().oneshot(request()).await.unwrap();
-            assert_eq!(resp.status(), StatusCode::OK);
-            held.push(resp);
+        for (token, book) in &users[1..] {
+            for _ in 0..MAX_USER_PAGES {
+                let resp = t.app.clone().oneshot(page_request(token, book)).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                held.push(resp);
+            }
         }
-        assert_eq!(t.state.ab_pages.available_permits(), 0);
-        let ninth = tokio::spawn(t.app.clone().oneshot(request()));
+        assert_eq!(all.available_permits(), 0);
+        let (token, book) = &users[0];
+        let ninth = tokio::spawn(t.app.clone().oneshot(page_request(token, book)));
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         assert!(!ninth.is_finished(), "the ninth page waits for a slot");
         // One body read to the end gives its slot back, and the ninth goes ahead.
+        // (The collected bytes are the page's own: the slot goes back when they are dropped too.)
         let body = axum::body::to_bytes(held.pop().unwrap().into_body(), usize::MAX).await.unwrap();
         assert_eq!(js(&body)["total"], 1);
+        let len = body.len() as u64;
+        drop(body);
         let resp = tokio::time::timeout(std::time::Duration::from_secs(5), ninth).await.unwrap().unwrap().unwrap();
         // An exact length, so hyper sends a Content-Length (not chunked) as before.
-        assert_eq!(resp.body().size_hint().exact(), Some(body.len() as u64));
-        // Bodies dropped unread (the connection gone) give theirs back too.
+        assert_eq!(resp.body().size_hint().exact(), Some(len));
+        // Bodies dropped unread (the connection gone) give theirs back too, and no user is left.
         drop((resp, held));
-        assert_eq!(t.state.ab_pages.available_permits(), MAX_PAGES);
+        assert_eq!(all.available_permits(), MAX_PAGES);
+        assert_eq!(t.state.ab_pages.free().1, 0);
+    }
+
+    /// A user's third page waits for one of their first two, while other users go ahead (review
+    /// D-4); waiting counts toward the request timeout, and a request dropped while it waits
+    /// leaves nothing behind.
+    #[tokio::test]
+    async fn a_users_pages_wait_beyond_their_share() {
+        use tower::ServiceExt as _;
+        let t = testutil::app().await;
+        let (alice, alice_book) = big_book(&t, "alice", 1, 10).await;
+        let (bob, bob_book) = big_book(&t, "bob", 1, 10).await;
+        let mut held = Vec::new();
+        for _ in 0..MAX_USER_PAGES {
+            held.push(t.app.clone().oneshot(page_request(&alice, &alice_book)).await.unwrap());
+        }
+        let third = tokio::spawn(t.app.clone().oneshot(page_request(&alice, &alice_book)));
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            t.app.clone().oneshot(page_request(&bob, &bob_book)),
+        )
+        .await
+        .expect("another user's page does not wait")
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        drop(resp);
+        assert!(!third.is_finished(), "the user's third page waits");
+        assert_eq!(t.state.ab_pages.all.available_permits(), MAX_PAGES - MAX_USER_PAGES);
+        // A waiting request dropped (as by the request timeout) takes its place back: two held,
+        // the third waiting.
+        let fourth = tokio::spawn(t.app.clone().oneshot(page_request(&alice, &alice_book)));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        fourth.abort();
+        let _ = fourth.await;
+        let counts: Vec<usize> = t.state.ab_pages.users.lock().unwrap().values().map(|(_, n)| *n).collect();
+        assert_eq!(counts, [MAX_USER_PAGES + 1]);
+        // One of the first two read out: the third goes ahead.
+        let body = axum::body::to_bytes(held.pop().unwrap().into_body(), usize::MAX).await.unwrap();
+        assert_eq!(js(&body)["total"], 1);
+        drop(body);
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), third).await.unwrap().unwrap().unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        drop((resp, held));
+        assert_eq!(t.state.ab_pages.all.available_permits(), MAX_PAGES);
+        assert_eq!(t.state.ab_pages.free().1, 0);
+    }
+
+    /// The slots go back with the page's memory (review D-3): not when the body is dropped after
+    /// its last frame, but when that last frame is gone too (hyper may still have it queued).
+    #[tokio::test]
+    async fn page_slots_go_back_with_the_last_frame() {
+        use tower::ServiceExt as _;
+        let t = testutil::app().await;
+        // About 200 KB: several frames.
+        let (token, book) = big_book(&t, "alice", 20, 10_000).await;
+        let resp = t.app.clone().oneshot(page_request(&token, &book)).await.unwrap();
+        let mut body = resp.into_body();
+        let mut frames = Vec::new();
+        while let Some(frame) = next_frame(&mut body).await {
+            frames.push(frame);
+        }
+        assert!(frames.len() > 2, "{} frames", frames.len());
+        assert_eq!(js(&frames.concat().into())["total"], 20);
+        // Body gone, frames still queued: the page's memory and its slots are still held.
+        drop(body);
+        let last = frames.pop().unwrap();
+        drop(frames);
+        assert_eq!(t.state.ab_pages.all.available_permits(), MAX_PAGES - 1);
+        assert_eq!(t.state.ab_pages.free().1, 1);
+        drop(last);
+        assert_eq!(t.state.ab_pages.all.available_permits(), MAX_PAGES);
+        assert_eq!(t.state.ab_pages.free().1, 0);
     }
 
     #[tokio::test]
@@ -1503,5 +1763,127 @@ mod tests {
         assert_eq!(tags_of("p3").await, ["t3"]);
         assert_eq!(tags_of("p2").await, ["t5"]);
         write_err(&t.app, "DELETE", &delete, &token, r#""t3""#, StatusCode::BAD_REQUEST).await;
+    }
+
+    /// `DELETE /api/ab/tag` names are deduplicated and counted before the transaction (review
+    /// D-14): over `MAX_TAGS` distinct names is a 400 that touches nothing; names over the tag
+    /// limits (imported ones, §15) are deleted like any other; a full book of 5000 peers with 64
+    /// tags each cascades well within the request timeout.
+    #[tokio::test]
+    async fn tag_delete_names_are_capped() {
+        let t = testutil::app().await;
+        let db = &t.state.db;
+        let (_, token) = testutil::create_user(db, "alice", "", false).await;
+        let book = personal_guid(&t.app, &token).await;
+        // Every peer carries "m" and 63 two-byte tags.
+        let tags: Vec<String> = std::iter::once("m".to_owned()).chain((0..63).map(|i| format!("{i:02}"))).collect();
+        sqlx::query(
+            "with recursive n(i) as (select 1 union all select i + 1 from n where i < ?)
+             insert into ab_peer(ab_guid, id, tags, created_at, updated_at) select ?, 'p' || i, ?, 0, 0 from n",
+        )
+        .bind(MAX_PEERS)
+        .bind(&book)
+        .bind(serde_json::to_string(&tags).unwrap())
+        .execute(db)
+        .await
+        .unwrap();
+        let carrying_m = || {
+            let book = book.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "select count(*) from ab_peer where ab_guid = ? and exists (select 1 from json_each(tags) where value = 'm')",
+                )
+                .bind(book)
+                .fetch_one(db)
+                .await
+                .unwrap()
+            }
+        };
+        let delete = format!("/api/ab/tag/{book}");
+        let over: Vec<String> = std::iter::once("m".to_owned()).chain((0..MAX_TAGS).map(|i| format!("x{i}"))).collect();
+        write_err(&t.app, "DELETE", &delete, &token, &serde_json::to_string(&over).unwrap(), StatusCode::BAD_REQUEST)
+            .await;
+        assert_eq!(carrying_m().await, MAX_PEERS);
+        // Names over the tag limits (as an import leaves them, §15) are matched and deleted.
+        let long = "y".repeat(MAX_TAG_LEN + 1);
+        let ctrl = "a\u{1}".to_owned();
+        for name in [&long, &ctrl] {
+            sqlx::query("insert into ab_tag(ab_guid, name, color) values(?, ?, 1)")
+                .bind(&book)
+                .bind(name)
+                .execute(db)
+                .await
+                .unwrap();
+        }
+        let odd = serde_json::json!(["00", &long, &ctrl]).to_string();
+        sqlx::query("update ab_peer set tags = ? where ab_guid = ? and id = 'p2'")
+            .bind(&odd)
+            .bind(&book)
+            .execute(db)
+            .await
+            .unwrap();
+        write_ok(&t.app, "DELETE", &delete, &token, &serde_json::json!([&long, &ctrl]).to_string()).await;
+        assert_eq!(stored(db, &book, "p2").await.1, ["00"]);
+        let left: i64 = sqlx::query_scalar("select count(*) from ab_tag where ab_guid = ?")
+            .bind(&book)
+            .fetch_one(db)
+            .await
+            .unwrap();
+        assert_eq!(left, 0);
+        // ~60,000 entries are fine when they are few distinct names: "m", 998 others and "z".
+        let mut names: Vec<String> = std::iter::once("m".to_owned()).chain((0..998).map(|i| format!("x{i}"))).collect();
+        names.extend(std::iter::repeat("z".to_owned()).take(60_000));
+        let body = serde_json::to_string(&names).unwrap();
+        assert!(body.len() <= super::super::AB_TAG_DELETE_BODY_LIMIT, "{}", body.len());
+        let start = std::time::Instant::now();
+        write_ok(&t.app, "DELETE", &delete, &token, &body).await;
+        assert!(start.elapsed() < std::time::Duration::from_secs(10), "took {:?}", start.elapsed());
+        assert_eq!(carrying_m().await, 0);
+        assert_eq!(stored(db, &book, "p1").await.1, tags[1..]);
+    }
+
+    /// `DELETE /api/ab/peer` checks its array as it reads it (review D-16): over `MAX_PEERS` ids, an
+    /// id over `MAX_PEER_ID_LEN` or anything but an array of strings is a 400 that deletes nothing;
+    /// SQLite reads the ids out of the checked body, escapes included.
+    #[tokio::test]
+    async fn peer_delete_checks_the_ids() {
+        let t = testutil::app().await;
+        let db = &t.state.db;
+        let (_, token) = testutil::create_user(db, "alice", "", false).await;
+        let book = personal_guid(&t.app, &token).await;
+        for id in ["p1", "a\"b", "é"] {
+            sqlx::query("insert into ab_peer(ab_guid, id, created_at, updated_at) values(?, ?, 0, 0)")
+                .bind(&book)
+                .bind(id)
+                .execute(db)
+                .await
+                .unwrap();
+        }
+        let delete = format!("/api/ab/peer/{book}");
+        let too_many = serde_json::to_string(&vec!["p1"; MAX_PEERS as usize + 1]).unwrap();
+        // The 2 MB the route allows, as short elements: refused at element 5001.
+        let mut huge = "[".to_owned() + &r#""","#.repeat((2 << 20) / 3 - 2);
+        huge.push_str(r#""p1"]"#);
+        assert!(huge.len() <= super::super::AB_PEER_DELETE_BODY_LIMIT);
+        let long = serde_json::json!(["p1", "x".repeat(MAX_PEER_ID_LEN + 1)]).to_string();
+        for (body, want) in [
+            (too_many.as_str(), "too many peer ids"),
+            (huge.as_str(), "too many peer ids"),
+            (long.as_str(), "peer id too long"),
+            (r#"["p1",1]"#, "invalid type"),
+            (r#"{"id":"p1"}"#, "invalid type"),
+            (r#"["p1"] x"#, "trailing characters"),
+            (r#"["p1""#, "EOF"),
+        ] {
+            let (status, _, resp) = send(&t.app, "DELETE", &delete, Some(&token), body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{}", &body[..body.len().min(40)]);
+            let msg = js(&resp)["error"].as_str().unwrap().to_owned();
+            assert!(msg.starts_with("Invalid request body: ") && msg.contains(want), "{msg}");
+        }
+        assert_eq!(list_peers(&t.app, &token, &book).await.len(), 3);
+        write_ok(&t.app, "DELETE", &delete, &token, r#"[ "a\"b", "é", "nope" ]"#).await;
+        let left: Vec<Value> = list_peers(&t.app, &token, &book).await.iter().map(|p| p["id"].clone()).collect();
+        assert_eq!(left, ["p1"]);
+        write_ok(&t.app, "DELETE", &delete, &token, "[]").await;
     }
 }
