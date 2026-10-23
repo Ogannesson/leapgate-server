@@ -71,22 +71,22 @@ pub(crate) async fn create_user(db: &SqlitePool, name: &str, password: &str, is_
     (id, token)
 }
 
-/// A Porta device: its id and signing key pair.
+/// A Leapgate device: its id and signing key pair.
 pub(crate) struct Device {
     pub id: String,
     pub pk: sodiumoxide::crypto::sign::PublicKey,
     pub sk: sodiumoxide::crypto::sign::SecretKey,
 }
 
-/// A signed Porta answer and the signature of the request it answers.
-pub(crate) struct PortaResp {
+/// A signed Leapgate answer and the signature of the request it answers.
+pub(crate) struct LeapgateResp {
     pub status: StatusCode,
     pub headers: HeaderMap,
     pub body: Bytes,
     pub sig: [u8; 64],
 }
 
-impl PortaResp {
+impl LeapgateResp {
     pub fn json(&self) -> serde_json::Value {
         serde_json::from_slice(&self.body).unwrap()
     }
@@ -99,7 +99,7 @@ impl Device {
         Self { id: id.to_owned(), pk, sk }
     }
 
-    /// The `Porta-Device-Auth` header value and the signature, for `POST /api/porta/v1/<endpoint>`.
+    /// The `Leapgate-Device-Auth` header value and the signature, for `POST /api/leapgate/v1/<endpoint>`.
     pub fn auth(&self, endpoint: &str, t: i64, body: &[u8]) -> (String, [u8; 64]) {
         use crate::api::devauth::{b64url, request_message};
         let message = request_message("POST", endpoint, &self.id, t, body);
@@ -107,16 +107,16 @@ impl Device {
         (format!("v1 id={}, t={t}, s={}", b64url(self.id.as_bytes()), b64url(&sig)), sig)
     }
 
-    /// Signs (now) and posts `body` to `/api/porta/v1/<endpoint>`.
-    pub async fn post(&self, app: &axum::Router, endpoint: &str, body: &[u8]) -> PortaResp {
+    /// Signs (now) and posts `body` to `/api/leapgate/v1/<endpoint>`.
+    pub async fn post(&self, app: &axum::Router, endpoint: &str, body: &[u8]) -> LeapgateResp {
         let (auth, sig) = self.auth(endpoint, crate::common::now() as i64, body);
-        let (status, headers, body) = send_porta(app, &format!("/api/porta/v1/{endpoint}"), Some(&auth), body).await;
-        PortaResp { status, headers, body, sig }
+        let (status, headers, body) = send_leapgate(app, &format!("/api/leapgate/v1/{endpoint}"), Some(&auth), body).await;
+        LeapgateResp { status, headers, body, sig }
     }
 }
 
 /// A device registered with hbbs (a `peer` row with its public key and `uuid`).
-pub(crate) async fn porta_device(state: &AppState, id: &str, uuid: &[u8]) -> Device {
+pub(crate) async fn leapgate_device(state: &AppState, id: &str, uuid: &[u8]) -> Device {
     let dev = Device::new(id);
     crate::database::Database::new(state.db.clone())
         .insert_peer(id, uuid, &dev.pk.0, "{}")
@@ -125,9 +125,9 @@ pub(crate) async fn porta_device(state: &AppState, id: &str, uuid: &[u8]) -> Dev
     dev
 }
 
-/// Posts like the Porta client (`Content-Type: application/json`, optional `Porta-Device-Auth`),
+/// Posts like the Leapgate client (`Content-Type: application/json`, optional `Leapgate-Device-Auth`),
 /// from TCP peer `127.0.0.1:50000`. Returns `(status, headers, body)`.
-pub(crate) async fn send_porta(
+pub(crate) async fn send_leapgate(
     app: &axum::Router,
     uri: &str,
     auth: Option<&str>,
@@ -138,7 +138,7 @@ pub(crate) async fn send_porta(
         .uri(uri)
         .header(header::CONTENT_TYPE, "application/json");
     if let Some(auth) = auth {
-        req = req.header("Porta-Device-Auth", auth);
+        req = req.header("Leapgate-Device-Auth", auth);
     }
     let mut req = req.body(Body::from(body.to_vec())).unwrap();
     req.extensions_mut()
@@ -149,7 +149,7 @@ pub(crate) async fn send_porta(
     (status, headers, body)
 }
 
-/// Whether `headers` carry a `Porta-Server-Sig` over `body` for the request signed `req_sig`, by
+/// Whether `headers` carry a `Leapgate-Server-Sig` over `body` for the request signed `req_sig`, by
 /// the state's rendezvous key.
 pub(crate) fn verify_server_sig(state: &AppState, req_sig: &[u8; 64], headers: &HeaderMap, body: &[u8]) -> bool {
     use sodiumoxide::crypto::sign;

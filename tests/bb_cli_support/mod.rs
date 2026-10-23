@@ -1,5 +1,5 @@
 //! Helpers for the black-box command line / import tests (`tests/bb_cli.rs`).
-//! Everything here talks to a real `porta-server` process (command line mode or server mode) and to
+//! Everything here talks to a real `leapgate-server` process (command line mode or server mode) and to
 //! its SQLite file; nothing calls into the crate's implementation.
 
 #![allow(dead_code)]
@@ -20,10 +20,10 @@ use std::{
 };
 use tempfile::TempDir;
 
-pub const SECRET_KEY_FILE: &str = "porta_secret.key";
+pub const SECRET_KEY_FILE: &str = "leapgate_secret.key";
 
 pub fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_porta-server")
+    env!("CARGO_BIN_EXE_leapgate-server")
 }
 
 pub fn now() -> i64 {
@@ -33,7 +33,7 @@ pub fn now() -> i64 {
         .as_secs() as i64
 }
 
-/// A temporary working directory with the Porta database inside (`DB_URL` points at it).
+/// A temporary working directory with the Leapgate database inside (`DB_URL` points at it).
 pub struct Work {
     pub dir: TempDir,
 }
@@ -48,22 +48,22 @@ impl Work {
     }
 
     pub fn db_path(&self) -> PathBuf {
-        self.dir.path().join("porta.sqlite3")
+        self.dir.path().join("leapgate.sqlite3")
     }
 
     pub fn key_path(&self) -> PathBuf {
         self.dir.path().join(SECRET_KEY_FILE)
     }
 
-    /// Stands in for "the server was started once here" (PORTA.md §13): base64 of 32 random bytes,
-    /// the format `porta_secret.key` uses.
+    /// Stands in for "the server was started once here" (LEAPGATE.md §13): base64 of 32 random bytes,
+    /// the format `leapgate_secret.key` uses.
     pub fn write_secret_key(&self) {
         let mut key = [0u8; 32];
         hbb_common::rand::thread_rng().fill_bytes(&mut key);
         std::fs::write(self.key_path(), base64::encode(key)).unwrap();
     }
 
-    /// The migrated Porta database (same migration files the binary embeds, so the command line's own
+    /// The migrated Leapgate database (same migration files the binary embeds, so the command line's own
     /// migration run is a no-op afterwards).
     pub async fn pool(&self) -> SqlitePool {
         let opt = SqliteConnectOptions::new()
@@ -86,7 +86,7 @@ impl Work {
         pool
     }
 
-    /// `porta-server <args…>` in command line mode, cwd = this directory, `stdin` written then closed.
+    /// `leapgate-server <args…>` in command line mode, cwd = this directory, `stdin` written then closed.
     pub fn cli(&self, args: &[&str], stdin: &str) -> CliOutput {
         let mut child = Command::new(bin())
             .args(args)
@@ -127,7 +127,7 @@ impl CliOutput {
 
     fn describe(&self) -> String {
         format!(
-            "porta-server {:?}: {}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            "leapgate-server {:?}: {}\n--- stdout ---\n{}\n--- stderr ---\n{}",
             self.args, self.status, self.stdout, self.stderr
         )
     }
@@ -217,7 +217,7 @@ pub fn is_argon2id_of(hash: &str, plain: &str) -> bool {
             .unwrap_or(false)
 }
 
-/// Opens an `sb1:` value with the key file (PORTA.md §13 format: `sb1:` + base64(nonce ‖ ciphertext)).
+/// Opens an `sb1:` value with the key file (LEAPGATE.md §13 format: `sb1:` + base64(nonce ‖ ciphertext)).
 pub fn decrypt(key_file: &Path, stored: &str) -> String {
     use sodiumoxide::crypto::secretbox;
     let key = base64::decode(std::fs::read_to_string(key_file).unwrap().trim()).unwrap();
@@ -225,11 +225,11 @@ pub fn decrypt(key_file: &Path, stored: &str) -> String {
     let data = base64::decode(stored.strip_prefix("sb1:").expect("value must start with sb1:")).unwrap();
     let (nonce, cipher) = data.split_at(secretbox::NONCEBYTES);
     let nonce = secretbox::Nonce::from_slice(nonce).unwrap();
-    String::from_utf8(secretbox::open(cipher, &nonce, &key).expect("decrypts with porta_secret.key"))
+    String::from_utf8(secretbox::open(cipher, &nonce, &key).expect("decrypts with leapgate_secret.key"))
         .unwrap()
 }
 
-/// PORTA.md §10 `rev`, recomputed from the database rows: sha256 over the canonical JSON of
+/// LEAPGATE.md §10 `rev`, recomputed from the database rows: sha256 over the canonical JSON of
 /// `[effective options sorted by key, global epoch, device epoch]`, first 8 bytes big-endian & i64::MAX, 0 → 1.
 pub async fn expected_rev(db: &SqlitePool, device: &str) -> i64 {
     use sha2::{Digest as _, Sha256};
@@ -266,7 +266,7 @@ pub async fn epoch(db: &SqlitePool, device: &str) -> i64 {
 
 // ---- Server process ----
 
-/// A running `porta-server` in server mode; killed on drop.
+/// A running `leapgate-server` in server mode; killed on drop.
 pub struct Server {
     child: Child,
     pub port: u16,
@@ -274,10 +274,10 @@ pub struct Server {
 }
 
 impl Server {
-    /// Starts the server in `work` (cwd, `DB_URL`, a `porta.toml` with `[geo] auto_update = false`),
+    /// Starts the server in `work` (cwd, `DB_URL`, a `leapgate.toml` with `[geo] auto_update = false`),
     /// on a random free `-p P` (P-2, P-1, P, P+2 free), and waits until the API port (P-2) accepts.
     pub fn start(work: &Work) -> Self {
-        std::fs::write(work.path().join("porta.toml"), "[geo]\nauto_update = false\n").unwrap();
+        std::fs::write(work.path().join("leapgate.toml"), "[geo]\nauto_update = false\n").unwrap();
         let port = free_base_port();
         let log = work.path().join(format!("server-{port}.log"));
         let out = std::fs::File::create(&log).unwrap();
@@ -314,7 +314,7 @@ impl Server {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             if let Some(status) = self.child.try_wait().unwrap() {
-                panic!("porta-server exited early ({status})\n{}", self.log());
+                panic!("leapgate-server exited early ({status})\n{}", self.log());
             }
             if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
                 return;
@@ -457,7 +457,7 @@ pub struct Fixture {
 }
 
 /// Builds a rustdesk-api database (rollback journal, like rustdesk-api's own DSN) covering every
-/// rule of PORTA.md §15. Users (old id → name): 1 admin, 2 bob, 3 carol, 4 dave, 5 erin, 10 frank, 11 hank.
+/// rule of LEAPGATE.md §15. Users (old id → name): 1 admin, 2 bob, 3 carol, 4 dave, 5 erin, 10 frank, 11 hank.
 pub async fn build_rustdesk_api(dir: &Path) -> Fixture {
     let path = dir.join("rustdeskapi.db");
     let opt = SqliteConnectOptions::new()

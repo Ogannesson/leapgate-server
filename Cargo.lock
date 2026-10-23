@@ -2734,7 +2734,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "porta-server"
+name = "leapgate-server"
 version = "1.1.17"
 dependencies = [
  "argon2",

@@ -1,4 +1,4 @@
-//! Effective heartbeat options and their version number (PORTA.md §10).
+//! Effective heartbeat options and their version number (LEAPGATE.md §10).
 //! Shared by the heartbeat handler (`api/device.rs`) and the command line.
 
 use hbb_common::ResultType;
@@ -46,7 +46,7 @@ pub fn rev(options: &BTreeMap<String, String>, global_epoch: i64, device_epoch: 
 }
 
 /// sha256 of `bytes`, first 8 bytes as big-endian i64, masked to non-negative; 0 becomes 1. Also the
-/// routing list's `rev` (PORTA.md §7 level two).
+/// routing list's `rev` (LEAPGATE.md §7 level two).
 pub fn digest_rev(bytes: &[u8]) -> i64 {
     let digest = Sha256::digest(bytes);
     let mut first = [0u8; 8];

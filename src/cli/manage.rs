@@ -1,4 +1,4 @@
-//! `user …`, `group …`, `ab …`: accounts, user groups and shared address books (PORTA.md §12, §14).
+//! `user …`, `group …`, `ab …`: accounts, user groups and shared address books (LEAPGATE.md §12, §14).
 
 use super::{check_name, read_password, table, Args, Ctx, RESERVED_BOOK_NAMES, USAGE};
 use hbb_common::{bail, ResultType};
@@ -455,7 +455,7 @@ async fn book_guid(db: &SqlitePool, name: &str) -> ResultType<String> {
     }
 }
 
-/// Deletes all tokens of a user (password change, disable; PORTA.md §11).
+/// Deletes all tokens of a user (password change, disable; LEAPGATE.md §11).
 async fn logout_all(tx: &mut sqlx::SqliteConnection, uid: i64) -> ResultType<u64> {
     Ok(sqlx::query("delete from token where user_id = ?")
         .bind(uid)

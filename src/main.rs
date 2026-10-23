@@ -3,10 +3,10 @@
 
 use flexi_logger::*;
 use hbb_common::{bail, config::RENDEZVOUS_PORT, ResultType};
-use porta_server::{common::*, *};
+use leapgate_server::{common::*, *};
 
 const RMEM: usize = 0;
-/// First arguments that switch to command line management (PORTA.md §14).
+/// First arguments that switch to command line management (LEAPGATE.md §14).
 const CLI_COMMANDS: &[&str] = &[
     "user", "group", "ab", "device", "strategy", "relay", "route", "geo", "stats", "import",
 ];
@@ -41,9 +41,9 @@ fn main() -> ResultType<()> {
         -M, --rmem=[NUMBER(default={RMEM})] 'Sets UDP recv buffer size, set system rmem_max first, e.g., sudo sysctl -w net.core.rmem_max=52428800. vi /etc/sysctl.conf, net.core.rmem_max=52428800, sudo sysctl –p'
         , --mask=[MASK] '[DEPRECATED] Determine if the connection comes from LAN, e.g. 192.168.0.0/16'
         -k, --key=[KEY] 'Only allow the client with the same key'
-        , --porta-config=[FILE] 'Sets the Porta config file (default: porta.toml)'",
+        , --leapgate-config=[FILE] 'Sets the Leapgate config file (default: leapgate.toml)'",
     );
-    init_args(&args, "porta-server", "RustDesk ID/Rendezvous Server");
+    init_args(&args, "leapgate-server", "RustDesk ID/Rendezvous Server");
     let port = get_arg_or("port", RENDEZVOUS_PORT.to_string()).parse::<i32>()?;
     if port < 3 {
         bail!("Invalid port");

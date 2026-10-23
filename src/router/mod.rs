@@ -1,6 +1,6 @@
-//! Relay selection (PORTA.md §7): per-device fixed relay; level one, the geo cost
+//! Relay selection (LEAPGATE.md §7): per-device fixed relay; level one, the geo cost
 //! `(rtt(A,R) + rtt(B,R)) × weight(R)` over the reachable relays, round-robin fallback, the health check
-//! and GeoIP loading/updating; level two, the relay measurements Porta devices report, replacing an
+//! and GeoIP loading/updating; level two, the relay measurements Leapgate devices report, replacing an
 //! end's estimates.
 
 mod cost;
@@ -33,7 +33,7 @@ const HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
 const GEO_INTERVAL: Duration = Duration::from_secs(24 * 3600);
 /// Level two: only the first this many relays are sent to clients to measure.
 pub const MAX_PROBED: usize = 32;
-/// Level two: how often clients measure (Porta heartbeat `routing.probe_interval_secs`).
+/// Level two: how often clients measure (Leapgate heartbeat `routing.probe_interval_secs`).
 pub const PROBE_INTERVAL_SECS: u64 = 300;
 
 /// Context of one relay choice (note 02 §3.5). IPs are canonical (`::ffff:a.b.c.d` → IPv4).
@@ -42,7 +42,7 @@ pub struct RouteQuery<'a> {
     pub a_ip: IpAddr,
     /// Controlled side (B), its last UDP registration address.
     pub b_ip: IpAddr,
-    /// A's own id as it claims (`PunchHoleRequest.porta_from_id`, not authenticated; empty when
+    /// A's own id as it claims (`PunchHoleRequest.leapgate_from_id`, not authenticated; empty when
     /// absent), for its level-two measurement.
     pub a_id: &'a str,
     /// B's id, for `device_policy.relay_pin` and its level-two measurement.
@@ -112,7 +112,7 @@ impl Relays {
     }
 }
 
-/// sha256 of the probed hosts joined with `\n`, then `\n` and the probe interval (PORTA.md §7, as the
+/// sha256 of the probed hosts joined with `\n`, then `\n` and the probe interval (LEAPGATE.md §7, as the
 /// strategy `rev`): the same configuration gives the same rev across restarts. Warns when relays
 /// beyond `MAX_PROBED` take no part in level two.
 fn routing_rev(list: &[RelayState]) -> i64 {
@@ -184,7 +184,7 @@ impl Router {
         }
     }
 
-    /// Level two: the current list `rev` and the hosts clients are to measure (the Porta heartbeat's
+    /// Level two: the current list `rev` and the hosts clients are to measure (the Leapgate heartbeat's
     /// `routing`).
     pub fn routing(&self) -> (i64, Vec<String>) {
         let relays = self.relays.read().unwrap();
@@ -212,7 +212,7 @@ impl Router {
                     };
                 }
                 Ok(None) => {}
-                // Throttled: every punch request to an online peer gets here (PORTA.md §6 item 7).
+                // Throttled: every punch request to an online peer gets here (LEAPGATE.md §6 item 7).
                 Err(e) => throttled_log!(
                     Duration::from_secs(60),
                     error,
@@ -356,7 +356,7 @@ impl Router {
         relays.rev = routing_rev(&relays.list);
     }
 
-    /// Console `rs` without arguments / `porta-server relay status`.
+    /// Console `rs` without arguments / `leapgate-server relay status`.
     pub fn status_text(&self) -> String {
         let mut out = match self.geo_snapshot() {
             Some(g) => format!("GeoIP: {}\n", g.info),
@@ -405,7 +405,7 @@ impl Router {
         out
     }
 
-    /// Console `tg a b [idA idB]` / `porta-server route test`: the decision for A=`a`, B=`b`, with an
+    /// Console `tg a b [idA idB]` / `leapgate-server route test`: the decision for A=`a`, B=`b`, with an
     /// explanation; with ids, also which legs are measured (empty id: none).
     pub async fn test(&self, a: IpAddr, b: IpAddr, a_id: &str, b_id: &str) -> String {
         let (a, b) = (a.to_canonical(), b.to_canonical());
@@ -493,7 +493,7 @@ impl Router {
         });
     }
 
-    /// Console `gu` (`porta-server geo update`): download/reload GeoIP now, hot-swap, report the result.
+    /// Console `gu` (`leapgate-server geo update`): download/reload GeoIP now, hot-swap, report the result.
     pub async fn geo_update(&self) -> String {
         match self.geo_check(true).await {
             Ok(msg) => msg,
@@ -632,7 +632,7 @@ fn describe(l: &Loc) -> String {
     )
 }
 
-/// `porta-server geo lookup <ip>`: reads the local mmdb files (the server's files, found the same
+/// `leapgate-server geo lookup <ip>`: reads the local mmdb files (the server's files, found the same
 /// way; writes nothing) and describes country, coordinates, ASN and carrier group (built-in table
 /// plus `[routing.carriers]`, as in route decisions).
 pub fn geo_lookup(cfg: &Config, ip: IpAddr) -> ResultType<String> {
@@ -675,7 +675,7 @@ fn describe_ip<S: AsRef<[u8]> + Send + Sync>(
     out
 }
 
-/// `porta-server geo update` when the console is unreachable (server not running): download in the
+/// `leapgate-server geo update` when the console is unreachable (server not running): download in the
 /// command line process, without directory cleanup.
 pub async fn geo_download(cfg: &GeoConfig) -> ResultType<String> {
     if cfg.source == GeoSource::Manual {

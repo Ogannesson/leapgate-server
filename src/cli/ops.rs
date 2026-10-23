@@ -1,4 +1,4 @@
-//! `device …`, `strategy …`, `relay status`, `route test`, `geo …`, `stats` (PORTA.md §7, §8, §10, §14).
+//! `device …`, `strategy …`, `relay status`, `route test`, `geo …`, `stats` (LEAPGATE.md §7, §8, §10, §14).
 
 use super::{console, console_connect, console_send, fmt_time, table, Args, Ctx, USAGE};
 use crate::strategy::GLOBAL;
@@ -84,9 +84,9 @@ pub(super) async fn exec(ctx: &Ctx, cmd: &str, mut args: Args) -> ResultType<Str
             let value = if sub == "set" { args.next("option value")? } else { String::new() };
             args.finish()?;
             check_scope_key(&scope, &key)?;
-            // The Porta client's own options; it skips them in a pushed strategy too.
-            if key.starts_with("porta-") {
-                bail!("Options starting with porta- are the Porta client's own and are never pushed");
+            // The Leapgate client's own options; it skips them in a pushed strategy too.
+            if key.starts_with("leapgate-") {
+                bail!("Options starting with leapgate- are the Leapgate client's own and are never pushed");
             }
             sqlx::query(
                 "insert into strategy_option(scope, key, value) values(?, ?, ?)
@@ -137,11 +137,11 @@ pub(super) async fn exec(ctx: &Ctx, cmd: &str, mut args: Args) -> ResultType<Str
     }
 }
 
-/// `relay status`, `route test`, `geo …`: they talk to the console or read `porta.toml` and the mmdb
+/// `relay status`, `route test`, `geo …`: they talk to the console or read `leapgate.toml` and the mmdb
 /// files, never the database, so they run without one (review R2-6).
 pub(super) async fn runtime(
     console_addr: SocketAddr,
-    porta_config: &Path,
+    leapgate_config: &Path,
     cmd: &str,
     mut args: Args,
 ) -> ResultType<String> {
@@ -172,7 +172,7 @@ pub(super) async fn runtime(
         ("geo", "lookup") => {
             let ip = parse_ip(&args.next("ip")?)?;
             args.finish()?;
-            let cfg = crate::config::Config::load(porta_config, "")?;
+            let cfg = crate::config::Config::load(leapgate_config, "")?;
             Ok(crate::router::geo_lookup(&cfg, ip)? + "\n")
         }
         ("geo", "update") => {
@@ -181,7 +181,7 @@ pub(super) async fn runtime(
                 Ok(stream) => console_send(stream, "gu", GEO_UPDATE_WAIT).await,
                 Err(err) => {
                     eprintln!("{err}; downloading in this process instead");
-                    let cfg = crate::config::Config::load(porta_config, "")?;
+                    let cfg = crate::config::Config::load(leapgate_config, "")?;
                     Ok(crate::router::geo_download(&cfg.geo).await? + "\n")
                 }
             }
@@ -231,7 +231,7 @@ fn fingerprint(pk: &[u8]) -> String {
     out
 }
 
-/// `device key reset [--forget] <id>` (PORTA.md §14): unpins the key of `id`, keeping its uuid and
+/// `device key reset [--forget] <id>` (LEAPGATE.md §14): unpins the key of `id`, keeping its uuid and
 /// key (a reinstall keeps its id by the usual rule: same uuid, same IP may change the key), or with
 /// `forget` deletes its row (the uuid changed too; the next registration of the id is a new device).
 /// Only the command line changes the database: whoever can open its file may. Then the running
@@ -248,7 +248,7 @@ async fn key_reset(ctx: &Ctx, id: &str, forget: bool) -> ResultType<String> {
     if sqlx::query(sql).bind(id).execute(&ctx.db).await?.rows_affected() == 0 {
         bail!(
             "No registered device {id}. If an earlier reset of it was not reloaded by the server, \
-             restart porta-server."
+             restart leapgate-server."
         );
     }
     let done = if forget {
@@ -264,7 +264,7 @@ async fn key_reset(ctx: &Ctx, id: &str, forget: bool) -> ResultType<String> {
     };
     bail!(
         "{done}The database is changed, but the server did not reload it ({failure}).\n\
-         If porta-server is running, restart it for this to take effect."
+         If leapgate-server is running, restart it for this to take effect."
     )
 }
 
@@ -544,7 +544,7 @@ mod tests {
         sqlx::query(
             "insert into device(id, user_id, hostname, client_type, version, first_seen_at, last_seen_at) values
              ('100', ?, 'pc-a', 'rustdesk', '1.4.2', 0, 1700000000),
-             ('200', null, 'pc-b', 'porta', '0.1.0', 0, 1700000000)",
+             ('200', null, 'pc-b', 'leapgate', '0.1.0', 0, 1700000000)",
         )
         .bind(alice)
         .execute(db)
@@ -572,7 +572,7 @@ mod tests {
         let lines: Vec<&str> = all.lines().collect();
         assert_eq!(lines.len(), 3, "{all}");
         assert!(lines[1].starts_with("100") && lines[1].contains("alice") && lines[1].contains("1.4.2"), "{all}");
-        assert!(lines[2].starts_with("200") && lines[2].contains("porta"), "{all}");
+        assert!(lines[2].starts_with("200") && lines[2].contains("leapgate"), "{all}");
 
         let legacy = cli(&ctx, &["device", "list", "--legacy"], "").await.unwrap();
         let lines: Vec<&str> = legacy.lines().collect();
@@ -629,7 +629,7 @@ mod tests {
         assert!(err.contains("forgotten") && err.contains("restart it"), "{err}");
         assert_eq!(pinned_at(db, "dev001").await, None);
         let err = cli(&ctx, &["device", "key", "reset", "dev001"], "").await.unwrap_err().to_string();
-        assert!(err.contains("No registered device") && err.contains("restart porta-server"), "{err}");
+        assert!(err.contains("No registered device") && err.contains("restart leapgate-server"), "{err}");
         assert!(cli(&ctx, &["device", "key", "reset", "a b"], "").await.is_err());
         assert!(cli(&ctx, &["device", "key", "reset"], "").await.is_err());
 
@@ -660,11 +660,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strategy_never_takes_porta_keys() {
+    async fn strategy_never_takes_leapgate_keys() {
         let (_dir, ctx) = ctx(NO_CONSOLE).await;
-        for words in [&["strategy", "set", "*", "porta-api-caps", "x"][..], &["strategy", "unset", "dev1", "porta-x"]] {
+        for words in [&["strategy", "set", "*", "leapgate-api-caps", "x"][..], &["strategy", "unset", "dev1", "leapgate-x"]] {
             let err = cli(&ctx, words, "").await.unwrap_err().to_string();
-            assert!(err.contains("porta-"), "{err}");
+            assert!(err.contains("leapgate-"), "{err}");
         }
         assert_eq!(rows(&ctx.db).await, vec![row("*", "relay-server", "")]);
     }

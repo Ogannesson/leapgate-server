@@ -1,4 +1,4 @@
-//! Cost model of routing level one (PORTA.md §7, note 06 §4 and §5.2). Pure functions over positions,
+//! Cost model of routing level one (LEAPGATE.md §7, note 06 §4 and §5.2). Pure functions over positions,
 //! so every branch can be tested with fake data behind [`Locate`].
 
 use super::measure::Leg;
@@ -247,7 +247,7 @@ pub(crate) struct Scored {
     pub costs: Vec<Option<Cost>>,
 }
 
-/// Level two's whole-end replacement (PORTA.md §7): an end uses its measurement when it has a
+/// Level two's whole-end replacement (LEAPGATE.md §7): an end uses its measurement when it has a
 /// value for every candidate; the relays it measured down then leave this pair's candidates,
 /// unless none would be left, in which case that end goes back to estimates (A is applied
 /// first). A measured end's leg is its rtt, the other's the level-one estimate. Cost per

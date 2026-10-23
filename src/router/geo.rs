@@ -1,4 +1,4 @@
-//! GeoIP files (PORTA.md §7, note 06 §1~§3): finding, opening and checking the mmdb files, the DB-IP
+//! GeoIP files (LEAPGATE.md §7, note 06 §1~§3): finding, opening and checking the mmdb files, the DB-IP
 //! Lite download, and the cleanup rules.
 
 use super::cost::{GeoRecord, Locate};
@@ -150,10 +150,10 @@ fn read(path: &Path) -> ResultType<Reader<Vec<u8>>> {
     Reader::open_readfile(path).map_err(|e| anyhow!("{}: {e}", path.display()))
 }
 
-/// Where the server keeps its private copies of manual files: `.porta-geoip/` in its working
+/// Where the server keeps its private copies of manual files: `.leapgate-geoip/` in its working
 /// directory, next to the database and the key files. That is writable even when `geo.dir` is not
 /// (geoipupdate's root-owned directory, a read-only mount). Fixed, not configurable.
-pub(crate) const COPY_DIR: &str = ".porta-geoip";
+pub(crate) const COPY_DIR: &str = ".leapgate-geoip";
 
 /// `source = "manual"` on the server: operators may update a file in place (cp, curl -o), and a
 /// mapped file that shrinks under us kills the process with SIGBUS. So we map a copy,

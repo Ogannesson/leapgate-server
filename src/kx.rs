@@ -1,4 +1,4 @@
-//! TCP KeyExchange on 21116 (PORTA.md §6.1, note 02 §6.2). Owned by the rendezvous module.
+//! TCP KeyExchange on 21116 (LEAPGATE.md §6.1, note 02 §6.2). Owned by the rendezvous module.
 //!
 //! The server half of the client's `key_exchange` (`rustdesk:src/common.rs`): the server offers a
 //! signed ephemeral key in the first frame of every TCP connection; a client that wants the

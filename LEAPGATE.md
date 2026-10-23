@@ -1,6 +1,6 @@
-# porta-server：Porta 的服务端（第一期实施契约）
+# leapgate-server：Leapgate 的服务端（第一期实施契约）
 
-本仓库是 `rustdesk/rustdesk-server@873230e` 的**硬分叉**（不再合并上游，安全修复手工摘取），作为子模块挂在总仓库 `Porta` 的 `server/` 下。总体方案见总仓库 `docs/architecture.md`，本文件是第一期（服务端）写代码时要遵守的契约：范围、模块边界、表结构、配置、各模块的行为规则；第三期的服务端改动验收后按代码的最终行为并入（设计记录在总仓库 `docs/第三期实施契约/`）。上游的 `AGENTS.md` 规则（不引入 `unwrap()`/`expect()`、不做纯格式化改动）照样适用。
+本仓库是 `rustdesk/rustdesk-server@873230e` 的**硬分叉**（不再合并上游，安全修复手工摘取），作为子模块挂在总仓库 `Leapgate` 的 `server/` 下。总体方案见总仓库 `docs/architecture.md`，本文件是第一期（服务端）写代码时要遵守的契约：范围、模块边界、表结构、配置、各模块的行为规则；第三期的服务端改动验收后按代码的最终行为并入（设计记录在总仓库 `docs/第三期实施契约/`）。上游的 `AGENTS.md` 规则（不引入 `unwrap()`/`expect()`、不做纯格式化改动）照样适用。
 
 字段级细节不在这里重复，写代码前读总仓库 `docs/research/第一期服务端/` 下对应的笔记（下文简称"笔记 01~06"）：
 - 01 心跳与策略下发；02 hbbs 内部结构与挂钩点；03 账号、组面板、设备上报、审计接口；04 地址簿接口；05 rustdesk-api 表结构与迁移；06 GeoIP 落地。
@@ -20,8 +20,8 @@
 8. **命令行管理**和**从 rustdesk-api 一次性导入**（§14、§15）。
 
 第三期加了：
-- **Porta 上报路径和设备签名**（`/api/porta/v1/`，第三期实施契约 01 块，§9.5）。Porta 客户端的心跳、sysinfo、被控端审计改走这条路径，每个请求用设备私钥签名，第一次验签通过就锁定这台设备的公钥；原版客户端照走 §9.3 的兼容接口。
-- **路由第二级**（第三期实施契约 02 块，§7 第二级）：Porta 客户端测到各中继的 TCP 建连耗时，随 Porta 心跳上报；选中继时某一端有可用的实测就整端代替估算。
+- **Leapgate 上报路径和设备签名**（`/api/leapgate/v1/`，第三期实施契约 01 块，§9.5）。Leapgate 客户端的心跳、sysinfo、被控端审计改走这条路径，每个请求用设备私钥签名，第一次验签通过就锁定这台设备的公钥；原版客户端照走 §9.3 的兼容接口。
+- **路由第二级**（第三期实施契约 02 块，§7 第二级）：Leapgate 客户端测到各中继的 TCP 建连耗时，随 Leapgate 心跳上报；选中继时某一端有可用的实测就整端代替估算。
 
 不做（第一期）：OIDC 和第三方登录、邮箱验证码和 TOTP、Web 管理后台、路由第二级（客户端测速；第三期做，见 §7 第二级）、TCP 注册（走代理/WebSocket/禁 UDP 的被控端原版就显示离线，维持现状）、修改 ID（`RegisterPk.old_id`）、`HttpProxyRequest`（API 经 21116 回落）、WebRTC 信令转发、转发 `udp_port`（UDP 打洞）、心跳下发 `disconnect`、`audit/conn/active`、`PUT /api/audit`、旧版地址簿 `GET/POST /api/ab`，以及总方案第 4 节列的全部"明确不做"。hbbr（`src/relay_server.rs`）不改逻辑。
 
@@ -37,7 +37,7 @@
 | `src/conn_limit.rs` | 会合端口和 21114 共用的连接数限流：总数加每来源（§6 第 8 条、§9.4） | 会合 |
 | `src/api/listen.rs` | 21114 的 accept 循环：连接上限，请求头、整请求、读写无进度超时，写下限（§9.4） | API |
 | `src/state.rs` | `AppState`：进程内共享的句柄（§3） | 骨架 |
-| `src/config.rs` | `porta.toml` 解析（§5） | 骨架 |
+| `src/config.rs` | `leapgate.toml` 解析（§5） | 骨架 |
 | `src/database.rs` | 连接池、迁移、hbbs 原有的 peer 查询 | 骨架 |
 | `src/auth.rs` | 密码哈希/校验、令牌生成/哈希/反查 | 骨架 |
 | `src/strategy.rs` | 生效选项与版本号计算（§10），设备模块和命令行共用 | 骨架 |
@@ -50,8 +50,8 @@
 | `src/conn_tracker.rs` | 连接结果记录与统计（§8） | 结果记录 |
 | `src/api/account.rs`、`src/api/group.rs` | 账号接口、组面板（§9.2、§11、§12.3） | 账号 |
 | `src/api/ab.rs` | 地址簿 12 个接口（§12） | 地址簿 |
-| `src/api/device.rs`、`src/api/audit.rs` | sysinfo、心跳下发、审计（§9.3、§10）；第三期加 Porta 心跳和审计（§9.5） | 设备 |
-| `src/api/devauth.rs` | 第三期：Porta 路径的签名头解析、验签提取器 `SignedBody`、防重放表、首次锁定、响应签名（§9.5） | 第三期 01 |
+| `src/api/device.rs`、`src/api/audit.rs` | sysinfo、心跳下发、审计（§9.3、§10）；第三期加 Leapgate 心跳和审计（§9.5） | 设备 |
+| `src/api/devauth.rs` | 第三期：Leapgate 路径的签名头解析、验签提取器 `SignedBody`、防重放表、首次锁定、响应签名（§9.5） | 第三期 01 |
 | `migrations/0004_device_signing.sql` | 第三期：`peer.pk_pinned_at`（§4.2） | 第三期 01 |
 | `src/cli/`、`src/import.rs` | 命令行与导入（§14、§15） | 命令行 |
 
@@ -74,10 +74,10 @@
   - `tracker: Arc<ConnTracker>`
   - `secret: Arc<SecretBox>`（§13）
   - `cfg: Arc<Config>`
-  - `sk: Option<Arc<sign::SecretKey>>`：`get_server_sk` 的结果，KeyExchange、`IdPk` 签名和 Porta 路径的响应签名（§9.5）共用这一份（第三期从 `RendezvousServer` 的 `inner.sk` 挪进来）。`-k` 传的是公钥时为 `None`。
-- 模块自己的小状态（登录失败计数、审计 nonce 去重表、第三期 Porta 路径的防重放表）放在模块内的 `static`，不进 `AppState`。
-- `PeerMap` 条目上第三期多了两项内存状态：`pinned`（库里 `pk_pinned_at` 的副本，只用来省掉注定失败的写库，以库为准，§6 第 7 条）和 `porta_hb`（最近一次验签通过的 Porta 心跳的时刻和 Porta 版本，只存内存，条目被淘汰就丢，下一次心跳重写；给第三期 04 块用，目前没人读）。
-- Porta 新增的代码（路由、结果记录、API、GeoIP、新表）里，IP 在比较、查库、落库前先规范化：`::ffff:a.b.c.d` → IPv4（`to_canonical()` 或 `try_into_v4`）。原版会合逻辑里已有的地址处理保持原样（`same_intranet`、`update_addr`/`RegisterPk` 的 ip 比较、`peer.info.ip` 落库、`tcp_punch` 的键），也不要在 accept 处统一改写地址，否则同公网 IP 的设备拿不到局域网直连，或升级后每台设备都被判成"IP 变了"。
+  - `sk: Option<Arc<sign::SecretKey>>`：`get_server_sk` 的结果，KeyExchange、`IdPk` 签名和 Leapgate 路径的响应签名（§9.5）共用这一份（第三期从 `RendezvousServer` 的 `inner.sk` 挪进来）。`-k` 传的是公钥时为 `None`。
+- 模块自己的小状态（登录失败计数、审计 nonce 去重表、第三期 Leapgate 路径的防重放表）放在模块内的 `static`，不进 `AppState`。
+- `PeerMap` 条目上第三期多了两项内存状态：`pinned`（库里 `pk_pinned_at` 的副本，只用来省掉注定失败的写库，以库为准，§6 第 7 条）和 `leapgate_hb`（最近一次验签通过的 Leapgate 心跳的时刻和 Leapgate 版本，只存内存，条目被淘汰就丢，下一次心跳重写；给第三期 04 块用，目前没人读）。
+- Leapgate 新增的代码（路由、结果记录、API、GeoIP、新表）里，IP 在比较、查库、落库前先规范化：`::ffff:a.b.c.d` → IPv4（`to_canonical()` 或 `try_into_v4`）。原版会合逻辑里已有的地址处理保持原样（`same_intranet`、`update_addr`/`RegisterPk` 的 ip 比较、`peer.info.ip` 落库、`tcp_punch` 的键），也不要在 accept 处统一改写地址，否则同公网 IP 的设备拿不到局域网直连，或升级后每台设备都被判成"IP 变了"。
 
 ## 4. 存储
 
@@ -199,7 +199,7 @@ create table device (                          -- 来自 HTTP 上报；和 hbbs 
   os            text not null default '',
   version       text not null default '',      -- sysinfo 里的客户端版本原样，例如 "1.5.0"
   ver           integer not null default 0,    -- 心跳 ver（数字版本）
-  client_type   text not null default 'rustdesk',  -- 'rustdesk' | 'porta'
+  client_type   text not null default 'rustdesk',  -- 'rustdesk' | 'leapgate'
   sysinfo       text not null default '',      -- 最近一次 sysinfo 原文；'' 表示还没收到
   first_seen_at integer not null,
   last_seen_at  integer not null,
@@ -256,8 +256,8 @@ create table audit_alarm (
 ## 5. 配置
 
 - hbbs 原有参数（`-p`、`-k`、`-r`、`--mask`、`DB_URL`、`.env`、`-c` 指定的 INI…）全部照旧。
-- Porta 自己的结构化配置放在 `porta.toml`：路径取参数 `--porta-config`（环境变量同名规则照 `get_arg`），默认工作目录下的 `porta.toml`；文件不存在就全用默认值。改了要重启。
-- 中继列表：`porta.toml` 里有 `[[relay]]` 就用它；没有就用 `-r` 的列表（权重 1，无覆盖）。控制台 `rs a,b,c` 仍可在运行时临时替换。载入时只去掉空串和重复项，**不做 DNS 过滤**（不用原版 `get_servers` 里的 `test_if_valid_server`）：解析不了的主机由健康检查判为不可达，恢复后自动回到候选里。
+- Leapgate 自己的结构化配置放在 `leapgate.toml`：路径取参数 `--leapgate-config`（环境变量同名规则照 `get_arg`），默认工作目录下的 `leapgate.toml`；文件不存在就全用默认值。改了要重启。
+- 中继列表：`leapgate.toml` 里有 `[[relay]]` 就用它；没有就用 `-r` 的列表（权重 1，无覆盖）。控制台 `rs a,b,c` 仍可在运行时临时替换。载入时只去掉空串和重复项，**不做 DNS 过滤**（不用原版 `get_servers` 里的 `test_if_valid_server`）：解析不了的主机由健康检查判为不可达，恢复后自动回到候选里。
 
 ```toml
 [api]
@@ -295,10 +295,10 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 改动都按"只加挂钩、不重写流程"做，行为和原版保持一致，除非下面明确要求。
 1. **KeyExchange v1**：21116/TCP 每条连接 accept 后、有 `sk` 时先发 `KeyExchange`（v1：签名的临时公钥 + `signed_params`），读第一帧：是 `KeyExchange` 且 `keys.len()==2` 就建立加密，之后收发都加解密；第一帧不是 `KeyExchange` 就按明文 `RendezvousMessage` 处理。写半边存进 `tcp_punch` 时要带上加密器（`Sink` 改型）。完整步骤和客户端测试里的服务端替身见笔记 02 §6.2。21118（WebSocket）**不做** KeyExchange、服务端也不先发：客户端 `use_ws()` 时 `secure_tcp`/`secure_tcp_required` 都直接跳过（客户端 `src/common.rs` `secure_tcp_impl`），`Sink::Ws` 不带加密器。`sk` 为 None（`-k` 传的是公钥）时，启动时打一条 error 日志："没有私钥，无法做 KeyExchange，登录过的客户端会连接失败；请用 `-k -` 或 `-k <base64 私钥>`"。
 2. **IPv6 信令转发**：按笔记 02 §6.5 的表补 `socket_addr_v6`（以及 `PunchHole` 的 `force_relay`、`PunchHoleResponse` 的 `upnp_port`）。不转发 `udp_port` 和 WebRTC 字段。hbbs 强制中继（`ALWAYS_USE_RELAY` 或 mask 异或）时清空转发的 v6 地址并置 `force_relay`（笔记 02 §6.4）。
-3. **路由挂钩**：`handle_punch_hole_request` 里调 `router.select(&RouteQuery{a_ip, b_ip, a_id, b_id, a_token, conn_type}).await`，`a_id` 是 `PunchHoleRequest.porta_from_id`（第三期，字段号 1000，发起方自报的设备 ID，不认证；超过 253 字节当空串），只用来查 A 的第二级测量（§7）；选中中继两段的延迟随结果记录写进 `conn_attempt`（§8）。`RelayResponse` 分支和控制台 `tg` 也改调 router（`RelayResponse` 的 `a_id`、`b_id` 都传空串）。新增控制台命令 `gu`：让路由模块立即执行一次 GeoIP 下载/重新加载并回显结果（§14 `geo update` 用）。`io_loop` 的中继定时器分支、`Data::RelayServers` 删掉，健康检查挪进 router（笔记 02 §3.5）。控制台 `rs` 无参数时打印 `router.status_text()`。
+3. **路由挂钩**：`handle_punch_hole_request` 里调 `router.select(&RouteQuery{a_ip, b_ip, a_id, b_id, a_token, conn_type}).await`，`a_id` 是 `PunchHoleRequest.leapgate_from_id`（第三期，字段号 1000，发起方自报的设备 ID，不认证；超过 253 字节当空串），只用来查 A 的第二级测量（§7）；选中中继两段的延迟随结果记录写进 `conn_attempt`（§8）。`RelayResponse` 分支和控制台 `tg` 也改调 router（`RelayResponse` 的 `a_id`、`b_id` 都传空串）。新增控制台命令 `gu`：让路由模块立即执行一次 GeoIP 下载/重新加载并回显结果（§14 `geo update` 用）。`io_loop` 的中继定时器分支、`Data::RelayServers` 删掉，健康检查挪进 router（笔记 02 §3.5）。控制台 `rs` 无参数时打印 `router.status_text()`。
 4. **结果记录挂钩**：H1~H5 五处调用 `tracker`（笔记 02 §4.4），只取字段、不阻塞（tracker 内部用通道异步落库）。
 5. 修掉控制台 `aur` 把中继列表清空的那一行（笔记 02 §3.4）。
-5a. 21118（WebSocket）只在 TCP 对端是回环地址时才信任 `X-Real-IP`/`X-Forwarded-For`，否则用 TCP 对端地址（原版对任何来源都信任，直连 21118 就能伪造来源 IP，影响按 IP 选中继、限流和记录；笔记 02 §5）。反向代理和 porta-server 同机部署时行为不变；这时反代转发到 21118 的 location 必须覆盖 `X-Real-IP`（和 21114 同一条硬性部署要求，见 §10），否则客户端自带的头会被原样采信。
+5a. 21118（WebSocket）只在 TCP 对端是回环地址时才信任 `X-Real-IP`/`X-Forwarded-For`，否则用 TCP 对端地址（原版对任何来源都信任，直连 21118 就能伪造来源 IP，影响按 IP 选中继、限流和记录；笔记 02 §5）。反向代理和 leapgate-server 同机部署时行为不变；这时反代转发到 21118 的 location 必须覆盖 `X-Real-IP`（和 21114 同一条硬性部署要求，见 §10），否则客户端自带的头会被原样采信。
 6. 删掉 `check_software_update` 及其调用。
 7. 注册语义不改（`UUID_MISMATCH` 逻辑、每来源每分钟 30 次和每天 300 个新 id 的限额、mask/local_ip、`test_hbbs` 自检照旧），只补边界（审查 A-1/A-5/A-10）：
    - `RegisterPk` 进任何分支之前先校验：`pk` 必须正好 32 字节（客户端发的是 ed25519 公钥 `Config::get_key_pair().1`），`uuid` 非空且不超过 96 字节（客户端发 `get_uuid()`：机器 id，Windows/macOS 36 字节、Linux 32 字节，没有时用 32 字节公钥；96 是 API 那边 128 字节 base64 的原始长度，能注册的设备一定能通过 §9.3 的 uuid 校验）；不合格的静默丢弃：不回包、不写库、不打日志。
@@ -323,7 +323,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
    - 并发连接：21116、21118 各最多 2048 条，21115 最多 256 条；每个端口上每个来源（IPv4 地址 / IPv6 /64）最多 32 条，回环来源只计入总数（同机反代承载所有 WSS 客户端）。超限的连接在 accept 后直接关闭，21116 上不发 KeyExchange、不做签名；每分钟最多打一条 warn。
    - 最坏情况下的缓冲（审查 C-2/C-15/C-27，按 Linux 实测修正）：21116 每条约 26 KB（`Framed` 写缓冲 8 KB + 读缓冲涨到 16 KB 一帧 + 任务），合计约 53 MB；21118 握手完成前每条最多 8 KB + 4 KB 读块，握手后每条约 4 KB 读缓冲 + 16 KB 帧 + 最多 16 KB 正在拼接的分片消息，合计约 74 MB；21115 每条约 136 KB，合计约 35 MB；三者合计约 160 MB。攻击结束后 glibc 不会把峰值 RSS 还给系统，选部署机时按峰值留余量。另有 `PUNCH_REQS`（默认最多 10 万条，约 21~45 MB），只记录带对 key、目标在线的打洞请求，不算在上面。
    - 发往 UDP 的消息（转发给 B 的 `PunchHole`、`RequestRelay` 等）进一个最多 4096 条的有界队列，连接任务不等、队列满了就丢弃（每分钟最多一条 warn），`io_loop` 卡住时内存不随攻击带宽增长。`RequestRelay` 不校验任何东西就转给 B，所以：每条连接最多 12 条，超过就断开（客户端每次尝试一条，最多 3 次）；转发时只带客户端会设的字段（`id`、`uuid`、`relay_server`、`secure`、`conn_type`、`token`、`switch_code`，加服务端填的 `socket_addr`），`uuid`、`token`、`switch_code` 截到 64 字节、`relay_server` 截到 253 字节，不带 `licence_key`；`PunchHoleRequest` 转发的 `socket_addr_v6` 超过 18 字节（`AddrMangle` 编码的 IPv6 地址长度）就清空（审查 C-13）。
-9. **局域网多候选地址**（第三期，porta-cardo `1a46681`）：`handle_local_addr` 把 `LocalAddr.porta_local_addrs`（字段号 1000，`repeated bytes`，Porta 被控端报的物理网卡局域网地址，`AddrMangle` 编码）原样放进发给控制端的 `PunchHoleResponse{is_local}` 的同名字段。只做限长，不解码、不打日志：超过 18 字节（`AddrMangle` 能编出的最长值，IPv6 地址 16 字节加 2 字节端口；IPv4 最多 11 字节）的丢掉，剩下的取前 8 个（Porta 客户端最多报 8 个）。原版客户端不发这个字段，响应和原来一样。用途和客户端两侧怎么用见 `client/PORTA.md` §3。
+9. **局域网多候选地址**（第三期，leapgate-cardo `1a46681`）：`handle_local_addr` 把 `LocalAddr.leapgate_local_addrs`（字段号 1000，`repeated bytes`，Leapgate 被控端报的物理网卡局域网地址，`AddrMangle` 编码）原样放进发给控制端的 `PunchHoleResponse{is_local}` 的同名字段。只做限长，不解码、不打日志：超过 18 字节（`AddrMangle` 能编出的最长值，IPv6 地址 16 字节加 2 字节端口；IPv4 最多 11 字节）的丢掉，剩下的取前 8 个（Leapgate 客户端最多报 8 个）。原版客户端不发这个字段，响应和原来一样。用途和客户端两侧怎么用见 `client/LEAPGATE.md` §3。
 
 ## 7. 路由（`src/router/`）
 
@@ -337,16 +337,16 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 - 健康检查：配置载入时（启动、控制台 `rs` 替换）把全部中继视为可达；之后每 3 秒对每台中继做一次 TCP 建连（3 秒超时），只有一台也要查；记录是否可达和建连耗时；某一轮全部失败时保留上一轮的可达集合（和原版一致）。
 - GeoIP：`maxminddb`（开 `mmap`），文件名规则见 §5。没有库时路由退回轮询，不阻塞启动。
   - `source = "dbip"` 且 `auto_update`：启动后在后台检查、此后每天检查一次。want = 当前 **UTC** 年月；本地 city 和 asn 都 ≥ want 就跳过。否则下载 `dbip-{city,asn}-lite-YYYY-MM.mmdb.gz`；当月 404 时，本地没有库或本地库比上月还旧才下载上月，本地已有上月文件就保持不动、次日再试。解压到 `*.part`、用 maxminddb 打开并抽查几个 IP 通过后原子改名并热切换。下载用已有的 `reqwest` + `flate2`（笔记 06 §3）。
-  - `source = "manual"`：每天检查一次两个文件的 mtime，变了就按同样的打开、抽查流程重新加载并热切换；抽查失败保留旧库。每次加载都先把文件复制成私有副本、映射副本，运维用 cp、curl -o 原地覆盖文件也不会让进程因 SIGBUS 崩溃。副本放在服务工作目录下的 `.porta-geoip/<文件名>`（和数据库、密钥文件同处，服务一定能写；先写临时名 `<文件名>.part` 再改名），不放在 `geo.dir` 里：`geo.dir` 可以是 geoipupdate 的 root 目录或只读挂载，服务对它只读不写。
-  - 清理：服务进程启动时删除残留的 `*.part`（dbip 在 `geo.dir` 里，manual 在 `.porta-geoip/` 里）；热切换成功后删除旧月份的 mmdb（删不掉就忽略，下次启动再删）；任何一步失败都删掉本次的 `*.part`，保留旧库，次日重试。只有服务进程做清理。
+  - `source = "manual"`：每天检查一次两个文件的 mtime，变了就按同样的打开、抽查流程重新加载并热切换；抽查失败保留旧库。每次加载都先把文件复制成私有副本、映射副本，运维用 cp、curl -o 原地覆盖文件也不会让进程因 SIGBUS 崩溃。副本放在服务工作目录下的 `.leapgate-geoip/<文件名>`（和数据库、密钥文件同处，服务一定能写；先写临时名 `<文件名>.part` 再改名），不放在 `geo.dir` 里：`geo.dir` 可以是 geoipupdate 的 root 目录或只读挂载，服务对它只读不写。
+  - 清理：服务进程启动时删除残留的 `*.part`（dbip 在 `geo.dir` 里，manual 在 `.leapgate-geoip/` 里）；热切换成功后删除旧月份的 mmdb（删不掉就忽略，下次启动再删）；任何一步失败都删掉本次的 `*.part`，保留旧库，次日重试。只有服务进程做清理。
   - 命令行 `geo lookup` 按同样的规则找文件，不写任何文件：dbip 直接映射（这些文件只会被改名替换），manual 读进内存（不做私有副本）。
 - 每次决策打一行 debug 日志：双方国家/运营商组、候选代价、选中的中继和 `reason`。
 - 运营商组：内置中国三大运营商的主要 ASN 表（写代码前到 bgp.he.net 或 PeeringDB 核对），查不到时按"ASN 相等算同组"。不用 AS 名称做字符串匹配。
 
 ### 第二级（第三期，`measure.rs`、`cost.rs`）
-设计依据是总仓库 `docs/第三期实施契约/02-路由第二级.md`（下称"契约 02"），这里按代码的最终行为写。Porta 客户端在服务进程里测到每台候选中继的 TCP 建连耗时（每台 3 次取最小，约 5 分钟一轮），随 Porta 心跳上报（§9.5）；服务端选中继时，某一端有可用的实测就用实测代替这一端的估计。
+设计依据是总仓库 `docs/第三期实施契约/02-路由第二级.md`（下称"契约 02"），这里按代码的最终行为写。Leapgate 客户端在服务进程里测到每台候选中继的 TCP 建连耗时（每台 3 次取最小，约 5 分钟一轮），随 Leapgate 心跳上报（§9.5）；服务端选中继时，某一端有可用的实测就用实测代替这一端的估计。
 - **下发的列表**：配置里的全部中继（含健康检查暂判不可达的）的前 32 台（`MAX_PROBED`）原串，和 `PunchHole.relay_server` 下发的是同一个字符串。超过 32 台时启动（和 `rs` 替换）打一条 warn：第 33 台起永远没有实测，它可达时两端都退回估计，等于第二级失效。版本号 `rev`：对"这些原串用 `\n` 连起来 + `\n` + 测速间隔（常量 300 秒，`PROBE_INTERVAL_SECS`）"做 sha256，取法同 §10 的策略 `rev`（`strategy::digest_rev`）；重启后同一份配置算出同一个 rev，`rs` 换了列表就变。`rev` 和列表放在同一把锁下，读到的总是配对的。
-- **测量表**（`Measurements`，只在内存，不落库）：键是 Porta 心跳**验签得来**的设备 ID（伪造不了别人的测量），每台存最近一轮：列表版本、测量时刻（收到时刻 − `age_s`，不依赖两边时钟）、按列表下标排的每台结果（`Rtt(ms)` / `Down` / `Unknown`）。一条约 ID + 32 × 4 字节。
+- **测量表**（`Measurements`，只在内存，不落库）：键是 Leapgate 心跳**验签得来**的设备 ID（伪造不了别人的测量），每台存最近一轮：列表版本、测量时刻（收到时刻 − `age_s`，不依赖两边时钟）、按列表下标排的每台结果（`Rtt(ms)` / `Down` / `Unknown`）。一条约 ID + 32 × 4 字节。
   - 写入：`probes` 形状不对（`routing_rev`、`age_s` 缺失或类型不对，`rtt` 不是"字符串 → 整数"，`down` 不是字符串数组）、`routing_rev` 不是当前版本、`age_s > 900` 的整轮丢弃，只打 trace，心跳照常处理。`rtt` 的键必须逐字等于列表里的原串、值在 1~10000，否则这一台留 `Unknown`；`down` 同样只认列表里的原串；同一台两边都有时以 `rtt` 为准。
   - 上限 1 万台（`MAX_MEASURED`，同 `device` 表）。已有这个 ID 就覆盖；满了先删所有过期的，仍满就删测量时刻最老的一条。不需要定时清理。
   - 读出：版本不是当前的、或测量时刻超过 15 分钟（`MEASURE_TTL`）的视为没有。`decide` 在一次加锁里取 A、B 两份。
@@ -357,14 +357,14 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
   4. `reason`：两端都用实测 `rtt`，只有 A `rtt_a`，只有 B `rtt_b`，都不用时同第一级（两端都没位置返回 `None` 走轮询）；一端用实测时即使两端都没位置也有代价，不轮询。
   5. 选中那台的两段放进 `RouteDecision.a_ms`/`b_ms`。
   - 固定中继仍然最先判断（`b_id` 非空时查 `device_policy`）。
-- **两端的 ID**：B 的 ID 就是打洞请求的目标 ID；A 的 ID 来自 `PunchHoleRequest.porta_from_id`，不认证。A 冒用别人的 ID 只影响 A 自己这次连接的选路，不影响别人；但冒用者能从选路结果侧面推断被冒用设备到各中继的相对延迟，以及它最近 15 分钟是否上报过完整测量（也就是是否在线），被冒用的设备察觉不到。信息量不超过直接向它打洞拿到的公网 IP，接受。不把测量绑定到心跳的来源 IP：HTTP 和 21116 本来就可能从不同出口出去（例如路由器透明代理只代理部分流量）。原版客户端不发，A 段按估计。
+- **两端的 ID**：B 的 ID 就是打洞请求的目标 ID；A 的 ID 来自 `PunchHoleRequest.leapgate_from_id`，不认证。A 冒用别人的 ID 只影响 A 自己这次连接的选路，不影响别人；但冒用者能从选路结果侧面推断被冒用设备到各中继的相对延迟，以及它最近 15 分钟是否上报过完整测量（也就是是否在线），被冒用的设备察觉不到。信息量不超过直接向它打洞拿到的公网 IP，接受。不把测量绑定到心跳的来源 IP：HTTP 和 21116 本来就可能从不同出口出去（例如路由器透明代理只代理部分流量）。原版客户端不发，A 段按估计。
 - **`RelayResponse` 分支不走第二级**：那里 `a_id`、`b_id` 都是空串（只在 B 回报的中继等于 hbbs 自己的 `local_ip` 时才调路由）；它也不遵守固定中继，是第一期就有的问题（已知，未排期）。
 - `relay status`（控制台 `rs`）末尾多一行 `measurements: <N> devices, <M> fresh`（表里的设备数、其中现在可用的数）。`route test --a/--b`（控制台 `tg` 的第 3、4 个参数）见 §14。
 
 ## 8. 连接结果记录（`src/conn_tracker.rs`）
 
 - 按笔记 02 §4.4 实现：内存跟踪器（键 `try_into_v4(A:p1)`、`(A 公网 IP, B id)`、`try_into_v4(A:p3)`），每 5 秒扫一遍把到期的记录定稿写入 `conn_attempt`，定稿规则照笔记，下面几条是对笔记的补充和更正。热路径（H1~H5）只做内存操作，不 await 数据库。
-- `a_user`/`a_device_id`：H1 只把 `PunchHoleRequest.token` 原串存进内存记录，反查放在后台（定稿写库时）调 `auth::token_owner`（async）；`a_user` 存 `user.name`，`a_device_id` 存 `token.device_id`；未登录或令牌已失效时两者都是 NULL。第三期不用不认证的 `porta_from_id` 填 `a_device_id`，也不另存它（契约 02 D2-1）：用没用上 A 的测量看 `route_reason`。
+- `a_user`/`a_device_id`：H1 只把 `PunchHoleRequest.token` 原串存进内存记录，反查放在后台（定稿写库时）调 `auth::token_owner`（async）；`a_user` 存 `user.name`，`a_device_id` 存 `token.device_id`；未登录或令牌已失效时两者都是 NULL。第三期不用不认证的 `leapgate_from_id` 填 `a_device_id`，也不另存它（契约 02 D2-1）：用没用上 A 的测量看 `route_reason`。
 - `route_reason`、`route_a_ms`、`route_b_ms`（第三期，迁移 0005）：H1 时路由模块的 `reason`、`a_ms`、`b_ms`；`forced_relay` 时 `relay_offered` 被改成 `local_ip`，这三列仍记路由模块的原判断。重复请求合并进同一行时，三列和 `relay_offered` 一起跟着"B 回答之前最近一次成功的请求"走。
 - `outcome` 取值全集：`rejected`、`no_reply`、`relay`、`relay_or_v6`、`relay_failed`、`relay_unmatched`、`direct_lan`、`direct_tcp`、`direct_tcp_or_v6`。
 - 窗口（命名常量，标注"待实测"）：直连判定窗口 `W = max(45 秒, 6 × (reply_at − started_at) + 20 秒)`（A 的直连超时 = 打洞耗时 × 6，没有封顶；客户端的打洞耗时还包含连 hbbs 和 KeyExchange 的时间，hbbs 看不到，20 秒余量约能覆盖 3 秒，实测时要专门覆盖慢建连）；H5 匹配时要求 `RequestRelay` 落在 `reply_at + W` 以内；一条记录最多合并 3 次 `RequestRelay`（客户端最多回落 3 次），而且只在它第一次 `relay_req_at` 之后 60 秒内合并，超出的另起一条 `relay_only`；匹配到 `RequestRelay` 的记录，等最后一次 `relay_req_at` + 20 秒后才定稿，那时有 `relay_resp_at` 记 `relay`，没有记 `relay_failed`。
@@ -375,7 +375,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 ## 9. HTTP API 通则
 
 ### 9.1 必须遵守（任何一条写错，原版客户端都会走错分支）
-1. **任何接口都不回 5xx**：客户端遇到 5xx 或连不上会改走 hbbs 的 TCP 代理（第一期不做），白等最长 36 秒，心跳也跟着卡住。内部错误：审计接口回 200 + `{"error":"…"}`（客户端会重试）；`/api/currentUser` 回 200 + `{"error":"…"}`（客户端收到 400 会清本地令牌、401 会全部重置，一次临时错误不能把用户登出）；其他接口回 400 + `{"error":"…"}`。handler panic 和整请求超时（§9.4）都按内部错误回，同样遵守这三种分法。例外是第三期的 Porta 路径 `/api/porta/v1/`（§9.5）：只有 Porta 客户端调用，内部错误、超时、panic 回 503。
+1. **任何接口都不回 5xx**：客户端遇到 5xx 或连不上会改走 hbbs 的 TCP 代理（第一期不做），白等最长 36 秒，心跳也跟着卡住。内部错误：审计接口回 200 + `{"error":"…"}`（客户端会重试）；`/api/currentUser` 回 200 + `{"error":"…"}`（客户端收到 400 会清本地令牌、401 会全部重置，一次临时错误不能把用户登出）；其他接口回 400 + `{"error":"…"}`。handler panic 和整请求超时（§9.4）都按内部错误回，同样遵守这三种分法。例外是第三期的 Leapgate 路径 `/api/leapgate/v1/`（§9.5）：只有 Leapgate 客户端调用，内部错误、超时、panic 回 503。
 2. 请求体一律用 `Bytes` 收、自己解析 JSON；不用 axum 的 `Json` 提取器（出错回 415/422 纯文本）。JSON 响应带 `Content-Type: application/json; charset=utf-8`；`SYSINFO_UPDATED` 用 `text/plain; charset=utf-8`；空 body 的响应（sysinfo 403、审计成功、地址簿写接口成功）不要求 Content-Type。axum 自己产生的错误也回 JSON：用错 HTTP 方法回 405 + `{"error":"Method Not Allowed"}`，请求体超过该路由的上限（§9.4）回 413 + `{"error":"Request body too large"}`，审计接口也回 413（客户端对 4xx 直接放弃、对 200 + error 会重试，同一个超大请求体重发没有意义）。
 3. 令牌无效、过期、账号禁用 → **401**（客户端据此清登录态）。
 4. `/api/login-options` 回 `[]`（没有第三方登录）。
@@ -418,25 +418,25 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 - 备注：按 `device_id = body.id` 且 `session_id = body.session_id` 找匹配记录，每种连接类型更新其中 id 最大的 4 条的 `note`（见上），一条都匹配不到就忽略。
 
 ### 9.4 其他
-- `GET /`：静态说明页（HTML）：服务名 Porta、源代码地址（AGPL-3.0 第 13 条：链接到公开仓库）、"IP Geolocation by DB-IP" 署名并链接 https://db-ip.com 。客户端"在 Web 控制台管理"菜单打开的就是这里。
+- `GET /`：静态说明页（HTML）：服务名 Leapgate、源代码地址（AGPL-3.0 第 13 条：链接到公开仓库）、"IP Geolocation by DB-IP" 署名并链接 https://db-ip.com 。客户端"在 Web 控制台管理"菜单打开的就是这里。
 - 其余未知路径回 404。
 - 连接保护（审查 C-9；常量写死，不做配置，`src/api/listen.rs`）：API 端口不用 `axum::serve`（它不给 hyper 设 timer，hyper 默认的 30 秒请求头超时因此不生效，实测发半个请求头的连接一直挂着），自己写 accept 循环：
   - 并发连接最多 512 条，每个来源（IPv4 地址 / IPv6 /64）最多 32 条，回环来源只计入总数（和会合端口同一套规则，§6 第 8 条）。超限的连接在 accept 后直接关闭，不回 HTTP 响应，每分钟最多打一条 warn；客户端把它当连不上处理（会尝试 TCP 代理回退）。
   - 请求头 10 秒内收完（从连接建立或上一个响应结束算起，所以也是 keep-alive 的空闲超时）；请求头最大 16 KB（hyper 默认约 400 KB），超出回 431。
-  - 整个请求（含收请求体）20 秒内要产生响应，超时按内部错误回：审计接口和 `/api/currentUser` 回 200 + `{"error":"Request timeout"}`，其他接口回 400 + `{"error":"Request timeout"}`。上报类（`/api/heartbeat`、`/api/sysinfo`、`/api/sysinfo_ver`、`/api/audit/*`，第三期起还有 `/api/porta/v1/*`，`is_report` 含 `is_porta`）改为 10 秒（审查 D-13）：客户端只从 Rust 侧发这些请求，它的 HTTP 超时是 12 秒（含建连和 TLS 握手），过了 12 秒的答复没人收，客户端会转去 21116 做 TCP 代理回退（Porta 直接关掉），HTTPS 下还没缓存 TLS 设置的客户端会把同一个请求重发最多 4 次。其余接口保持 20 秒，2 MB 的 `DELETE /api/ab/peer` 按 100 KB/s 也收得完：这些请求默认走客户端的 Flutter 侧（每次 30 秒）；配了 SOCKS 代理或打开本地选项 `enable-flutter-http-on-rust` 的客户端改走 Rust 侧，和上报类一样每次尝试只等 12 秒，失败后会重试或做 TCP 回退（rustdesk@bd92623:flutter/lib/utils/http_service.dart `HttpService.sendRequest`、src/common.rs `get_http_response_async`；审查 E-7）。这部分客户端遇到 12~20 秒的请求收不到服务端的超时答复，只是早几秒报错，接受；2 MB 的 `DELETE /api/ab/peer` 对它们要 170 KB/s 以上才收得完。
+  - 整个请求（含收请求体）20 秒内要产生响应，超时按内部错误回：审计接口和 `/api/currentUser` 回 200 + `{"error":"Request timeout"}`，其他接口回 400 + `{"error":"Request timeout"}`。上报类（`/api/heartbeat`、`/api/sysinfo`、`/api/sysinfo_ver`、`/api/audit/*`，第三期起还有 `/api/leapgate/v1/*`，`is_report` 含 `is_leapgate`）改为 10 秒（审查 D-13）：客户端只从 Rust 侧发这些请求，它的 HTTP 超时是 12 秒（含建连和 TLS 握手），过了 12 秒的答复没人收，客户端会转去 21116 做 TCP 代理回退（Leapgate 直接关掉），HTTPS 下还没缓存 TLS 设置的客户端会把同一个请求重发最多 4 次。其余接口保持 20 秒，2 MB 的 `DELETE /api/ab/peer` 按 100 KB/s 也收得完：这些请求默认走客户端的 Flutter 侧（每次 30 秒）；配了 SOCKS 代理或打开本地选项 `enable-flutter-http-on-rust` 的客户端改走 Rust 侧，和上报类一样每次尝试只等 12 秒，失败后会重试或做 TCP 回退（rustdesk@bd92623:flutter/lib/utils/http_service.dart `HttpService.sendRequest`、src/common.rs `get_http_response_async`；审查 E-7）。这部分客户端遇到 12~20 秒的请求收不到服务端的超时答复，只是早几秒报错，接受；2 MB 的 `DELETE /api/ab/peer` 对它们要 170 KB/s 以上才收得完。
   - 套接字上有读或写在等、且 30 秒没有任何字节进出就断开（防止客户端不读响应，一直占着已经组好的响应体）。这个值要大于整请求超时：handler 执行期间 hyper 会挂着一个读来探测对端关闭，慢 handler 要先拿到超时响应。
   - 写下限（审查 D-4/D-18，防慢慢读的客户端）：一个响应从发送缓冲写满、写被挡住的那一刻起，直到下一个请求开始处理，写出的字节数在 30 秒宽限之后要跟上平均 32 KB/s，跟不上就断开。只靠上一条挡不住慢读：内核在发送缓冲空出三分之一时就收下一次写，客户端把接收窗口压小时，公网上的发送缓冲只有几十 KB，每 30 秒读几 KB 就能让一页几 MB 的响应发几个小时。32 KB/s（256 kbit/s）远低于远程桌面本身需要的带宽；真实的一页（100 条、几十 KB）一次就进了套接字缓冲，碰不到这条。于是 S 字节的响应最迟约 30 秒 + S ÷ 32 KB/s 发完。计数按请求清零（审查 E-9）：每条连接有一个请求计数器，hyper 每把一个请求交给服务就加一，写的时候发现计数变了就重新计时；hyper 的 HTTP/1 一次只处理一个请求，前一个响应写完才交下一个，所以计数一变就是下一个响应开始了。不按"套接字读到数据"清零：客户端把几个请求放在一次写里发来（HTTP 流水线）时，它们第一次读就全进了 hyper 的读缓冲，之后整段都不再读套接字，前几页读得快攒下的字节会算进后一页的额度，能让后一页的名额占几个小时；响应写到一半时对端发来数据也不再让计时重来。判断放在套接字一层（`listen.rs` 的 `Guarded`），不放在响应体里：hyper 的写缓冲满时不会去取响应体，那里的计时触发不了。
-  - 请求体上限按路由：默认 16 KB（登录、登出、currentUser、sysinfo、心跳、单个标签的写接口，以及不读请求体的接口）；审计 64 KB（超长字段要截断入库，§9.3；Porta 审计同样 64 KB）；Porta 心跳 32 KB（sysinfo 8 KB 加 02 块的测速结果，最多 32 台中继 × 约 270 字节）；`peer/add`、`peer/update` 64 KB（合法的单条最大约 18 KB）；`DELETE /api/ab/tag` 256 KB（一本簿最多 1000 个标签；去重后超过 1000 个名字回 400，§12.1）；`DELETE /api/ab/peer` 2 MB（客户端一次删除把全部 id 放进一个数组，满簿 5000 个 253 字节的 id 约 1.3 MB）。`DELETE /api/ab/peer` 的数组边读边数、不展开（审查 D-16）：超过 5000 个元素，读到那里就回 400；id 不按长度查（审查 E-4，见 §12.1）；通过后把原始请求体直接交给 SQLite 的 `json_each` 读 id，等库期间只占请求体本身（原先解析成字符串列表再转回 JSON，2 MB 的 `["","",…]` 每个请求约占 50 MB）。处理中的请求都要占着自己的请求体，所以连接本身之外，最坏还要加上"并发请求数 × 各自路由的上限"；这条路由没有单独的并发上限，只受连接上限约束。
+  - 请求体上限按路由：默认 16 KB（登录、登出、currentUser、sysinfo、心跳、单个标签的写接口，以及不读请求体的接口）；审计 64 KB（超长字段要截断入库，§9.3；Leapgate 审计同样 64 KB）；Leapgate 心跳 32 KB（sysinfo 8 KB 加 02 块的测速结果，最多 32 台中继 × 约 270 字节）；`peer/add`、`peer/update` 64 KB（合法的单条最大约 18 KB）；`DELETE /api/ab/tag` 256 KB（一本簿最多 1000 个标签；去重后超过 1000 个名字回 400，§12.1）；`DELETE /api/ab/peer` 2 MB（客户端一次删除把全部 id 放进一个数组，满簿 5000 个 253 字节的 id 约 1.3 MB）。`DELETE /api/ab/peer` 的数组边读边数、不展开（审查 D-16）：超过 5000 个元素，读到那里就回 400；id 不按长度查（审查 E-4，见 §12.1）；通过后把原始请求体直接交给 SQLite 的 `json_each` 读 id，等库期间只占请求体本身（原先解析成字符串列表再转回 JSON，2 MB 的 `["","",…]` 每个请求约占 50 MB）。处理中的请求都要占着自己的请求体，所以连接本身之外，最坏还要加上"并发请求数 × 各自路由的上限"；这条路由没有单独的并发上限，只受连接上限约束。
   - 默认监听地址不变（`0.0.0.0:21114`）。推荐部署：同机反向代理终结 HTTPS，防火墙不对外开 21114；直接暴露时以上保护照样生效，但每来源上限按 TCP 对端地址算。
 
-### 9.5 Porta 上报路径（第三期，`devauth.rs`、`device.rs`、`audit.rs`）
+### 9.5 Leapgate 上报路径（第三期，`devauth.rs`、`device.rs`、`audit.rs`）
 设计依据是总仓库 `docs/第三期实施契约/01-上报与认证.md`（下称"契约 01"），这里按代码的最终行为写。
 
-**接口**：`POST /api/porta/v1/heartbeat`（请求体上限 32 KB）、`POST /api/porta/v1/audit/{conn,file,alarm}`（64 KB）。只有 Porta 客户端调用，所以不受 §9.1 第 1 条约束：
+**接口**：`POST /api/leapgate/v1/heartbeat`（请求体上限 32 KB）、`POST /api/leapgate/v1/audit/{conn,file,alarm}`（64 KB）。只有 Leapgate 客户端调用，所以不受 §9.1 第 1 条约束：
 - 错误体统一是 `{"error": <码>, "message": <说明>}`：400 `bad_request`（JSON 解析失败、`uuid` 超过 128 字节、字段类型不对）、401（见下面的验签链）、413 `too_large`（超过路由上限或 sysinfo 超过 8 KB）、429 `too_many_requests`、503 `internal`（查库或写库失败、整请求超时、handler panic）、404（未知路径照旧）、405 `method_not_allowed`。axum 自己产生的 413、405 在 `json_rejections` 里换成这个格式。
-- 日志：超时不打日志（和兼容路径一致）；数据库错误和 panic 经 `porta_internal`，每分钟最多一条 error（签名请求能按上报额度的速率触发它）。
+- 日志：超时不打日志（和兼容路径一致）；数据库错误和 panic 经 `leapgate_internal`，每分钟最多一条 error（签名请求能按上报额度的速率触发它）。
 
-**请求签名头**：`Porta-Device-Auth: v1 id=<base64url(设备ID)>, t=<unix 秒>, s=<base64url(签名 64 字节)>`。base64url 不带填充，严格解码（只接受字节的规范写法）；字段顺序和 `, ` 分隔固定。被签内容（字节直接拼接）：`"porta-device-v1\0" ‖ 方法 ‖ "\0" ‖ 接口名 ‖ "\0" ‖ 设备ID ‖ "\0" ‖ t 的十进制 ‖ "\0" ‖ sha256(请求体)`，接口名是 `/api/porta/v1/` 之后的部分（`heartbeat`、`audit/conn`）。Ed25519 detached，公钥是 `peer.pk`（设备注册时报的那把）。身份只从这个头来，请求体里的 `id` 一律忽略；`uuid` 只用于延迟补绑（§11），不参与认证。签名向量和客户端测试共用一组常量（`devauth.rs` `signature_vector`）。
+**请求签名头**：`Leapgate-Device-Auth: v1 id=<base64url(设备ID)>, t=<unix 秒>, s=<base64url(签名 64 字节)>`。base64url 不带填充，严格解码（只接受字节的规范写法）；字段顺序和 `, ` 分隔固定。被签内容（字节直接拼接）：`"leapgate-device-v1\0" ‖ 方法 ‖ "\0" ‖ 接口名 ‖ "\0" ‖ 设备ID ‖ "\0" ‖ t 的十进制 ‖ "\0" ‖ sha256(请求体)`，接口名是 `/api/leapgate/v1/` 之后的部分（`heartbeat`、`audit/conn`）。Ed25519 detached，公钥是 `peer.pk`（设备注册时报的那把）。身份只从这个头来，请求体里的 `id` 一律忽略；`uuid` 只用于延迟补绑（§11），不参与认证。签名向量和客户端测试共用一组常量（`devauth.rs` `signature_vector`）。
 
 **验签链**（提取器 `SignedBody`，放在 handler 最后一个参数，按顺序，任一步失败直接回）：
 1. 头格式：ID 解码后 1~253 字节 UTF-8、签名正好 64 字节、`t` 是 i64。不符 → 401 `bad_auth`，不签名、不带 `time`（没有可绑定的请求签名；客户端也不接受"请求签名段为空"的验法，否则截下的 `bad_auth` 能被重放来拨歪时钟偏移）。
@@ -452,21 +452,21 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 
 **防重放表**（模块内 `static`，不落库）：键是设备 ID，最多 4096 台，每条约 1.5 KB（合计约 6 MB）。每台记最近 64 个 `(t, 签名前 16 字节)`；接受条件是 `t ≥ max_ts − 30`（同一设备最多乱序 30 秒）、`t > floor`、不在环里。环超过 64 条弹出最早那条，`floor` 抬到它的 `t`。新建条目 `floor = now − 30`，所以服务重启后，重启前截获的请求最多还能重放 30 秒。只有验签通过的请求才建条目；表满时扫一遍删掉 `last_seen` 最小的。Ed25519 签名是确定的，同一请求重发就是同一签名：客户端重试必须重新签名（换 `t`）。
 
-**响应签名**：`Porta-Server-Sig: <base64url(签名 64 字节)>`，被签内容 `"porta-server-v1\0" ‖ 请求的签名(64 字节) ‖ sha256(响应体)`，用 `AppState.sk`。2xx 和 `bad_auth` 以外的 401 带签名；`bad_auth`、400、404、405、413、429、503 不带。服务端没有私钥（`-k` 传公钥）时都不带。
+**响应签名**：`Leapgate-Server-Sig: <base64url(签名 64 字节)>`，被签内容 `"leapgate-server-v1\0" ‖ 请求的签名(64 字节) ‖ sha256(响应体)`，用 `AppState.sk`。2xx 和 `bad_auth` 以外的 401 带签名；`bad_auth`、400、404、405、413、429、503 不带。服务端没有私钥（`-k` 传公钥）时都不带。
 
-**心跳**（`device::porta_heartbeat`）：请求体 JSON 对象，键不出现表示没有：`uuid`、`ver`、`porta`（客户端 `libs/porta` 的版本）、`strategy_rev`、`sysinfo_hash`（标准 base64 的 sha256）、`sysinfo`（对象，按原始字节收）、`routing_rev`（第三期 02 块：客户端手里那份中继列表的版本，没有为 0）、`probes`（02 块：最近一轮测速，`{routing_rev, age_s, rtt: {原串: 毫秒}, down: [原串]}`，契约 02 §2.2）。`conns` 不读，serde 跳过。`probes` 先收成任意 JSON 值，形状不对只丢这轮测量（§7 第二级），不回 400。流程：
+**心跳**（`device::leapgate_heartbeat`）：请求体 JSON 对象，键不出现表示没有：`uuid`、`ver`、`leapgate`（客户端 `libs/leapgate` 的版本）、`strategy_rev`、`sysinfo_hash`（标准 base64 的 sha256）、`sysinfo`（对象，按原始字节收）、`routing_rev`（第三期 02 块：客户端手里那份中继列表的版本，没有为 0）、`probes`（02 块：最近一轮测速，`{routing_rev, age_s, rtt: {原串: 毫秒}, down: [原串]}`，契约 02 §2.2）。`conns` 不读，serde 跳过。`probes` 先收成任意 JSON 值，形状不对只丢这轮测量（§7 第二级），不回 400。流程：
 1. 解析；`uuid` 超长 400；`sysinfo` 原文超过 8 KB 413；`sysinfo` 里 `hostname`、`username`、`os`、`version` 类型不对 400；`routing_rev` 不是整数 400。
-2. 写 `Peer.porta_hb = { at: now, porta_ver }`，`porta_ver = get_version_number(porta)` 限到 u32（解析不出为 0）。400、413 的心跳和 Porta 审计都不写它。带了 `probes`：`router.record_probes(签名头里的 ID, probes)`（§7 第二级）。
-3. 带了 `sysinfo`：`store_sysinfo(…, "porta")`，原文按请求里的字节原样存。
-4. `touch(…, "porta")` 写设备行，得到库里现存的 sysinfo 原文。
+2. 写 `Peer.leapgate_hb = { at: now, leapgate_ver }`，`leapgate_ver = get_version_number(leapgate)` 限到 u32（解析不出为 0）。400、413 的心跳和 Leapgate 审计都不写它。带了 `probes`：`router.record_probes(签名头里的 ID, probes)`（§7 第二级）。
+3. 带了 `sysinfo`：`store_sysinfo(…, "leapgate")`，原文按请求里的字节原样存。
+4. `touch(…, "leapgate")` 写设备行，得到库里现存的 sysinfo 原文。
 5. 有设备行，且库里 sysinfo 为空或 `base64(sha256(原文)) != sysinfo_hash` → 响应带 `need_sysinfo: true`；没能建行时不带这个键。
 6. `strategy::effective`，`rev != strategy_rev` 时带 `strategy: {rev, options}`（全部生效选项，值一律字符串，空串表示删键）。
 7. `routing_rev` 不等于路由模块当前的列表版本时带 `routing: {rev, probe_interval_secs: 300, relays: [前 32 台原串]}`（§7 第二级；没有配置中继时 `relays` 为 `[]`，客户端停止测速）；相等时不带。
 8. 签名回 200：`{"api": 1, "features": [], "time": <服务器 unix 秒>, …}`。`features` 是常量数组，本期为空（04 块加 `"udp-punch"`；02 块不加特性项，客户端看响应里有没有 `routing`）。查库失败一律 503。
 
-哈希只算在 sysinfo 这个 JSON 值的原始字节上；服务端原样存那段字节，比对时当场算，不加列。兼容路径存的是整个兼容请求体，哈希必然不同，所以设备从兼容路径切到 Porta 路径后会重传一次 sysinfo。
+哈希只算在 sysinfo 这个 JSON 值的原始字节上；服务端原样存那段字节，比对时当场算，不加列。兼容路径存的是整个兼容请求体，哈希必然不同，所以设备从兼容路径切到 Leapgate 路径后会重传一次 sysinfo。
 
-**审计**（`audit::porta_conn/file/alarm`）：请求体同兼容接口，`id` 取签名头里的；和兼容 handler 共用结构体、截断规则和写库函数（`conn_inner`、`file_inner`、`alarm_inner` → `report`，身份参数 `Identity::Verified` 不查身份），nonce 去重表两条路径共用，同一条审计从哪条路径到达都只记一次。没有会话备注分支（`conn` 里的 `note` 键忽略，按普通上报处理）。成功（含 nonce 重复）签名回 200 + `{"api":1}`；写库失败 503，nonce 不登记，客户端重试时能入库。
+**审计**（`audit::leapgate_conn/file/alarm`）：请求体同兼容接口，`id` 取签名头里的；和兼容 handler 共用结构体、截断规则和写库函数（`conn_inner`、`file_inner`、`alarm_inner` → `report`，身份参数 `Identity::Verified` 不查身份），nonce 去重表两条路径共用，同一条审计从哪条路径到达都只记一次。没有会话备注分支（`conn` 里的 `note` 键忽略，按普通上报处理）。成功（含 nonce 重复）签名回 200 + `{"api":1}`；写库失败 503，nonce 不登记，客户端重试时能入库。
 
 ## 10. 心跳与策略（`strategy.rs`、`device.rs`）
 
@@ -478,11 +478,11 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 - 编码：`modified_at` 是 JSON 整数（i64），不能写成字符串；"值一律是字符串"只指 `config_options` 里的值。
 - `sysinfo` 键只在设备还没有 sysinfo（`device.sysinfo = ''`）时出现，值固定为 `true`；其余情况必须完全省略这个键，不能发 `false` 或 `null`（客户端只看键在不在，带了就会重传 sysinfo）。响应结构体的可选键一律用 `Option` + `skip_serializing_if`。
 - 心跳更新 `device.last_seen_at`、`ver`、`last_ip`：`ver` 或 `last_ip` 变了、或者库里的 `last_seen_at` 已有 60 秒时才写库，其余心跳只读（心跳 15 秒一次、会话中 3 秒一次，每次写库都要拿写锁，会合模块的注册写库也在等这把锁），所以 `last_seen_at` 最多落后 60 秒。设备行不存在就建，受 §9.3 的行数上限约束。心跳和 sysinfo 写设备行时，`user_id` 为 NULL（含刚建的行）的按 §11 延迟补绑，补绑和写设备行是同一条语句。
-- 客户端 IP（`last_ip` 等）：TCP 对端是回环地址时取 `X-Real-IP`，没有就取 `X-Forwarded-For` 的最后一个地址；否则直接用 TCP 对端地址；取到后规范化（§3）。反代和 porta-server 不在同一台机器的情况第一期不支持。
-  - **硬性部署要求**（审查 D-9）：同机反代转发到 21114（API）和 21118（WebSocket 会合）的每一段 location 都必须用客户端的真实地址覆盖 `X-Real-IP`：nginx 写 `proxy_set_header X-Real-IP $remote_addr;`，Caddy 写 `header_up X-Real-IP {remote_host}`。nginx 默认把客户端自带的请求头原样转发，常见配置只设 `X-Forwarded-For`；Caddy 的 `reverse_proxy` 默认也只设 `X-Forwarded-*`。不覆盖时，客户端每个请求都能自填一个 `X-Real-IP`，porta-server 会照单采信：上报的每来源限速（§9.3）、会合端口的 `IP_BLOCKER`、每来源新 id 限额和按位置选中继（§6、§7）全部能被一个真实 IP 绕开。服务端不做"信任哪个头"的配置项：先取哪个头都不是在所有反代配置下都安全（先取 `X-Forwarded-For` 最后一项时，只设 `X-Real-IP` 的 nginx 会原样透传客户端自带的 `X-Forwarded-For`），所以约束放在部署上。部署后从外网带 `X-Real-IP: 192.0.2.1` 发一次心跳，确认记下的 `last_ip` 是真实地址。
-- sysinfo：存原文，拆出 `hostname`、`username`、`os`、`version`。第三期起 Porta 客户端没有单独的 sysinfo 接口，sysinfo 并进 Porta 心跳（§9.5）。
-- 写设备行的逻辑只有一份（第三期抽出），兼容和 Porta 两条路径都调用：`touch`（心跳写行：上面的"变了才写、`last_seen_at` 60 秒一写"、行数上限、延迟补绑，返回库里现存的 sysinfo 原文）和 `store_sysinfo`（存 sysinfo 的事务）。`client_type` 记的是**最近一次走的路径**：兼容路径写 `rustdesk`，Porta 路径写 `porta`；`touch` 的"什么都没变"条件包括 `client_type` 相同，所以换了路径会立即写一次。
-- 策略永远不下发 `porta-` 开头的键（那是 Porta 客户端自己的选项，例如能力缓存 `porta-api-caps`）：`strategy set`、`strategy unset` 拒收这类键（§14），客户端合并下发时也跳过它们。
+- 客户端 IP（`last_ip` 等）：TCP 对端是回环地址时取 `X-Real-IP`，没有就取 `X-Forwarded-For` 的最后一个地址；否则直接用 TCP 对端地址；取到后规范化（§3）。反代和 leapgate-server 不在同一台机器的情况第一期不支持。
+  - **硬性部署要求**（审查 D-9）：同机反代转发到 21114（API）和 21118（WebSocket 会合）的每一段 location 都必须用客户端的真实地址覆盖 `X-Real-IP`：nginx 写 `proxy_set_header X-Real-IP $remote_addr;`，Caddy 写 `header_up X-Real-IP {remote_host}`。nginx 默认把客户端自带的请求头原样转发，常见配置只设 `X-Forwarded-For`；Caddy 的 `reverse_proxy` 默认也只设 `X-Forwarded-*`。不覆盖时，客户端每个请求都能自填一个 `X-Real-IP`，leapgate-server 会照单采信：上报的每来源限速（§9.3）、会合端口的 `IP_BLOCKER`、每来源新 id 限额和按位置选中继（§6、§7）全部能被一个真实 IP 绕开。服务端不做"信任哪个头"的配置项：先取哪个头都不是在所有反代配置下都安全（先取 `X-Forwarded-For` 最后一项时，只设 `X-Real-IP` 的 nginx 会原样透传客户端自带的 `X-Forwarded-For`），所以约束放在部署上。部署后从外网带 `X-Real-IP: 192.0.2.1` 发一次心跳，确认记下的 `last_ip` 是真实地址。
+- sysinfo：存原文，拆出 `hostname`、`username`、`os`、`version`。第三期起 Leapgate 客户端没有单独的 sysinfo 接口，sysinfo 并进 Leapgate 心跳（§9.5）。
+- 写设备行的逻辑只有一份（第三期抽出），兼容和 Leapgate 两条路径都调用：`touch`（心跳写行：上面的"变了才写、`last_seen_at` 60 秒一写"、行数上限、延迟补绑，返回库里现存的 sysinfo 原文）和 `store_sysinfo`（存 sysinfo 的事务）。`client_type` 记的是**最近一次走的路径**：兼容路径写 `rustdesk`，Leapgate 路径写 `leapgate`；`touch` 的"什么都没变"条件包括 `client_type` 相同，所以换了路径会立即写一次。
+- 策略永远不下发 `leapgate-` 开头的键（那是 Leapgate 客户端自己的选项，例如能力缓存 `leapgate-api-caps`）：`strategy set`、`strategy unset` 拒收这类键（§14），客户端合并下发时也跳过它们。
 
 ## 11. 账号、令牌、密码（`auth.rs`、`account.rs`）
 
@@ -491,7 +491,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 - 登录时把请求体里的设备 `id`/`uuid` 记进令牌行；再做 §9.3 同样的校验：只有 `peer` 表里有这个 id 且 uuid 相符时，才把 `device.user_id` 设成这个用户（设备行不存在就建，建行和上报一样受 §9.3 的行数上限约束：表满且没有可淘汰行时登录照常成功，只是不建行、不绑定，审查 D-7）；uuid 不符时登录照常成功但不改 `device.user_id`（防止别人把你的设备挂到自己名下）；公钥锁定（第三期，§9.5）不影响登录绑定，锁定后照样能凭 uuid 改绑主人。"设备主人"这个身份的加固（已锁定设备的登录不再覆盖已有主人、命令行指定主人）放到第四期，和 Exit Node 一起做；`peer` 表里没有这个 id 时登录照常成功，不建设备行、不绑定（令牌行照样记 id/uuid）。
 - 延迟补绑：登录时还没在 hbbs 注册的设备（例如开着 stop-service 登录、之后才启动服务），由之后的心跳或 sysinfo 补上归属：请求通过 §9.3 的 uuid 校验、且 `device.user_id` 为 NULL（含刚建的行）时，取 `token` 表里 `device_id` = 这个 id、`device_uuid` = 请求里的 uuid、账号 `status = 1` 的令牌中 `last_used_at` 最新的一行，把它的 `user_id` 写进 `device.user_id`。查令牌和写归属在写设备行的同一条语句里完成（`user_id = coalesce(user_id, (select … from token …))`），中间插不进登出（审查 C-24）；心跳只在写库时补绑（§10，最多晚 60 秒）。安全性和登录时绑定相同：令牌行的 uuid 要等于刚和 `peer.uuid` 比对过的那个。已有主人的设备不改。已知边角：A 在设备上登录过、登出请求没送到，B 再登录接管后又登出，下一次心跳会把设备补绑回 A（A 的旧令牌还在）。不处理：登出时连别人的同设备令牌一起删，会让伪造 `device_id` 的人能删掉别人的令牌；归属只决定设备在组面板（§12.3）里列在谁名下，不影响策略和连接权限，而 A 本来就在这台设备上登录过，补错的后果有限。
 - 登出时删掉当前令牌，连同本人 `device_id` 相同、签发不晚于当前令牌（`created_at <= 当前令牌的 created_at`）、而且当前令牌签发以来没再用过（`last_used_at <= 当前令牌的 created_at`）的令牌：一个客户端只持有最新一枚，更早签发又没再用过的是废令牌，留着的话下一次心跳就会把设备补绑回来。签发更晚的（登出请求还在路上时用户重新登录拿到的）和签发后还用过的保留（审查 C-5、C-20）。`device_id` 为空的令牌不受影响。之后若 `device.user_id` 是本人则清空。
-  - 已知边角：同一台机器上多个系统账户登录同一个 Porta 账号时，它们上报的 id、uuid 相同，各自存自己的令牌，服务端分不清。一方登出时，另一方的令牌只要在登出那枚签发之后用过就保留（之后写库的心跳会把设备补绑回这个账号，这是对的）；从那以后一直没用过的会被一起删掉，那个系统账户下次调用接口时收到 401、被客户端登出，重新登录即可。
+  - 已知边角：同一台机器上多个系统账户登录同一个 Leapgate 账号时，它们上报的 id、uuid 相同，各自存自己的令牌，服务端分不清。一方登出时，另一方的令牌只要在登出那枚签发之后用过就保留（之后写库的心跳会把设备补绑回这个账号，这是对的）；从那以后一直没用过的会被一起删掉，那个系统账户下次调用接口时收到 401、被客户端登出，重新登录即可。
   - 另一个边角：用户重新登录的瞬间，还在路上的旧令牌请求晚于新令牌到达，会把旧令牌的 `last_used_at` 推后，让它逃过之后那次登出的删除，并把设备补绑回本人，和延迟补绑那条里的"补绑回 A"同类。
 - 走代理或 WebSocket 的客户端在 hbbs 注册不了（会合模块的 TCP 路径不做注册，§1），`peer` 表里没有它们，所以既不会被绑定，心跳也只拿到 `{}`，收不到策略。
 - 登录请求里的 `id` 超过 253 字节（`MAX_PEER_ID_LEN`）或 `uuid` 超过 128 字节时回 400 + `{"error": "…"}`，不写令牌行（和用户名超长一样，在查库前拒绝）。令牌行的 `device_id` 会被结果记录模块复制进每一行 `conn_attempt`（§8），不限长度时登录一次就能让之后每条连接记录都带着任意长的文本。
@@ -530,7 +530,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
   - `color` 按 i64 存取。
 - 分页和类型严格性按笔记 04 §1.6、§2。`pageSize` 最大 1000，超过的按 1000 截断，`total` 照样是全部条数（客户端写死每页 100，按 `total` 翻页；`/api/ab/peers` 一页的原文和回包都在内存里，见上面的估算）。这个上限对所有分页接口（含 §12.3 组面板）都生效。
 
-### 12.2 用户组（维护者 2026-10-22 定：Porta 也做用户组）
+### 12.2 用户组（维护者 2026-10-22 定：Leapgate 也做用户组）
 - 一个用户可以在多个组里（`group_member`）。共享簿可以授权给组（`ab_rule.group_id`），成员变动后权限立即跟着变。
 - 组只用于授权和组面板可见范围；组的增删、成员管理走命令行。
 
@@ -543,14 +543,14 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 
 ## 13. 密码字段加密（`crypto.rs`）
 
-- 工作目录下的 `porta_secret.key`（32 字节随机数，权限 0600，和 `id_ed25519` 放在一起）。**只有服务模式**在缺失时生成；命令行（含 import）只读已有的文件，不存在就报错退出，提示到服务的工作目录下运行或先启动一次服务（否则在别处跑命令行会多生成一把密钥，导入的密码就解不开了）。服务模式发现文件不存在、库里却已有密文（`select 1 from ab_peer where hash_enc <> '' or password_enc <> '' limit 1` 查到行）时拒绝启动，报错提示恢复密钥文件，或有意清空这两列（已存的密码全部作废）；不生成新密钥。
+- 工作目录下的 `leapgate_secret.key`（32 字节随机数，权限 0600，和 `id_ed25519` 放在一起）。**只有服务模式**在缺失时生成；命令行（含 import）只读已有的文件，不存在就报错退出，提示到服务的工作目录下运行或先启动一次服务（否则在别处跑命令行会多生成一把密钥，导入的密码就解不开了）。服务模式发现文件不存在、库里却已有密文（`select 1 from ab_peer where hash_enc <> '' or password_enc <> '' limit 1` 查到行）时拒绝启动，报错提示恢复密钥文件，或有意清空这两列（已存的密码全部作废）；不生成新密钥。
 - `sodiumoxide::crypto::secretbox`；存储格式 `sb1:` + base64(nonce ‖ 密文)。
 - 加密的字段：`ab_peer.hash_enc`、`ab_peer.password_enc`。服务端运维者本人仍能解开，目的是防数据库文件和备份泄露。
-- 备份数据库时要连同 `porta_secret.key` 一起备份，丢了这个文件，地址簿里的密码就解不开了。`/api/ab/peers` 遇到解不开的值只省略这条的 `hash`/`password` 键并记 warn 日志（簿 guid 和设备 id，不打密文），其余条目照常返回。
+- 备份数据库时要连同 `leapgate_secret.key` 一起备份，丢了这个文件，地址簿里的密码就解不开了。`/api/ab/peers` 遇到解不开的值只省略这条的 `hash`/`password` 键并记 warn 日志（簿 guid 和设备 id，不打密文），其余条目照常返回。
 
 ## 14. 命令行（`src/cli/`）
 
-`porta-server <子命令>`，直接读写同一个数据库（`DB_URL`），打开时执行迁移。需要运行时状态的子命令走本机控制台（127.0.0.1:`port-1`）。密码一律从标准输入读一行，不放在参数里。
+`leapgate-server <子命令>`，直接读写同一个数据库（`DB_URL`），打开时执行迁移。需要运行时状态的子命令走本机控制台（127.0.0.1:`port-1`）。密码一律从标准输入读一行，不放在参数里。
 - `user add <name> [--admin] [--display-name …] [--email …]`、`user passwd <name>`、`user list`、`user disable|enable <name>`、`user admin <name> on|off`、`user del <name>`
 - `group add <name> [--share-devices]`、`group del <name>`、`group list`、`group member add|rm <group> <user>`
 - `ab list`、`ab create <name> --owner <user> [--note …]`、`ab rename <name> <new>`、`ab del <name>`、`ab grant <book> --user <u>|--group <g> ro|rw|full`、`ab revoke <book> --user <u>|--group <g>`
@@ -559,10 +559,10 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 - `device key reset [--forget] <device>`（第三期，§9.5 的公钥锁定）：**只由命令行改库**，能打开数据库文件就是授权；控制台不认证（本机任一进程都能连），所以不提供改库的命令。
   - 默认只清锁定：`update peer set pk_pinned_at = null where id = ?`，保留 uuid 和公钥。用途是卸载时删了配置的重装：uuid 来自机器、不变，重装后的设备按现有规则（同 uuid、同 IP 可以换公钥）保住原 ID。要在旧安装停止运行之后、重装的设备重新注册之前执行：旧安装还在跑时，它下一次签名心跳就把旧公钥重新锁上。已经因 `UUID_MISMATCH` 换成随机 ID 的，reset 后在设备上把 ID 改回原来的。
   - `--forget`：`delete from peer where id = ?`，给 uuid 也变了的情况（换硬件、重装系统）。删行后这个 ID 谁都能注册、抢到的人发一次签名心跳就锁定了自己的公钥，所以只在新设备已经在线（已换成随机 ID）时执行，执行后立刻在设备上把 ID 改回原 ID。`device`、`device_policy`、`strategy_option` 里按 ID 存的行不受影响。
-  - 改完库后连控制台发 `kl <id>`，让运行中的服务按库重载这个条目。回复以 `<id>: ` 开头（服务端的三种正常回复）才算成功，把回复接在输出后面，退出码 0。连不上控制台、或回复是别的（`Failed: …`、空串），库已改好、不回滚，报错说明服务端没有重载、附上回复原文，提示"服务若在运行，需要重启 porta-server 才会生效"，退出码非零。没重载时，解锁也会在设备下一次用新公钥注册时生效（§6 第 7 条：注册前先按库重载锁定的条目）；删行则由服务端在下一次注册时发现行不在、移除条目。
-  - 库里没有这个 ID 时报错，并提示"如果上次重置时服务端没有重载，请重启 porta-server"。ID 为空或含空白（控制台按空格拆命令）时报错。
+  - 改完库后连控制台发 `kl <id>`，让运行中的服务按库重载这个条目。回复以 `<id>: ` 开头（服务端的三种正常回复）才算成功，把回复接在输出后面，退出码 0。连不上控制台、或回复是别的（`Failed: …`、空串），库已改好、不回滚，报错说明服务端没有重载、附上回复原文，提示"服务若在运行，需要重启 leapgate-server 才会生效"，退出码非零。没重载时，解锁也会在设备下一次用新公钥注册时生效（§6 第 7 条：注册前先按库重载锁定的条目）；删行则由服务端在下一次注册时发现行不在、移除条目。
+  - 库里没有这个 ID 时报错，并提示"如果上次重置时服务端没有重载，请重启 leapgate-server"。ID 为空或含空白（控制台按空格拆命令）时报错。
 - 控制台 `kl <id>` / `key-reload <id>`（第三期）：只按库重载内存，谁都能触发，效果只是让内存和库对齐。条目在内存里：库里有行就把内存刷成库里的值（含 `pinned`），回 `<id>: reloaded from the database`；库里没有行就移除条目，回 `<id>: not in the database, dropped from memory`。不在内存里回 `<id>: not in memory, nothing to reload`。走主池（连接任务，不占会合池）。
-- `strategy show [<device>]`（列出生效选项和 rev）、`strategy set <device|'*'> <key> <value>`、`strategy unset <device|'*'> <key>`（写成墓碑 `''`，让客户端删掉这个键；`set`、`unset` 拒收 `porta-` 开头的键，§10）、`strategy forget <device|'*'> <key>`（删行，不再下发这个键；设备级删掉后回到全局值）、`strategy repush <device|'*'>`（递增 epoch）
+- `strategy show [<device>]`（列出生效选项和 rev）、`strategy set <device|'*'> <key> <value>`、`strategy unset <device|'*'> <key>`（写成墓碑 `''`，让客户端删掉这个键；`set`、`unset` 拒收 `leapgate-` 开头的键，§10）、`strategy forget <device|'*'> <key>`（删行，不再下发这个键；设备级删掉后回到全局值）、`strategy repush <device|'*'>`（递增 epoch）
 - `device pin-relay <device> <host|none>`
 - `relay status`（控制台 `rs`；第三期末尾多一行 `measurements: <N> devices, <M> fresh`，§7 第二级）、`route test <ipA> <ipB> [--a <device>] [--b <device>]`（控制台 `tg <ipA> <ipB> <idA|-> <idB|->`，`-` 表示没有；ID 为空、是 `-` 或含空白时报错）。带 ID 时用这两台设备的第二级测量，每台可达中继后面标出两段用的是实测（`rtt 23ms` / `down`）还是估计（`est 21.3ms`，没有位置为 `est ?`），被实测 `down` 去掉的标 `no cost (measured down)`，这一行里用估计的那一端显示 `-`（没参加计算，没有值）；不带 ID 时输出和第一级一样。
 - `geo lookup <ip>`（直接读本地 mmdb：国家、经纬度、ASN、运营商组）、`geo update`（走控制台 `gu`，由服务进程执行下载、校验和热切换并回显结果；连不上控制台即服务没在运行时，才在命令行进程里直接下载，不做目录清理）
@@ -574,7 +574,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 
 ## 15. 从 rustdesk-api 导入（`src/import.rs`）
 
-- 只读打开 rustdesk-api 的 SQLite，按笔记 05 §8 的 SQL 读取（下面写明的地方除外）；Porta 库里已有用户时拒绝执行（只支持往空库导入一次）。`--dry-run` 只打印将导入的数量、冲突和被丢弃的数据。
+- 只读打开 rustdesk-api 的 SQLite，按笔记 05 §8 的 SQL 读取（下面写明的地方除外）；Leapgate 库里已有用户时拒绝执行（只支持往空库导入一次）。`--dry-run` 只打印将导入的数量、冲突和被丢弃的数据。
 - 导入：用户、用户组和成员、个人簿、共享簿、授权规则、条目、标签、设备归属（`peers.user_id`，可选）。令牌、登录日志、审计不导入。导入在一个事务里完成，结束时打印所用密钥文件的绝对路径。
 - 用户：`username→name`、`nickname→display_name`、`email→email`、`remark→note`，avatar 丢弃。`status` 为 1 → 1，其他值（rustdesk-api 的 2=禁用）→ 0；`is_admin` 用 `CAST(is_admin AS INTEGER)`，非 0 → 1。`created_at` 按 `%Y-%m-%d %H:%M:%S%.f%:z` 解析成 unix 秒，NULL 或解析失败用导入时间；其余表的时间一律用导入时间。建立旧 user id → 新 id 的映射。用户名为空或超过 128 字节（§14，登录接口拒绝更长的名字）的用户不导入，写进报告；和其他没导入的用户一样，他们名下的个人簿、共享簿、条目、标签、授权规则一并丢弃，设备照常导入但不设归属。
 - 密码：以 `$2a$`/`$2b$`/`$2y$` 开头的原样写入；恰好 32 位 `[0-9a-f]` 的写成 `md5:` + 原值；空串写 `''`；其他无法识别的非空值写 `''`。密码为 `''` 的用户（含只能靠 OAuth/LDAP 登录的）照样导入，打印清单，提示用 `user passwd` 设密码。登录时按 §11 升级。
@@ -595,8 +595,8 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 - 构建、测试都在 Linux 测试机上跑（`cargo build`、`cargo test`）。每个模块要有单元测试；行为以笔记里的客户端代码为准，不以 rustdesk-api 为准。
 - HTTP 契约测试：用 axum `Router` + 临时 SQLite（`tower::ServiceExt::oneshot`，骨架提供测试辅助），逐条断言 §9.1 的约定（状态码、Content-Type、空 body、字段类型），以及地址簿权限、级联、写接口边界、心跳下发规则（含：sysinfo 已存在时响应里没有 `sysinfo` 键；`modified_at` 是 JSON number）。
 - 会合测试：在回环地址上起真实监听，模拟客户端做 KeyExchange（v0 和 v1 都测）后发 `PunchHoleRequest`，断言 v6 地址被转发、强制中继时被清空、选中的中继符合路由规则（可参照客户端 `src/common.rs` 里的 `rendezvous_stub` 测试写法）。
-- 第三期 01 块（Porta 上报路径）的测试：签名向量和客户端共用一组常量（请求头和响应签名逐字节一致）；验签链每种拒绝原因一条（`bad_auth` 不签名不带 `time`，其余 401 带签名和 `time`）；时间窗用固定 now 测 ±60 接受、±61 拒绝；防重放（乱序 30 秒、64 条后 `floor` 抬升、4096 台时淘汰最久未见）；锁定（首个合法请求后库和内存都锁定、从库重新加载的条目也是锁定、公钥已换时条件更新 0 行请求仍成功、库层守卫挡住旧快照换公钥、只换 IP 照常、行已删回 `SERVER_ERROR`）；会合层（锁定后换公钥回 `UUID_MISMATCH`、换 IP OK、不经控制台改库后注册以库为准、锁定条目的重载计入查库预算、已删行的换 IP 注册回 `SERVER_ERROR`）；防降级（锁定后兼容心跳 `{}`、sysinfo 403、审计不入库、登录照样绑定）；Porta 心跳（`need_sysinfo`、sysinfo 逐字节存、哈希、按 rev 下发策略、`client_type` 切换、响应签名可验、坏请求体、`porta_hb`）；Porta 审计（nonce 两路共用、写库失败 503 且 nonce 不登记、体里 `id` 被忽略、`note` 不走备注分支）；中间件（413/405 的 Porta 格式、超时和 panic 回 503、未知路径 404）；命令行（`device key` 输出、`device key reset` 改库加 `kl` 重载、回复校验、连不上控制台时报错）；迁移 0004 在第一期的库上执行。
-- 第三期 02 块（路由第二级）的测试：`cost::score` 的整端替换（两端、单端、测量没覆盖全部候选退回估计、`down` 去掉候选、全部 `down` 忽略、先 A 后 B、两端都没位置但一端有实测仍有代价、选中那台的两段）；测量表（版本不符、`age_s > 900`、不认识的原串、毫秒越界、形状不对都不影响别的条目，15 分钟按测量时刻过期，满 1 万条先删过期再删最老）；列表版本（同一列表同一值、`rs` 换列表变、空列表非 0、超过 32 台只算前 32）；`select` 用两端测量、固定中继仍优先、换列表后旧测量不用；Porta 心跳（`routing_rev` 相同不带 `routing`、不同带，坏 `probes` 照常 200，测量记在验签得到的 ID 下）；打洞请求带 `porta_from_id` 时 `conn_attempt` 记 `rtt` 和两段、超长按空串；控制台 `tg` 和命令行 `route test` 带不带 ID；迁移 0005 在第一期的库上执行。关键断言做过变异验证。
+- 第三期 01 块（Leapgate 上报路径）的测试：签名向量和客户端共用一组常量（请求头和响应签名逐字节一致）；验签链每种拒绝原因一条（`bad_auth` 不签名不带 `time`，其余 401 带签名和 `time`）；时间窗用固定 now 测 ±60 接受、±61 拒绝；防重放（乱序 30 秒、64 条后 `floor` 抬升、4096 台时淘汰最久未见）；锁定（首个合法请求后库和内存都锁定、从库重新加载的条目也是锁定、公钥已换时条件更新 0 行请求仍成功、库层守卫挡住旧快照换公钥、只换 IP 照常、行已删回 `SERVER_ERROR`）；会合层（锁定后换公钥回 `UUID_MISMATCH`、换 IP OK、不经控制台改库后注册以库为准、锁定条目的重载计入查库预算、已删行的换 IP 注册回 `SERVER_ERROR`）；防降级（锁定后兼容心跳 `{}`、sysinfo 403、审计不入库、登录照样绑定）；Leapgate 心跳（`need_sysinfo`、sysinfo 逐字节存、哈希、按 rev 下发策略、`client_type` 切换、响应签名可验、坏请求体、`leapgate_hb`）；Leapgate 审计（nonce 两路共用、写库失败 503 且 nonce 不登记、体里 `id` 被忽略、`note` 不走备注分支）；中间件（413/405 的 Leapgate 格式、超时和 panic 回 503、未知路径 404）；命令行（`device key` 输出、`device key reset` 改库加 `kl` 重载、回复校验、连不上控制台时报错）；迁移 0004 在第一期的库上执行。
+- 第三期 02 块（路由第二级）的测试：`cost::score` 的整端替换（两端、单端、测量没覆盖全部候选退回估计、`down` 去掉候选、全部 `down` 忽略、先 A 后 B、两端都没位置但一端有实测仍有代价、选中那台的两段）；测量表（版本不符、`age_s > 900`、不认识的原串、毫秒越界、形状不对都不影响别的条目，15 分钟按测量时刻过期，满 1 万条先删过期再删最老）；列表版本（同一列表同一值、`rs` 换列表变、空列表非 0、超过 32 台只算前 32）；`select` 用两端测量、固定中继仍优先、换列表后旧测量不用；Leapgate 心跳（`routing_rev` 相同不带 `routing`、不同带，坏 `probes` 照常 200，测量记在验签得到的 ID 下）；打洞请求带 `leapgate_from_id` 时 `conn_attempt` 记 `rtt` 和两段、超长按空串；控制台 `tg` 和命令行 `route test` 带不带 ID；迁移 0005 在第一期的库上执行。关键断言做过变异验证。
 - 第一期验收（部署后由维护者用原版客户端做）：登录、地址簿、设备列表、审计正常；被控端本地写死的中继能被远程清掉；中继按双方位置选择；控制端勾选 IPv6 后两端都有 IPv6 时能直连。
 
 ## 17. 工程约定

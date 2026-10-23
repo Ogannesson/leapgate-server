@@ -1,4 +1,4 @@
-//! Routing level two (PORTA.md §7): each Porta device's latest round of relay measurements, as its
+//! Routing level two (LEAPGATE.md §7): each Leapgate device's latest round of relay measurements, as its
 //! signed heartbeat reported it (`probes`, phase 3 contract 02 §2.2). Memory only, by device id.
 
 use hbb_common::log;
@@ -38,7 +38,7 @@ struct Measured {
     legs: Vec<Leg>,
 }
 
-/// `probes` of the Porta heartbeat; a shape error drops the round.
+/// `probes` of the Leapgate heartbeat; a shape error drops the round.
 #[derive(Deserialize)]
 struct Probes {
     routing_rev: i64,

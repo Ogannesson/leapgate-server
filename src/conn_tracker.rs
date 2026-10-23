@@ -1,4 +1,4 @@
-//! Connection outcome tracking (PORTA.md §8, note 02 §4.4).
+//! Connection outcome tracking (LEAPGATE.md §8, note 02 §4.4).
 //!
 //! The rendezvous hooks H1~H5 call the `on_*` methods; they only touch memory (a std mutex never held
 //! across an await). A sweeper finalizes due attempts every 5 seconds and hands them to a separate
@@ -184,7 +184,7 @@ pub struct RelayRequest {
     pub found_in_memory: bool,
 }
 
-/// Relay fallback statistics over a time range (for `porta-server stats`).
+/// Relay fallback statistics over a time range (for `leapgate-server stats`).
 #[derive(Debug, Clone, Default)]
 pub struct Stats {
     /// Count per `conn_attempt.outcome`.

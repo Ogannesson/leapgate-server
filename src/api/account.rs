@@ -1,4 +1,4 @@
-//! Account endpoints (PORTA.md §9.2, §11; note 03 §2).
+//! Account endpoints (LEAPGATE.md §9.2, §11; note 03 §2).
 
 use super::{
     device::{make_room, uuid_matches, UuidCheck, BEGIN_WRITE, MAX_UUID_LEN},

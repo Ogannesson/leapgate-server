@@ -99,18 +99,18 @@ pub(crate) struct Peer {
     /// The row's `pk_pinned_at` is set: a `RegisterPk` with another key is refused. A copy of the
     /// database, which alone decides (`Database::update_pk`); this one only saves a write bound to fail.
     pub(crate) pinned: bool,
-    /// The last signed Porta heartbeat (`api::device::porta_heartbeat`), memory only: gone with the
+    /// The last signed Leapgate heartbeat (`api::device::leapgate_heartbeat`), memory only: gone with the
     /// entry, written again by the next heartbeat. Read by the UDP punch work (phase 3 block 04).
     #[allow(dead_code)]
-    pub(crate) porta_hb: Option<PortaHb>,
+    pub(crate) leapgate_hb: Option<LeapgateHb>,
 }
 
-/// A signed Porta heartbeat: when, and the Porta version it reported (`get_version_number` of the
-/// client's `libs/porta` version, 0 when unreadable).
+/// A signed Leapgate heartbeat: when, and the Leapgate version it reported (`get_version_number` of the
+/// client's `libs/leapgate` version, 0 when unreadable).
 #[allow(dead_code)]
-pub(crate) struct PortaHb {
+pub(crate) struct LeapgateHb {
     pub at: Instant,
-    pub porta_ver: u32,
+    pub leapgate_ver: u32,
 }
 
 impl Default for Peer {
@@ -126,7 +126,7 @@ impl Default for Peer {
             // disabled: false,
             reg_pk: (0, get_expired_time()),
             pinned: false,
-            porta_hb: None,
+            leapgate_hb: None,
         }
     }
 }
@@ -136,7 +136,7 @@ pub(crate) type LockPeer = Arc<RwLock<Peer>>;
 #[derive(Clone)]
 pub(crate) struct PeerMap {
     map: Arc<RwLock<HashMap<String, LockPeer>>>,
-    /// The rendezvous pool (PORTA.md §4.1): `io_loop`'s lookups and writes only.
+    /// The rendezvous pool (LEAPGATE.md §4.1): `io_loop`'s lookups and writes only.
     pub(crate) db: database::Database,
     /// The main pool, for the lookups of the rendezvous ports' connection tasks (`get_from_main`):
     /// on the rendezvous pool, a flood of them would queue `io_loop` behind it (review D-15).

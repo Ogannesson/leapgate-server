@@ -234,8 +234,8 @@ const MAX_RELAY_TEXT: usize = 64;
 /// Longest `AddrMangle` encoding: a v6 address is 16 bytes of IP + 2 of port, a v4 one at most
 /// 11 (hbb_common `AddrMangle::encode`). A longer value is not an address.
 const MAX_MANGLED_ADDR: usize = 18;
-/// LAN candidates relayed from `LocalAddr.porta_local_addrs`; a Porta client sends at most 8
-/// (`client/PORTA.md` §3.3).
+/// LAN candidates relayed from `LocalAddr.leapgate_local_addrs`; a Leapgate client sends at most 8
+/// (`client/LEAPGATE.md` §3.3).
 const MAX_LAN_CANDIDATES: usize = 8;
 static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
 
@@ -1088,9 +1088,9 @@ impl RendezvousServer {
             pk: self.get_pk(&la.version, la.id).await,
             relay_server: la.relay_server,
             socket_addr_v6: la.socket_addr_v6,
-            // Porta clients' LAN candidates, passed on undecoded (`client/PORTA.md` §3).
-            porta_local_addrs: la
-                .porta_local_addrs
+            // Leapgate clients' LAN candidates, passed on undecoded (`client/LEAPGATE.md` §3).
+            leapgate_local_addrs: la
+                .leapgate_local_addrs
                 .into_iter()
                 .filter(|a| a.len() <= MAX_MANGLED_ADDR)
                 .take(MAX_LAN_CANDIDATES)
@@ -1161,15 +1161,15 @@ impl RendezvousServer {
             ph.socket_addr_v6 = Default::default();
         }
         let id = ph.id;
-        // porta: A's own id (routing level two); an overlong one is no id
-        let a_id = if ph.porta_from_id.len() <= MAX_PEER_ID_LEN { ph.porta_from_id.as_str() } else { "" };
+        // leapgate: A's own id (routing level two); an overlong one is no id
+        let a_id = if ph.leapgate_from_id.len() <= MAX_PEER_ID_LEN { ph.leapgate_from_id.as_str() } else { "" };
         // punch hole request from A, relay to B,
         // check if in same intranet first,
         // fetch local addrs if in same intranet.
         // because punch hole won't work if in the same intranet,
         // all routers will drop such self-connections.
         // A failed lookup is not "no such id": no answer, the client times out and may retry.
-        // Through the main pool: this runs in a connection task (review D-15, PORTA.md §4.1).
+        // Through the main pool: this runs in a connection task (review D-15, LEAPGATE.md §4.1).
         if let Some(peer) = self.pm.get_from_main(&id).await.inspect_err(|err| {
             throttled_log!(
                 Duration::from_secs(60),
@@ -1244,7 +1244,7 @@ impl RendezvousServer {
             track.route_reason = route.reason;
             track.route_a_ms = route.a_ms;
             track.route_b_ms = route.b_ms;
-            // udp_port and the WebRTC offer are not forwarded (PORTA.md §6.2)
+            // udp_port and the WebRTC offer are not forwarded (LEAPGATE.md §6.2)
             if same_intranet {
                 log::debug!(
                     "Fetch local addr {:?} {:?} request from {:?}",
@@ -1877,7 +1877,7 @@ impl RendezvousServer {
 /// X-Real-IP / X-Forwarded-For keep the real client IP behind a reverse proxy (WSS) on the
 /// same host. They are only trusted from a loopback peer: anyone reaching this port directly
 /// could spoof an arbitrary IP otherwise, which would steer relay selection and bypass
-/// IP-based limits (PORTA.md §6.5a).
+/// IP-based limits (LEAPGATE.md §6.5a).
 /// https://github.com/rustdesk/rustdesk-server/issues/634
 fn ws_client_addr(addr: SocketAddr, headers: &tungstenite::http::HeaderMap) -> SocketAddr {
     if !try_into_v4(addr).ip().is_loopback() {
@@ -2368,7 +2368,7 @@ mod tests {
         assert_eq!(AddrMangle::decode(&res.socket_addr), "192.168.1.2:21118".parse().unwrap());
         assert_eq!(res.socket_addr_v6, mangle("[2001:db8::b]:40002"));
         // An upstream client sends no candidates: none in the response either.
-        assert!(res.porta_local_addrs.is_empty());
+        assert!(res.leapgate_local_addrs.is_empty());
     }
 
     #[hbb_common::tokio::test]
@@ -2396,7 +2396,7 @@ mod tests {
             local_addr: sent[0].clone(),
             id: "B1".to_owned(),
             version: "1.4.2".to_owned(),
-            porta_local_addrs: sent.clone(),
+            leapgate_local_addrs: sent.clone(),
             ..Default::default()
         });
         b_sends(&h, la).await;
@@ -2408,7 +2408,7 @@ mod tests {
         let mut expected = sent.clone();
         expected.remove(1);
         expected.truncate(MAX_LAN_CANDIDATES);
-        assert_eq!(res.porta_local_addrs, expected);
+        assert_eq!(res.leapgate_local_addrs, expected);
     }
 
     #[test]
@@ -2461,8 +2461,8 @@ mod tests {
         assert!(h.rs.check_cmd("rs").await.ends_with("measurements: 1 devices, 1 fresh\n"));
     }
 
-    /// Routing level two through a punch request: `porta_from_id` picks A's measurements, and the
-    /// record gets the reason and both legs; an overlong `porta_from_id` counts as none.
+    /// Routing level two through a punch request: `leapgate_from_id` picks A's measurements, and the
+    /// record gets the reason and both legs; an overlong `leapgate_from_id` counts as none.
     #[hbb_common::tokio::test]
     async fn punch_request_uses_both_measurements() {
         let mut h = harness(true, None).await;
@@ -2477,7 +2477,7 @@ mod tests {
         h.online("devB02", "8.8.4.4:5000").await;
         for (b, from) in [("devB01", "devA01".to_owned()), ("devB02", long.clone())] {
             let mut msg = punch_request(b);
-            msg.mut_punch_hole_request().porta_from_id = from;
+            msg.mut_punch_hole_request().leapgate_from_id = from;
             let mut a = h.connect(Client::V1).await;
             a.send(&msg).await.unwrap();
             let (msg, _) = h.to_b().await;
@@ -3140,7 +3140,7 @@ mod tests {
         assert!(answered, "the slot comes back once the first connection ends");
     }
 
-    /// Review C-28: the 5-minute cleanup (`purge_ip_maps`) rules of PORTA.md §6 item 7.
+    /// Review C-28: the 5-minute cleanup (`purge_ip_maps`) rules of LEAPGATE.md §6 item 7.
     #[test]
     fn ip_map_cleanup_rules() {
         use std::collections::HashSet;

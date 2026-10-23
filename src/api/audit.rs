@@ -1,12 +1,12 @@
-//! Audit reports (PORTA.md §9.3; note 03 §5).
+//! Audit reports (LEAPGATE.md §9.3; note 03 §5).
 //! Success: 200 + empty body (`ok_empty`); internal error or over the source's report budget: 200 +
 //! `{"error"}` (`ok_internal`, `admit`; the client retries); bad body: 400. Handlers return
 //! `Response` so `?` cannot produce a plain 400.
-//! The Porta clients' signed audits (`porta_*`, phase 3 contract 01 §3.7) write the same way:
+//! The Leapgate clients' signed audits (`leapgate_*`, phase 3 contract 01 §3.7) write the same way:
 //! signed 200 + `{"api":1}`, 503 on a failed write.
 
 use super::{
-    devauth::{parse_body, porta_internal, signed_json, SignedBody},
+    devauth::{parse_body, leapgate_internal, signed_json, SignedBody},
     device::{report_allowed, uuid_matches, UuidCheck},
     ok_empty, ok_error, ok_internal, parse_json, ClientIp,
 };
@@ -255,7 +255,7 @@ enum Identity<'a> {
     /// A compatibility report: passes on `uuid_matches` giving `Match` only (an unregistered id, a
     /// wrong uuid, or a device whose key is pinned is skipped).
     Compat { uuid: Option<&'a str> },
-    /// A Porta report whose signature verified (`SignedBody`): nothing more to check.
+    /// A Leapgate report whose signature verified (`SignedBody`): nothing more to check.
     Verified,
 }
 
@@ -306,13 +306,13 @@ fn compat_answer(outcome: ReportOutcome) -> Response {
     }
 }
 
-/// A Porta audit's answer: signed 200 + `{"api":1}`, or 503 (the client retries).
-fn porta_answer(state: &AppState, signed: &SignedBody, outcome: ReportOutcome) -> Response {
+/// A Leapgate audit's answer: signed 200 + `{"api":1}`, or 503 (the client retries).
+fn leapgate_answer(state: &AppState, signed: &SignedBody, outcome: ReportOutcome) -> Response {
     match outcome {
         ReportOutcome::Written | ReportOutcome::Skipped => {
             signed_json(state, &signed.sig, StatusCode::OK, &serde_json::json!({ "api": 1 }))
         }
-        ReportOutcome::Failed(err) => porta_internal(err),
+        ReportOutcome::Failed(err) => leapgate_internal(err),
     }
 }
 
@@ -322,7 +322,7 @@ fn porta_answer(state: &AppState, signed: &SignedBody, outcome: ReportOutcome) -
 /// 2 MB body into ~80 MB of `Value`s, before any identity check).
 #[derive(Deserialize)]
 struct ConnReq {
-    /// Missing: `""`, which no registered device has. On the Porta path the signed id replaces it.
+    /// Missing: `""`, which no registered device has. On the Leapgate path the signed id replaces it.
     #[serde(default)]
     id: String,
     uuid: Option<String>,
@@ -376,9 +376,9 @@ pub(crate) async fn conn(State(state): State<AppState>, ClientIp(ip): ClientIp, 
     compat_answer(conn_inner(db, &req, identity).await)
 }
 
-/// `POST /api/porta/v1/audit/conn`: new / authed / close of a signed device; no note branch (a `note`
+/// `POST /api/leapgate/v1/audit/conn`: new / authed / close of a signed device; no note branch (a `note`
 /// key is ignored).
-pub(crate) async fn porta_conn(State(state): State<AppState>, signed: SignedBody) -> Response {
+pub(crate) async fn leapgate_conn(State(state): State<AppState>, signed: SignedBody) -> Response {
     let mut req: ConnReq = match parse_body(&signed.body) {
         Ok(req) => req,
         Err(resp) => return resp,
@@ -386,7 +386,7 @@ pub(crate) async fn porta_conn(State(state): State<AppState>, signed: SignedBody
     req.id.clone_from(&signed.id);
     clip_conn(&mut req);
     let outcome = conn_inner(&state.db, &req, Identity::Verified).await;
-    porta_answer(&state, &signed, outcome)
+    leapgate_answer(&state, &signed, outcome)
 }
 
 fn clip_conn(req: &mut ConnReq) {
@@ -509,15 +509,15 @@ pub(crate) async fn file(State(state): State<AppState>, ClientIp(ip): ClientIp, 
     compat_answer(file_inner(&state.db, req, Identity::Compat { uuid: uuid.as_deref() }).await)
 }
 
-/// `POST /api/porta/v1/audit/file`.
-pub(crate) async fn porta_file(State(state): State<AppState>, signed: SignedBody) -> Response {
+/// `POST /api/leapgate/v1/audit/file`.
+pub(crate) async fn leapgate_file(State(state): State<AppState>, signed: SignedBody) -> Response {
     let mut req: FileReq = match parse_body(&signed.body) {
         Ok(req) => req,
         Err(resp) => return resp,
     };
     req.id.clone_from(&signed.id);
     let outcome = file_inner(&state.db, req, Identity::Verified).await;
-    porta_answer(&state, &signed, outcome)
+    leapgate_answer(&state, &signed, outcome)
 }
 
 async fn file_inner(db: &SqlitePool, mut req: FileReq, identity: Identity<'_>) -> ReportOutcome {
@@ -568,15 +568,15 @@ pub(crate) async fn alarm(State(state): State<AppState>, ClientIp(ip): ClientIp,
     compat_answer(alarm_inner(&state.db, req, Identity::Compat { uuid: uuid.as_deref() }).await)
 }
 
-/// `POST /api/porta/v1/audit/alarm`.
-pub(crate) async fn porta_alarm(State(state): State<AppState>, signed: SignedBody) -> Response {
+/// `POST /api/leapgate/v1/audit/alarm`.
+pub(crate) async fn leapgate_alarm(State(state): State<AppState>, signed: SignedBody) -> Response {
     let mut req: AlarmReq = match parse_body(&signed.body) {
         Ok(req) => req,
         Err(resp) => return resp,
     };
     req.id.clone_from(&signed.id);
     let outcome = alarm_inner(&state.db, req, Identity::Verified).await;
-    porta_answer(&state, &signed, outcome)
+    leapgate_answer(&state, &signed, outcome)
 }
 
 async fn alarm_inner(db: &SqlitePool, mut req: AlarmReq, identity: Identity<'_>) -> ReportOutcome {
@@ -1197,32 +1197,32 @@ mod tests {
     }
 
     /// Signed 200 + `{"api":1}`.
-    fn assert_porta_ok(t: &testutil::TestApp, r: &testutil::PortaResp) {
+    fn assert_leapgate_ok(t: &testutil::TestApp, r: &testutil::LeapgateResp) {
         assert_eq!(r.status, StatusCode::OK, "{}", String::from_utf8_lossy(&r.body));
         assert_eq!(&r.body[..], br#"{"api":1}"#);
         assert!(testutil::verify_server_sig(&t.state, &r.sig, &r.headers, &r.body));
     }
 
     #[tokio::test]
-    async fn porta_audits() {
+    async fn leapgate_audits() {
         let t = testutil::app().await;
         let db = &t.state.db;
-        let dev = testutil::porta_device(&t.state, "pa0001", UUID).await;
+        let dev = testutil::leapgate_device(&t.state, "pa0001", UUID).await;
 
         // A nonce first seen on the compatibility path (before the key is pinned) is not stored again.
         let n = nonce();
         ok(&t.app, "/api/audit/file", file_body("pa0001", Some(UUID), Some(&n))).await;
         let r = dev.post(&t.app, "audit/file", file_body("pa0001", None, Some(&n)).to_string().as_bytes()).await;
-        assert_porta_ok(&t, &r);
+        assert_leapgate_ok(&t, &r);
         assert_eq!(count(db, "audit_file").await, 1);
 
         // The id in the body is ignored: stored under the signed one.
         let r = dev.post(&t.app, "audit/file", file_body("someone", None, Some(&nonce())).to_string().as_bytes()).await;
-        assert_porta_ok(&t, &r);
+        assert_leapgate_ok(&t, &r);
         let ids: Vec<String> = sqlx::query_scalar("select device_id from audit_file").fetch_all(db).await.unwrap();
         assert_eq!(ids, ["pa0001", "pa0001"]);
         let r = dev.post(&t.app, "audit/alarm", br#"{"typ":3,"info":"x","conn_id":2}"#).await;
-        assert_porta_ok(&t, &r);
+        assert_leapgate_ok(&t, &r);
         let alarm: (String, i64) = sqlx::query_as("select device_id, typ from audit_alarm").fetch_one(db).await.unwrap();
         assert_eq!(alarm, ("pa0001".into(), 3));
 
@@ -1238,8 +1238,8 @@ mod tests {
         // Signed a second later than the first try, as the client's retry is (the same signature
         // within one second would be a replay).
         let (auth, sig) = dev.auth("audit/file", crate::common::now() as i64 + 1, body.as_bytes());
-        let (status, headers, resp) = testutil::send_porta(&t.app, "/api/porta/v1/audit/file", Some(&auth), body.as_bytes()).await;
-        assert_porta_ok(&t, &testutil::PortaResp { status, headers, body: resp, sig });
+        let (status, headers, resp) = testutil::send_leapgate(&t.app, "/api/leapgate/v1/audit/file", Some(&auth), body.as_bytes()).await;
+        assert_leapgate_ok(&t, &testutil::LeapgateResp { status, headers, body: resp, sig });
         assert_eq!(count(db, "audit_file").await, 3);
 
         // conn: new / authed / close as on the compatibility path, and no note branch: a body with a
@@ -1249,7 +1249,7 @@ mod tests {
             json!({"conn_id": 1, "session_id": 77, "peer": ["999", "bob"], "type": 0}),
             json!({"note": "hi", "session_id": 77, "conn_id": 2}),
         ] {
-            assert_porta_ok(&t, &dev.post(&t.app, "audit/conn", body.to_string().as_bytes()).await);
+            assert_leapgate_ok(&t, &dev.post(&t.app, "audit/conn", body.to_string().as_bytes()).await);
         }
         let rows: Vec<(String, i64, String, String, String)> =
             sqlx::query_as("select device_id, conn_id, session_id, peer_id, note from audit_conn order by id")

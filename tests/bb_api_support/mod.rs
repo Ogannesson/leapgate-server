@@ -1,5 +1,5 @@
-//! bb_api 黑盒测试的辅助代码：起真实的 porta-server 进程，直接读写它的 SQLite，按客户端的样子发 HTTP/UDP。
-//! 只依据 PORTA.md 契约、笔记 01/03 和上游客户端代码，不依赖任何模块的实现。
+//! bb_api 黑盒测试的辅助代码：起真实的 leapgate-server 进程，直接读写它的 SQLite，按客户端的样子发 HTTP/UDP。
+//! 只依据 LEAPGATE.md 契约、笔记 01/03 和上游客户端代码，不依赖任何模块的实现。
 
 #![allow(dead_code)]
 
@@ -183,14 +183,14 @@ pub fn expected_rev(options: &BTreeMap<String, String>, global_epoch: i64, devic
     }
 }
 
-/// 在 `dir` 里起 porta-server：`-p port`、`TEST_HBBS=no`、库是 `dir/db_v2.sqlite3`，输出追加到 `dir/server.log`。
+/// 在 `dir` 里起 leapgate-server：`-p port`、`TEST_HBBS=no`、库是 `dir/db_v2.sqlite3`，输出追加到 `dir/server.log`。
 fn spawn(dir: &tempfile::TempDir, port: u16) -> Child {
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(dir.path().join("server.log"))
         .unwrap();
-    Command::new(env!("CARGO_BIN_EXE_porta-server"))
+    Command::new(env!("CARGO_BIN_EXE_leapgate-server"))
         .arg("-p")
         .arg(port.to_string())
         .current_dir(dir.path())
@@ -206,7 +206,7 @@ fn spawn(dir: &tempfile::TempDir, port: u16) -> Child {
         .unwrap()
 }
 
-/// 一个真实的 porta-server 进程：临时工作目录、`-p P`、`TEST_HBBS=no`、`porta.toml` 里 `[geo] auto_update = false`。
+/// 一个真实的 leapgate-server 进程：临时工作目录、`-p P`、`TEST_HBBS=no`、`leapgate.toml` 里 `[geo] auto_update = false`。
 pub struct Server {
     pub dir: tempfile::TempDir,
     child: Child,
@@ -222,12 +222,12 @@ impl Server {
         Self::start_with("").await
     }
 
-    /// `extra_toml` 追加到 `porta.toml`（`[geo]` 段已经写好）。
+    /// `extra_toml` 追加到 `leapgate.toml`（`[geo]` 段已经写好）。
     pub async fn start_with(extra_toml: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let port = pick_port();
         std::fs::write(
-            dir.path().join("porta.toml"),
+            dir.path().join("leapgate.toml"),
             format!("[geo]\nauto_update = false\n\n{extra_toml}\n"),
         )
         .unwrap();
@@ -281,13 +281,13 @@ impl Server {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             if let Some(status) = self.child.try_wait().unwrap() {
-                panic!("porta-server exited early ({status}):\n{}", self.log());
+                panic!("leapgate-server exited early ({status}):\n{}", self.log());
             }
             if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
                 return;
             }
             if Instant::now() > deadline {
-                panic!("porta-server API did not come up on {addr}:\n{}", self.log());
+                panic!("leapgate-server API did not come up on {addr}:\n{}", self.log());
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -626,7 +626,7 @@ impl Drop for Server {
         if std::thread::panicking() {
             let log = self.log();
             let tail: Vec<&str> = log.lines().rev().take(40).collect();
-            eprintln!("---- porta-server log (last 40 lines, port {}) ----", self.port);
+            eprintln!("---- leapgate-server log (last 40 lines, port {}) ----", self.port);
             for line in tail.iter().rev() {
                 eprintln!("{line}");
             }

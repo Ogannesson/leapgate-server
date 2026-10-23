@@ -1,4 +1,4 @@
-//! `porta.toml`: Porta's own structured configuration (PORTA.md §5).
+//! `leapgate.toml`: Leapgate's own structured configuration (LEAPGATE.md §5).
 //! hbbs' original arguments (`-p`, `-k`, `-r`, `DB_URL`, `.env`, ...) are unchanged and read via `get_arg`.
 
 use hbb_common::{anyhow::Context, ResultType};
@@ -232,9 +232,9 @@ where
 }
 
 impl Config {
-    /// Reads `--porta-config` (default `porta.toml`) and `-r`.
+    /// Reads `--leapgate-config` (default `leapgate.toml`) and `-r`.
     pub fn from_args() -> ResultType<Self> {
-        let path = crate::common::get_arg_or("porta-config", "porta.toml".to_owned());
+        let path = crate::common::get_arg_or("leapgate-config", "leapgate.toml".to_owned());
         Self::load(Path::new(&path), &crate::common::get_arg("relay-servers"))
     }
 
@@ -286,7 +286,7 @@ mod tests {
     fn missing_file_uses_defaults_and_cli_relays() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = Config::load(
-            &dir.path().join("porta.toml"),
+            &dir.path().join("leapgate.toml"),
             "a.example:21117, b.example,,a.example:21117",
         )
         .unwrap();
@@ -318,7 +318,7 @@ mod tests {
     #[test]
     fn full_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("porta.toml");
+        let path = dir.path().join("leapgate.toml");
         std::fs::write(
             &path,
             r#"
