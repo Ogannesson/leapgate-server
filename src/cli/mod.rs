@@ -93,7 +93,14 @@ pub fn run(argv: Vec<String>) -> ResultType<()> {
                     secret_key: PathBuf::from(crate::crypto::SECRET_KEY_FILE),
                 };
                 let stdin = std::io::stdin();
-                exec(&ctx, args, &mut stdin.lock()).await?
+                let out = exec(&ctx, args, &mut stdin.lock()).await;
+                // No automatic checkpoints (PORTA.md §4.1), and dropping the pool does not wait for
+                // the connections to close: copy the WAL into the database before exiting, so that
+                // with the service stopped the database file alone has every change. PASSIVE: with
+                // the service running it holds up no writer (its own task checkpoints then).
+                let _ = sqlx::query("pragma wal_checkpoint(passive)").execute(&ctx.db).await;
+                ctx.db.close().await;
+                out?
             }
         };
         if changes {

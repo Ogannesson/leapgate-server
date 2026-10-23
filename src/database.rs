@@ -92,8 +92,8 @@ pub(crate) async fn open(url: &str, create: bool) -> ResultType<SqlitePool> {
         .synchronous(SqliteSynchronous::Normal)
         .busy_timeout(Duration::from_secs(5))
         .pragma("journal_size_limit", JOURNAL_SIZE_LIMIT.to_string())
-        // `spawn_checkpoints` checkpoints instead (the command line has none: closing its last
-        // connection checkpoints and removes the WAL, as with any SQLite database).
+        // `spawn_checkpoints` checkpoints instead; the command line checkpoints once before exiting
+        // (`cli::run`).
         .pragma("wal_autocheckpoint", "0")
         .foreign_keys(true)
         .log_statements(log::LevelFilter::Debug);

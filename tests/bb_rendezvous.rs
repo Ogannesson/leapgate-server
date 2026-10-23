@@ -819,13 +819,14 @@ async fn first_byte(server: &Server, timeout_ms: u64) -> Option<Duration> {
 /// `RegisterPk` 不能让会合主循环跟着等库：它自己、同时到的 `RegisterPeer` 回包、21116 新连接的
 /// 首字节都要在几十毫秒内。会合用自己的小连接池，不和 API 排同一个队（PORTA.md §4.1）。洪水请求
 /// 各带一个来源，每条都真的写库；测量期写库次数为 0 时测试判失败（审查 D-1/D-17）。
-/// `RegisterPk` 的设备只在库里、不在内存里（服务重启后的样子），uuid、pk、IP 都对得上，只查库
-/// 不写库：写库还要等 §4.1 的 checkpoint 放开写锁，那不是这里要测的排队。
+/// `RegisterPk` 的设备只在库里、不在内存里（服务重启后的样子），uuid、pk、IP（按服务存的映射地址
+/// 格式）都对得上，只查库不写库：写库还要等 §4.1 的 checkpoint 放开写锁，那不是这里要测的排队。
+/// 测完回查预置行没被改写，确认确实没写库（审查 E-1）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn api_write_flood_does_not_stall_rendezvous() {
     const FLOODERS: usize = 400;
-    // 测试机实测（debug，洪水每秒约 2600 次写库）：会合用自己的池时各次最坏 3~36 ms；退回和 API
-    // 共用主池时每轮 64~148 ms，各次最坏 110~148 ms。
+    // 测试机实测（debug，洪水每秒约 2300~2700 次写库）：会合用自己的池时各次最坏 2~22 ms；退回和
+    // API 共用主池时每轮 64~148 ms，各次最坏 110~148 ms。
     const WORST: Duration = Duration::from_millis(60);
     // 库放在磁盘上（target/tmp）：/tmp 常是 tmpfs，提交不落盘，等库的时间看不出来。
     let disk = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -833,7 +834,7 @@ async fn api_write_flood_does_not_stall_rendezvous() {
     let server = std::sync::Arc::new(
         Server::start(GEO_OFF, &[("DB_URL", db_url.to_str().unwrap())]).await,
     );
-    let mut known = Vec::new();
+    let (mut known, mut known_info) = (Vec::new(), Vec::new());
     {
         let opts = sqlx::sqlite::SqliteConnectOptions::new()
             .filename(&db_url)
@@ -841,15 +842,18 @@ async fn api_write_flood_does_not_stall_rendezvous() {
         let db = sqlx::SqlitePool::connect_with(opts).await.unwrap();
         for i in 0..10 {
             let (id, pk, from) = (unique_id(""), sign::gen_keypair().0 .0, format!("127.0.1.{}", i + 1));
+            // 服务绑双栈 [::]，IPv4 来源存成映射地址（原版会合逻辑的 ip 比较不规范化，PORTA.md §3）。
+            let info = format!(r#"{{"ip":"::ffff:{from}"}}"#);
             sqlx::query("insert into peer(guid, id, uuid, pk, info) values(?, ?, ?, ?, ?)")
                 .bind(hbb_common::rand::random::<[u8; 16]>().to_vec())
                 .bind(&id)
                 .bind(&b"uuid-c21"[..])
                 .bind(&pk[..])
-                .bind(format!(r#"{{"ip":"{from}"}}"#))
+                .bind(&info)
                 .execute(&db)
                 .await
                 .unwrap();
+            known_info.push((id.clone(), info));
             known.push((id, pk, from));
         }
         db.close().await;
@@ -959,6 +963,20 @@ async fn api_write_flood_does_not_stall_rendezvous() {
         "API 洪水拖住了会合主循环：最坏 {worst:?}\n{}",
         lines.join("\n")
     );
+    // 测量期确实只查库（审查 E-1）：预置行的 info 没被改写。改写了说明服务存的 IP 格式和预置的
+    // 不同（比如测试机关了 IPv6，服务退回绑 0.0.0.0），上面测的就成了写库。
+    let opts = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&db_url)
+        .busy_timeout(Duration::from_secs(5));
+    let db = sqlx::SqlitePool::connect_with(opts).await.unwrap();
+    for (id, seeded) in &known_info {
+        let info: String = sqlx::query_scalar("select info from peer where id = ?")
+            .bind(id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(&info, seeded, "{id} 的 info 被改写");
+    }
 }
 
 /// 审查 D-15：持 key 的客户端在 21116 的几百条连接上不停发目标不存在的 `PunchHoleRequest`
@@ -1041,4 +1059,28 @@ async fn punch_lookup_flood_does_not_stall_rendezvous() {
     );
     assert!(n > 0, "测量期服务端没有处理完一条打洞请求，测不到查库排队");
     assert!(worst < WORST, "打洞查库拖住了会合主循环：{rtts:?}");
+}
+
+/// 审查 E-3：服务进程里真的起了 checkpoint 任务（PORTA.md §4.1，每 5 秒一次）。自动 checkpoint
+/// 关掉了，这个任务一丢，`-wal` 只增不减。注册一批新 id（每个写一次库）后不再写，10 秒内 `-wal`
+/// 要被截成 0 字节（或删掉）。测试侧不开连接（它默认自动 checkpoint，会掩盖问题），只看文件大小。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn service_checkpoints_the_wal() {
+    let server = Server::start(GEO_OFF, &[]).await;
+    // 新 id 全服每分钟最多 20 个（PORTA.md §6 第 7 条）。
+    for i in 0..15 {
+        let pk = sign::gen_keypair().0 .0;
+        let from = format!("127.0.3.{}", i + 1);
+        let (res, _) = register_pk_from(&server, &from, &unique_id(""), b"uuid-e3", &pk, 5000).await;
+        assert_eq!(res, Some(register_pk_response::Result::OK), "{from}");
+    }
+    let wal = server.db_path().with_file_name("db_v2.sqlite3-wal");
+    let len = || std::fs::metadata(&wal).map_or(0, |m| m.len());
+    eprintln!("写完时 -wal {} 字节", len());
+    let t = Instant::now();
+    while len() > 0 {
+        assert!(t.elapsed() < Duration::from_secs(10), "10 秒内 -wal 没被截断：{} 字节", len());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    eprintln!("{:?} 后 -wal 截断", t.elapsed());
 }

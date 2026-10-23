@@ -2651,6 +2651,10 @@ mod tests {
             assert_eq!(register_reply(&mut client).await, Some(register_pk_response::Result::OK), "{id}");
         }
         assert!(!h.rs.pm.is_in_memory("dbfail1").await && h.rs.pm.is_in_memory("dbfail2").await);
+        // `get_pk` reads memory only (review D-15/E-10): with both pools still open, a lookup
+        // through either would find dbfail1, load it into memory and sign it.
+        assert!(h.rs.get_pk("1.4.2", "dbfail1".to_owned()).await.is_empty());
+        assert!(!h.rs.pm.is_in_memory("dbfail1").await);
         h.rs.pm.db.close().await;
 
         // A known id the lookup cannot confirm, and a new one: dropped, nothing added.
@@ -2674,7 +2678,8 @@ mod tests {
             let p = p.read().await;
             assert_eq!((&p.uuid[..], &p.pk[..]), (&b"uuid-real"[..], &pk[..]));
         }
-        // `get_pk` reads memory only (review D-15): signs dbfail2, not dbfail1.
+        // With the database failing dbfail1 is still signed nothing (review C-22); dbfail2, in
+        // memory, is signed.
         assert!(h.rs.get_pk("1.4.2", "dbfail1".to_owned()).await.is_empty());
         assert!(!h.rs.get_pk("1.4.2", "dbfail2".to_owned()).await.is_empty());
         // The rows are as registered (read through the API's pool, still open).
