@@ -234,20 +234,26 @@ async fn key_reset(ctx: &Ctx, id: &str, forget: bool) -> ResultType<String> {
         "update peer set pk_pinned_at = null where id = ?"
     };
     if sqlx::query(sql).bind(id).execute(&ctx.db).await?.rows_affected() == 0 {
-        bail!("No registered device {id}");
+        bail!(
+            "No registered device {id}. If an earlier reset of it was not reloaded by the server, \
+             restart porta-server."
+        );
     }
     let done = if forget {
         format!("{id}: forgotten; the next registration of this id is taken as a new device\n")
     } else {
         format!("{id}: key no longer pinned (uuid and key kept); the next signed report pins the key it is signed with\n")
     };
-    match console(ctx.console, &format!("kl {id}"), CONSOLE_WAIT).await {
-        Ok(reply) => Ok(done + &reply),
-        Err(err) => bail!(
-            "{done}The database is changed, but the server did not reload it ({err}).\n\
-             If porta-server is running, restart it for this to take effect."
-        ),
-    }
+    // Every answer of a server that reloaded starts with "<id>: " (`PeerMap::reload_from_main`).
+    let failure = match console(ctx.console, &format!("kl {id}"), CONSOLE_WAIT).await {
+        Ok(reply) if reply.starts_with(&format!("{id}: ")) => return Ok(done + &reply),
+        Ok(reply) => format!("it answered {:?}", reply.trim_end()),
+        Err(err) => err.to_string(),
+    };
+    bail!(
+        "{done}The database is changed, but the server did not reload it ({failure}).\n\
+         If porta-server is running, restart it for this to take effect."
+    )
 }
 
 fn parse_ip(s: &str) -> ResultType<IpAddr> {
@@ -384,6 +390,21 @@ mod tests {
                 let mut buf = [0u8; 1024];
                 let n = s.read(&mut buf).await.unwrap();
                 let reply = format!("got {}", String::from_utf8_lossy(&buf[..n]));
+                s.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        addr
+    }
+
+    /// A console that answers `reply` to anything.
+    async fn console_replying(reply: &'static str) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 1024];
+                s.read(&mut buf).await.unwrap();
                 s.write_all(reply.as_bytes()).await.unwrap();
             }
         });
@@ -585,20 +606,34 @@ mod tests {
         assert!(err.contains("forgotten") && err.contains("restart it"), "{err}");
         assert_eq!(pinned_at(db, "dev001").await, None);
         let err = cli(&ctx, &["device", "key", "reset", "dev001"], "").await.unwrap_err().to_string();
-        assert!(err.contains("No registered device"), "{err}");
+        assert!(err.contains("No registered device") && err.contains("restart porta-server"), "{err}");
         assert!(cli(&ctx, &["device", "key", "reset", "a b"], "").await.is_err());
         assert!(cli(&ctx, &["device", "key", "reset"], "").await.is_err());
 
         // With a server running: the command line changes the database, then the console reloads
-        // the entry (`kl`; the server side is in `rendezvous_server`'s tests).
+        // the entry (`kl`; the server side is in `rendezvous_server`'s tests). The console is sent
+        // `kl <id>` (`fake_console` echoes it).
         let (_dir2, ctx2) = super::super::tests::ctx(fake_console().await).await;
         peer(&ctx2.db, "dev004", b"machine-4", &[0x44; 32], Some(1)).await;
-        let out = cli(&ctx2, &["device", "key", "reset", "dev004"], "").await.unwrap();
-        assert!(out.contains("no longer pinned") && out.ends_with("got kl dev004\n"), "{out}");
-        assert_eq!(pinned_at(&ctx2.db, "dev004").await, Some(None));
-        let out = cli(&ctx2, &["device", "key", "reset", "dev004", "--forget"], "").await.unwrap();
-        assert!(out.contains("forgotten") && out.ends_with("got kl dev004\n"), "{out}");
-        assert_eq!(pinned_at(&ctx2.db, "dev004").await, None);
+        let err = cli(&ctx2, &["device", "key", "reset", "dev004"], "").await.unwrap_err().to_string();
+        assert!(err.contains(r#""got kl dev004""#), "{err}");
+        // Answered like the server: success.
+        let (_dir3, ctx3) = super::super::tests::ctx(console_replying("dev005: reloaded from the database\n").await).await;
+        peer(&ctx3.db, "dev005", b"machine-5", &[0x55; 32], Some(1)).await;
+        let out = cli(&ctx3, &["device", "key", "reset", "dev005"], "").await.unwrap();
+        assert!(out.contains("no longer pinned") && out.ends_with("dev005: reloaded from the database\n"), "{out}");
+        assert_eq!(pinned_at(&ctx3.db, "dev005").await, Some(None));
+        let out = cli(&ctx3, &["device", "key", "reset", "dev005", "--forget"], "").await.unwrap();
+        assert!(out.contains("forgotten"), "{out}");
+        assert_eq!(pinned_at(&ctx3.db, "dev005").await, None);
+        // A failed or empty answer: the change stands, the command fails saying to restart.
+        for reply in ["Failed: x", ""] {
+            let (_dir4, ctx4) = super::super::tests::ctx(console_replying(reply).await).await;
+            peer(&ctx4.db, "dev006", b"machine-6", &[0x66; 32], Some(1)).await;
+            let err = cli(&ctx4, &["device", "key", "reset", "dev006"], "").await.unwrap_err().to_string();
+            assert!(err.contains("restart it") && err.contains(&format!("{reply:?}")), "{err}");
+            assert_eq!(pinned_at(&ctx4.db, "dev006").await, Some(None));
+        }
     }
 
     #[tokio::test]

@@ -649,6 +649,19 @@ impl RendezvousServer {
                         p.pinned && p.pk != rk.pk
                     };
                     if pinned_to_other {
+                        // A database read on `io_loop`: within the global budget (review C-12).
+                        // Not answered from memory instead: after an unpinning memory may lag, and
+                        // UUID_MISMATCH would make the client take a new id.
+                        if !self.lookups.take() {
+                            throttled_log!(
+                                Duration::from_secs(60),
+                                warn,
+                                "RegisterPk: over {} database lookups a second, dropped a pinned-key check from {}",
+                                LOOKUPS_PER_SEC,
+                                ip
+                            );
+                            return Ok(());
+                        }
                         match self.pm.reload(&id, &peer).await {
                             Ok(true) => {}
                             // Deleted (`--forget`): the next round registers the id as new.
@@ -3265,6 +3278,31 @@ mod tests {
         h.rs.handle_udp(&register_pk("reload1", b"uuid-new", &pk3), from, &mut server, "").await.unwrap();
         assert_eq!(register_reply(&mut a).await, Some(register_pk_response::Result::OK));
         assert_eq!(peer_row(&h, "reload1").await, (b"uuid-new".to_vec(), pk3.to_vec(), None));
+    }
+
+    /// Review C-12 kept: the reload of a pinned entry is a database read on `io_loop`, within the
+    /// global lookup budget; over it the packet is dropped unanswered, with no read.
+    #[hbb_common::tokio::test]
+    async fn pinned_key_check_within_the_lookup_budget() {
+        let mut h = harness(true, None).await;
+        let mut server = FramedSocket::new("127.0.0.1:0").await.unwrap();
+        let mut a = FramedSocket::new("127.26.4.1:0").await.unwrap();
+        let from = a.local_addr().unwrap();
+        h.rs.handle_udp(&register_pk("pbudget", b"uuid-pb", &[1u8; 32]), from, &mut server, "").await.unwrap();
+        assert_eq!(register_reply(&mut a).await, Some(register_pk_response::Result::OK));
+        pin(&h, "pbudget").await;
+        // Row deleted, entry kept: a read would find no row, drop the entry and answer SERVER_ERROR.
+        cli_reset(&h, "pbudget", true).await;
+        h.rs.lookups.tokens = 0.0;
+        h.rs.lookups.at = Instant::now() + Duration::from_secs(1);
+        let other = register_pk("pbudget", b"uuid-pb", &[2u8; 32]);
+        h.rs.handle_udp(&other, from, &mut server, "").await.unwrap();
+        assert_eq!(register_reply(&mut a).await, None);
+        assert!(h.rs.pm.is_in_memory("pbudget").await, "no read happened");
+        h.rs.lookups = LookupBudget::new();
+        h.rs.handle_udp(&other, from, &mut server, "").await.unwrap();
+        assert_eq!(register_reply(&mut a).await, Some(register_pk_response::Result::SERVER_ERROR));
+        assert!(!h.rs.pm.is_in_memory("pbudget").await);
     }
 
     /// Review fix: a new address of a device whose row is gone is not answered OK (that entry
