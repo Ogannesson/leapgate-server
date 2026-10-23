@@ -83,6 +83,10 @@
 
 ### 4.2 表结构（`migrations/0001_init.sql` 照此实现，列名、类型、约束不得自行改动）
 
+下面是 `0001` 的原样；之后的迁移只动索引，现行索引以迁移文件为准：
+- `0002`：三张审计表各加 `created_at` 索引（保留期删除，§9.3）；`device_user` 换成 `device_user_seen(user_id, last_seen_at)`。
+- `0003`：`audit_conn_session` 换成 `audit_conn_session_dev(session_id, device_id)`（备注更新，§9.3）；加部分索引 `device_owned_seen(last_seen_at, user_id, id) where user_id is not null`（设备表淘汰）；`token_user` 换成 `token_user_device(user_id, device_id)`。
+
 ```sql
 -- hbbs 原表，原样保留（见笔记 02 §2.4）
 create table if not exists peer ( guid blob primary key not null, id varchar(100) not null, uuid blob not null,
@@ -278,7 +282,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 3. **路由挂钩**：`handle_punch_hole_request` 里调 `router.select(&RouteQuery{a_ip, b_ip, b_id, a_token, conn_type}).await`；`RelayResponse` 分支和控制台 `tg` 也改调 router（`b_id` 传空串）。新增控制台命令 `gu`：让路由模块立即执行一次 GeoIP 下载/重新加载并回显结果（§14 `geo update` 用）。`io_loop` 的中继定时器分支、`Data::RelayServers` 删掉，健康检查挪进 router（笔记 02 §3.5）。控制台 `rs` 无参数时打印 `router.status_text()`。
 4. **结果记录挂钩**：H1~H5 五处调用 `tracker`（笔记 02 §4.4），只取字段、不阻塞（tracker 内部用通道异步落库）。
 5. 修掉控制台 `aur` 把中继列表清空的那一行（笔记 02 §3.4）。
-5a. 21118（WebSocket）只在 TCP 对端是回环地址时才信任 `X-Real-IP`/`X-Forwarded-For`，否则用 TCP 对端地址（原版对任何来源都信任，直连 21118 就能伪造来源 IP，影响按 IP 选中继、限流和记录；笔记 02 §5）。反向代理和 porta-server 同机部署时行为不变。
+5a. 21118（WebSocket）只在 TCP 对端是回环地址时才信任 `X-Real-IP`/`X-Forwarded-For`，否则用 TCP 对端地址（原版对任何来源都信任，直连 21118 就能伪造来源 IP，影响按 IP 选中继、限流和记录；笔记 02 §5）。反向代理和 porta-server 同机部署时行为不变；这时反代转发到 21118 的 location 必须覆盖 `X-Real-IP`（和 21114 同一条硬性部署要求，见 §10），否则客户端自带的头会被原样采信。
 6. 删掉 `check_software_update` 及其调用。
 7. 注册语义不改（`UUID_MISMATCH` 逻辑、每来源每分钟 30 次和每天 300 个新 id 的限额、mask/local_ip、`test_hbbs` 自检照旧），只补边界（审查 A-1/A-5/A-10）：
    - `RegisterPk` 进任何分支之前先校验：`pk` 必须正好 32 字节（客户端发的是 ed25519 公钥 `Config::get_key_pair().1`），`uuid` 非空且不超过 96 字节（客户端发 `get_uuid()`：机器 id，Windows/macOS 36 字节、Linux 32 字节，没有时用 32 字节公钥；96 是 API 那边 128 字节 base64 的原始长度，能注册的设备一定能通过 §9.3 的 uuid 校验）；不合格的静默丢弃：不回包、不写库、不打日志。
