@@ -757,6 +757,7 @@ async fn register_pk_from(
     from: &str,
     id: &str,
     uuid: &[u8],
+    pk: &[u8],
     timeout_ms: u64,
 ) -> (Option<register_pk_response::Result>, Duration) {
     let mut sock = hbb_common::udp::FramedSocket::new(format!("{from}:0")).await.unwrap();
@@ -764,7 +765,7 @@ async fn register_pk_from(
     m.set_register_pk(RegisterPk {
         id: id.to_owned(),
         uuid: uuid.to_vec().into(),
-        pk: sign::gen_keypair().0 .0.to_vec().into(),
+        pk: pk.to_vec().into(),
         ..Default::default()
     });
     let t = Instant::now();
@@ -814,18 +815,45 @@ async fn first_byte(server: &Server, timeout_ms: u64) -> Option<Duration> {
     }
 }
 
-/// 审查 C-21：未认证的 `/api/audit/alarm` 被几百个并发连接灌着（每条两次写库）时，新 id 的
-/// `RegisterPk` 不能让会合主循环跟着等库：同时到的 `RegisterPeer` 回包、21116 新连接的首字节
-/// 都要在几十毫秒内。会合用自己的小连接池，不和 API 排同一个队（PORTA.md §4.1）。
+/// 审查 C-21：未认证的 `/api/audit/alarm` 被几百个并发连接灌着（每条两次写库）时，要查库的
+/// `RegisterPk` 不能让会合主循环跟着等库：它自己、同时到的 `RegisterPeer` 回包、21116 新连接的
+/// 首字节都要在几十毫秒内。会合用自己的小连接池，不和 API 排同一个队（PORTA.md §4.1）。洪水请求
+/// 各带一个来源，每条都真的写库；测量期写库次数为 0 时测试判失败（审查 D-1/D-17）。
+/// `RegisterPk` 的设备只在库里、不在内存里（服务重启后的样子），uuid、pk、IP 都对得上，只查库
+/// 不写库：写库还要等 §4.1 的 checkpoint 放开写锁，那不是这里要测的排队。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn api_write_flood_does_not_stall_rendezvous() {
     const FLOODERS: usize = 400;
+    // 测试机实测（debug，洪水每秒约 2600 次写库）：会合用自己的池时各次最坏 3~36 ms；退回和 API
+    // 共用主池时每轮 64~148 ms，各次最坏 110~148 ms。
+    const WORST: Duration = Duration::from_millis(60);
     // 库放在磁盘上（target/tmp）：/tmp 常是 tmpfs，提交不落盘，等库的时间看不出来。
     let disk = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let db_url = disk.path().join("db_v2.sqlite3");
     let server = std::sync::Arc::new(
         Server::start(GEO_OFF, &[("DB_URL", db_url.to_str().unwrap())]).await,
     );
+    let mut known = Vec::new();
+    {
+        let opts = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db_url)
+            .busy_timeout(Duration::from_secs(5));
+        let db = sqlx::SqlitePool::connect_with(opts).await.unwrap();
+        for i in 0..10 {
+            let (id, pk, from) = (unique_id(""), sign::gen_keypair().0 .0, format!("127.0.1.{}", i + 1));
+            sqlx::query("insert into peer(guid, id, uuid, pk, info) values(?, ?, ?, ?, ?)")
+                .bind(hbb_common::rand::random::<[u8; 16]>().to_vec())
+                .bind(&id)
+                .bind(&b"uuid-c21"[..])
+                .bind(&pk[..])
+                .bind(format!(r#"{{"ip":"{from}"}}"#))
+                .execute(&db)
+                .await
+                .unwrap();
+            known.push((id, pk, from));
+        }
+        db.close().await;
+    }
     // 攻击者先免认证注册一台假设备 X，uuid 就对得上；L 是一台正常在线的设备。
     let x = PeerB::register(&server, &unique_id(""), B_IP).await;
     let l_id = unique_id("");
@@ -840,8 +868,17 @@ async fn api_write_flood_does_not_stall_rendezvous() {
         x.id,
         base64::encode(&x.uuid)
     );
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let sent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed},
+        Arc,
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    // 请求序号（决定来源）；写库成功（200、空 body）和其余响应的次数。
+    let (seq, written, other) = (
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+    );
     let http = reqwest::Client::builder()
         .pool_max_idle_per_host(FLOODERS)
         .timeout(Duration::from_secs(60))
@@ -849,37 +886,42 @@ async fn api_write_flood_does_not_stall_rendezvous() {
         .unwrap();
     let mut flood = Vec::new();
     for _ in 0..FLOODERS {
-        let (http, url, body, stop, sent) = (
+        let (http, url, body, stop, seq, written, other) = (
             http.clone(),
             server.api_url("/api/audit/alarm"),
             body.clone(),
             stop.clone(),
-            sent.clone(),
+            seq.clone(),
+            written.clone(),
+            other.clone(),
         );
         flood.push(tokio::spawn(async move {
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let _ = http
+            while !stop.load(Relaxed) {
+                // 每个请求一个来源（对端是回环，服务端采信 X-Real-IP，§10）：每来源每分钟 1000 次的
+                // 上报限速（§9.3）挡不住，每条都真的写库（审查 D-1/D-17）。
+                let n = seq.fetch_add(1, Relaxed);
+                let ok = http
                     .post(&url)
                     .header("Content-Type", "application/json")
+                    .header("X-Real-IP", format!("198.18.{}.{}", (n >> 8) & 0xff, n & 0xff))
                     .body(body.clone())
                     .send()
-                    .await;
-                sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    .await
+                    .is_ok_and(|r| r.status() == 200 && r.content_length() == Some(0));
+                if ok { &written } else { &other }.fetch_add(1, Relaxed);
             }
         }));
     }
     tokio::time::sleep(Duration::from_secs(3)).await;
-    let flood_start = (Instant::now(), sent.load(std::sync::atomic::Ordering::Relaxed));
+    let flood_start = (Instant::now(), written.load(Relaxed), other.load(Relaxed));
 
     let mut worst = Duration::ZERO;
     let mut lines = Vec::new();
-    for i in 0..10 {
-        // 新 id 的 RegisterPk（每次换来源，远低于每来源限额），20 ms 后测 L 的心跳和 21116。
+    for (i, (id, pk, from)) in known.into_iter().enumerate() {
+        // 库里那台设备的 RegisterPk（每次换来源，远低于每来源限额），20 ms 后测 L 的心跳和 21116。
         let pk_task = {
             let server = server.clone();
-            tokio::spawn(async move {
-                register_pk_from(&server, &format!("127.0.1.{}", i + 1), &unique_id(""), b"uuid-c21", 40_000).await
-            })
+            tokio::spawn(async move { register_pk_from(&server, &from, &id, b"uuid-c21", &pk, 40_000).await })
         };
         tokio::time::sleep(Duration::from_millis(20)).await;
         let (peer, fb) = tokio::join!(
@@ -891,22 +933,112 @@ async fn api_write_flood_does_not_stall_rendezvous() {
             "#{i}: RegisterPk {res:?} {pk_rtt:?}, RegisterPeer {peer:?}, 21116 首字节 {fb:?}"
         );
         eprintln!("{line}");
+        assert_eq!(res, Some(register_pk_response::Result::OK), "{line}");
         lines.push(line);
         worst = worst
+            .max(pk_rtt)
             .max(peer.unwrap_or(Duration::MAX))
             .max(fb.unwrap_or(Duration::MAX));
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    let (t0, n0) = flood_start;
-    let rate = (sent.load(std::sync::atomic::Ordering::Relaxed) - n0) as f64 / t0.elapsed().as_secs_f64();
-    eprintln!("alarm 洪水约 {rate:.0} req/s；RegisterPeer / 21116 最坏 {worst:?}");
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let (t0, w0, o0) = flood_start;
+    let (w, o) = (written.load(Relaxed) - w0, other.load(Relaxed) - o0);
+    let secs = t0.elapsed().as_secs_f64();
+    eprintln!(
+        "测量期 alarm 写库成功 {w} 次（约 {:.0} 次/秒），其余响应 {o} 次；最坏 {worst:?}",
+        w as f64 / secs
+    );
+    stop.store(true, Relaxed);
     for f in flood {
         f.abort();
     }
+    // 洪水真的在写库，测试才有意义（审查 D-1/D-17：合并上报限速后它曾经一条都没写）。
+    assert!(w > 0, "测量期 alarm 一次都没写进库（其余响应 {o} 次），测不到会合等库");
     assert!(
-        worst < Duration::from_millis(100),
+        worst < WORST,
         "API 洪水拖住了会合主循环：最坏 {worst:?}\n{}",
         lines.join("\n")
     );
+}
+
+/// 审查 D-15：持 key 的客户端在 21116 的几百条连接上不停发目标不存在的 `PunchHoleRequest`
+/// （每条都要查库），同时很多来源发新 id 的 `RegisterPk`（会合主循环每条查一次库）。会合主循环的
+/// 查库不能排在连接任务的查库后面：在线设备的 `RegisterPeer` 照常在几十毫秒内回包。连接任务的
+/// 查库走主池，会合池只给主循环用（PORTA.md §4.1）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn punch_lookup_flood_does_not_stall_rendezvous() {
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed},
+        Arc,
+    };
+    use hbb_common::futures::SinkExt;
+    const CONNS: usize = 256;
+    const PIPELINE: usize = 100;
+    // 每来源每分钟约 30 次 RegisterPk（§6 第 7 条）：128 个来源各约 2.2 秒一次，主循环每秒约 58 次查库。
+    const SOURCES: usize = 128;
+    // 审查 D-15 实测：两者共用会合池时 RegisterPeer 往返到秒级，甚至收不到回包。
+    const WORST: Duration = Duration::from_millis(100);
+    let disk = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let db_url = disk.path().join("db_v2.sqlite3");
+    let server = Arc::new(Server::start(GEO_OFF, &[("DB_URL", db_url.to_str().unwrap())]).await);
+    let l_id = unique_id("");
+    let l = PeerB::register(&server, &l_id, "127.0.0.4").await;
+    let mut l_sock = hbb_common::udp::FramedSocket::new("127.0.0.4:0").await.unwrap();
+    drop(l);
+    register_peer_rtt(&mut l_sock, &server, &l_id, 5000).await.expect("L 的心跳没有回包");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    // 服务端处理完的打洞请求（每条查一次库）。
+    let looked_up = Arc::new(AtomicUsize::new(0));
+    let mut tasks = Vec::new();
+    for _ in 0..CONNS {
+        let (server, stop, looked_up) = (server.clone(), stop.clone(), looked_up.clone());
+        tasks.push(tokio::spawn(async move {
+            while !stop.load(Relaxed) {
+                // 回环来源只计入总数（§6 第 8 条），几百条都连得上。一条连接只回第一条打洞请求
+                // （回包的写半边用一次就交出去），所以连发 PIPELINE 条再关写方向：服务端按顺序
+                // 处理完（各查一次库）才读到 EOF、关连接，这边读到 EOF 就说明它们都查过库了。
+                let mut s = server.connect_a(A_IP, Kx::Plain).await;
+                for _ in 0..PIPELINE {
+                    let id = format!("nx{}", hbb_common::rand::random::<u64>());
+                    send(&mut s, &msg_punch_request(server.punch_request(&id))).await;
+                }
+                SinkExt::<hbb_common::bytes::Bytes>::close(&mut s.0).await.unwrap();
+                while let Some(Ok(_)) = s.next_timeout(30_000).await {}
+                looked_up.fetch_add(PIPELINE, Relaxed);
+            }
+        }));
+    }
+    for i in 0..SOURCES {
+        let (server, stop) = (server.clone(), stop.clone());
+        tasks.push(tokio::spawn(async move {
+            let from = format!("127.0.{}.{}", 3 + i / 200, 1 + i % 200);
+            while !stop.load(Relaxed) {
+                // 全局每分钟只收 20 个新 id，其余查完库就丢、不回包：等 200 ms 就够。
+                let pk = sign::gen_keypair().0 .0;
+                register_pk_from(&server, &from, &unique_id(""), b"uuid-d15", &pk, 200).await;
+                tokio::time::sleep(Duration::from_millis(2000)).await;
+            }
+        }));
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let a0 = looked_up.load(Relaxed);
+    let t0 = Instant::now();
+    let mut rtts = Vec::new();
+    for _ in 0..10 {
+        rtts.push(register_peer_rtt(&mut l_sock, &server, &l_id, 10_000).await);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let n = looked_up.load(Relaxed) - a0;
+    stop.store(true, Relaxed);
+    for t in tasks {
+        t.abort();
+    }
+    let worst = rtts.iter().map(|r| r.unwrap_or(Duration::MAX)).max().unwrap();
+    eprintln!(
+        "测量期打洞查库 {n} 次（约 {:.0} 次/秒）；RegisterPeer {rtts:?}",
+        n as f64 / t0.elapsed().as_secs_f64()
+    );
+    assert!(n > 0, "测量期服务端没有处理完一条打洞请求，测不到查库排队");
+    assert!(worst < WORST, "打洞查库拖住了会合主循环：{rtts:?}");
 }

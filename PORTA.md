@@ -56,7 +56,7 @@
 - `RendezvousServer::start_with_bind` 自己建 tokio 运行时；API（axum）、路由健康检查、GeoIP 更新、结果记录的落库任务都在这个运行时里 `spawn`。
 - `AppState`（`Clone`，内部全是 `Arc`/池句柄），同一份交给 `RendezvousServer` 和 axum：
   - `db: SqlitePool`（主池，§4.1）
-  - `pm: PeerMap`（原有，在线状态 = 内存里有且 `last_reg_time` 不到 30 秒，笔记 02 §2.5；查库写库用自己的会合池，§4.1）
+  - `pm: PeerMap`（原有，在线状态 = 内存里有且 `last_reg_time` 不到 30 秒，笔记 02 §2.5；`io_loop` 查库写库用自己的会合池，连接任务的查库走主池，§4.1）
   - `router: Arc<Router>`（替代原来每个 clone 一份的 `relay_servers`/`relay_servers0` 快照，笔记 02 §1.6、§3.5）
   - `tracker: Arc<ConnTracker>`
   - `secret: Arc<SecretBox>`（§13）
@@ -69,11 +69,11 @@
 
 ### 4.1 连接池与迁移
 - 主池 `sqlx::SqlitePool`（API、命令行、后台任务用）：WAL、`synchronous=NORMAL`（提交不等 fsync，只有 checkpoint 才刷盘；不会损坏库，掉电最多丢最后几个事务）、`busy_timeout` 5 秒、`foreign_keys` 打开，池大小 `MAX_DATABASE_CONNECTIONS`（默认改为 8），取连接最多等 3 秒（sqlx 默认 30 秒；API 被灌时宁可几秒内失败，审查 C-21）。路径仍是 `DB_URL`，默认 `./db_v2.sqlite3`。
-- 会合池：`PeerMap` 单独一个池，连同一个库（`database::rendezvous_pool`，由 `AppState::new` 建）：2 个连接，取连接最多等 200 毫秒，`busy_timeout` 200 毫秒，其余设置同主池。`io_loop` 里查库、写库都走它，不和未认证的 API 请求排同一个公平队列（审查 C-21/C-11：API 被灌时，`io_loop` 每查一次库就要排几秒，UDP 收包和三个 TCP 端口的 accept 一起卡住）。等不到就放弃这次处理，客户端下一轮注册会重试；查库失败不能当成"没有这个 id"（§6 第 7 条）。
+- 会合池：`PeerMap` 单独一个池，连同一个库（`database::rendezvous_pool`，由 `AppState::new` 建）：2 个连接，取连接最多等 200 毫秒，`busy_timeout` 200 毫秒，其余设置同主池。只有 `io_loop` 用它（`RegisterPk` 的查库和写库），API 请求和 21116/21118 的连接任务都不碰它，所以 `io_loop` 不和任何未认证请求排同一个公平队列（审查 C-21/C-11：API 被灌时，`io_loop` 每查一次库就要排几秒，UDP 收包和三个 TCP 端口的 accept 一起卡住；审查 D-15：连接任务的查库洪水同样能把它卡住）。连接任务那边：`RelayResponse`、`PunchHoleSent`、`LocalAddr` 给 B 的 pk 签名只查内存（B 刚收到转发的请求，在线就一定在内存里；不在内存里就不签）；`PunchHoleRequest` 要区分 `OFFLINE` 和 `ID_NOT_EXIST`，目标不在内存里时经主池查库（`PeerMap::get_from_main`），和 API 请求在主池里排队。等不到就放弃这次处理，客户端下一轮注册会重试；查库失败不能当成"没有这个 id"（§6 第 7 条）。
 - WAL 的上界（审查 D-11）：SQLite 自带的自动 checkpoint（`wal_autocheckpoint`）是 PASSIVE 的，读写一直交叠时（多个来源灌上报接口）总有读者停在旧快照上，日志永远回绕不了，`-wal` 只增不减（实测约 1.8 GB/分钟，主库始终不到 1 MB，停灌后也不回收）；而且它由每个超过 1000 页的提交触发，被灌时总有一个占着 checkpoint 锁，别的 checkpoint 一试就失败。所以：
   - 两个池都设 `wal_autocheckpoint=0`（关掉自动 checkpoint）和 `journal_size_limit` 64 MB（日志回绕时把 `-wal` 截回这个大小；SQLite 默认 -1，永不缩）。
   - 服务进程里只有一个 checkpoint 者：后台任务（`database::spawn_checkpoints`，由 `AppState::spawn_tasks` 启动）每 5 秒先跑一次 `PRAGMA wal_checkpoint(PASSIVE)`，再跑一次 `PRAGMA wal_checkpoint(TRUNCATE)`。PASSIVE 不挡写者，先把能拷的帧拷进主库并 fsync；TRUNCATE 拿写锁、拷完剩下的帧（只有这几百毫秒里新写的）、等还停在日志上的读者退出（之后来的读者直接读主库），把 `-wal` 截成 0 字节。只跑 TRUNCATE 时它要在写锁里拷几秒的积累并 fsync，实测挡写者中位 0.5 秒、最长 2 秒，会合写库因此失败；先跑 PASSIVE 后中位 60 毫秒、最长 0.37 秒（debug 构建，每秒约 2400 次审计写入，测试机磁盘）。
-  - 它用自己的一个连接：不占会合池的 2 个连接，也不在主池里排队（主池被灌时取连接要等最多 3 秒，`busy_timeout` 5 秒）。它的 `busy_timeout` 是 50 毫秒：等写锁、等读者期间它挡着写者，所以要远短于会合池的 200 毫秒写锁等待；等不到就保留已拷的部分、下一轮再来，每分钟最多打一条 warn。拿到写锁以后拷帧和 fsync 的时间不受这个限制，慢盘上可能超过 200 毫秒，这时撞上的会合写库失败、客户端下一轮重试。
+  - 它用自己的一个连接：不占会合池的 2 个连接，也不在主池里排队（主池被灌时取连接要等最多 3 秒，`busy_timeout` 5 秒）。它的 `busy_timeout` 是 50 毫秒：等写锁、等读者期间它挡着写者，所以要远短于会合池的 200 毫秒写锁等待；等不到就保留已拷的部分、下一轮再来，每分钟最多打一条 warn。拿到写锁以后拷帧和 fsync 的时间不受这个限制，慢盘上可能超过 200 毫秒，这时撞上的会合写库失败、客户端下一轮重试（只换 IP 的重新注册不受影响，§6 第 7 条）。
   - 命令行不跑这个任务：服务在跑时由服务的任务 checkpoint；服务没跑时，命令行关掉最后一个连接时 SQLite 自己 checkpoint 并删掉 `-wal`。
 - 磁盘上界：主库文件按各表的上限核算（`peer` 表 §6 第 7 条，`conn_attempt` §8，`device` 和审计表 §9.3，地址簿 §12.1）；`-wal` 另计，约为两次 checkpoint 之间（5 秒多）的写入量：上面的洪水下峰值约 160 MB（修复前同样的洪水 3 分钟涨到 5.6 GB），停灌后回到 0。写入速率越高峰值越大（大致按每秒写入量 × 5 秒 × 每次写入的页数算）；只有 checkpoint 一直拿不到锁时它才会继续长，这时每分钟有一条 warn。
 - 迁移用 `sqlx::migrate!("./migrations")`（编译期嵌入文件，不需要数据库），服务和命令行启动时都执行。原来 `create_tables` 里的 `peer` 表 DDL 挪进 `0001`，保留 `if not exists`，这样能直接接管已有的 hbbs 数据库。
@@ -287,11 +287,11 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
    - 全局新 id 上限：所有来源合计每分钟最多 20 个新 id，超出的丢弃、不回包，每分钟最多打一条 warn。个人部署一天新增的设备只有个位数，批量部署时客户端会在后续注册周期里重试。已知 id 不受影响。
    - 库里的 `peer` 行不做自动清理（表里没有最后在线时间）：持续被灌时每天最多新增约 2.9 万行（20 × 1440）。
    - `RegisterPk` 的 id 不在内存里时要查库：查库前先过一个全局令牌桶（每秒 200 次、突发 1000 次），超出的静默丢弃（不回包、每分钟最多一条 warn）。被丢的客户端下一轮 `RegisterPeer` 会再被要求 `RegisterPk`（审查 C-12）。
-   - 查库出错不等于"没有这个 id"（审查 C-22/U-1）：`PeerMap::get` 返回 `Result<Option<_>>`。`RegisterPk` 出错就丢包，不进新 id 检查、不建条目；TCP 打洞请求不回包；`get_pk` 返回空、不签名。确认库里没有才在内存里建空条目（`insert_new`），不再查第二次库。
-   - `update_pk` 先写库、成功后才改内存，写库失败时内存条目保持原样；`RegisterPk` 回真实结果，写库失败回 `SERVER_ERROR`（客户端只记一行日志，下一轮重试）。不能回 `UUID_MISMATCH`：客户端收到它会换一个新 id（rustdesk `rendezvous_mediator.rs` `handle_uuid_mismatch` → `Config::update_id`）。插入撞上 id 唯一索引（查库之后别处加了这个 id，比如命令行导入）时，从库加载这一行、回 `SERVER_ERROR`，客户端重试时按库里的 uuid 判断。
+   - 查库出错不等于"没有这个 id"（审查 C-22/U-1）：`PeerMap::get`（会合池）和 `get_from_main`（主池）返回 `Result<Option<_>>`。`RegisterPk` 出错就丢包，不进新 id 检查、不建条目；TCP 打洞请求不回包。`get_pk` 只查内存，不在内存里就返回空、不签名（审查 D-15）。确认库里没有才在内存里建空条目（`insert_new`），不再查第二次库。
+   - `update_pk` 先写库、成功后才改内存，写库失败时内存条目保持原样；`RegisterPk` 回真实结果，写库失败回 `SERVER_ERROR`（客户端只记一行日志，下一轮重试）。不能回 `UUID_MISMATCH`：客户端收到它会换一个新 id（rustdesk `rendezvous_mediator.rs` `handle_uuid_mismatch` → `Config::update_id`）。插入撞上 id 唯一索引（查库之后别处加了这个 id，比如命令行导入）时，从库加载这一行、回 `SERVER_ERROR`，客户端重试时按库里的 uuid 判断。例外是只换了 IP 的重新注册（条目有 guid，uuid、pk 都和内存里的一样，审查 D-12）：先改内存（`socket_addr`、`last_reg_time`、`info.ip`），再写库，写库失败只打一条限频日志、照样回 OK。这里没有 U-1 要防的情况（内存里的 uuid、pk 本来就是库里的），而先写库的话，库写不进时换了 IP 的在线设备要晚 15 秒（客户端下一轮注册）才在新地址上可连，连续失败会显示离线。库里留着旧 IP 的后果只是条目被淘汰后再加载时又判一次"IP 变了"、重写一遍。
    - `io_loop` 里的 5 分钟定时器（和 `handle_udp` 串行，不会插进 `RegisterPk` 的查找和 `update_pk` 之间）：`IP_BLOCKER` 清空天窗口到期的集合，删掉分钟窗口已过且集合为空的条目；`IP_CHANGES` 删掉 360 秒前开始的记录；`PeerMap` 删掉 `last_reg_time` 超过 24 小时的条目。被淘汰的设备回来时，下一次 `RegisterPeer`（只查内存）会被要求重新 `RegisterPk`，`RegisterPk` 再从库里加载条目、照常校验 uuid，受每来源每分钟约 30 次的限额；淘汰时间取 24 小时，是为了让过夜离线的设备不走这一轮（审查 C-3：一个出口后面的上百台机器早上一起回来，要分几分钟才能全部在线）。只存在内存里的 `socket_addr`、`last_reg_time`、`reg_pk`（6 秒内的注册计数）对闲置一天的设备都没有意义，在线判断本来就要求 `last_reg_time` 在 30 秒内。TCP 侧的 `get` 从库里加载条目时只在内存里没有时才插入，不覆盖已有条目（审查 C-25）。
-   - 日志不打 uuid/pk 原文，只打 id、来源 IP 和长度。未认证、每个包都能触发的日志（info 及以上）一律用 hbb_common `throttled_log!`，每分钟最多各打一条：uuid 不匹配、ip/pk 不匹配、许可证不符的 `PunchHoleRequest`、`RegisterPeer` 的 "IP change"、`update_pk` 的两行，以及会合模块查库、写库失败（审查 A-5、C-1/C-7/C-8/C-17）。攻击者给的 id 先截到 253 字节（按字符边界）再打：TCP 打洞请求的 id 不校验长度，最长一帧。以后在这类路径上加日志照此办理。
-   - 查库、写库仍在 `io_loop` 里做：有了上面的上限，写库次数有界；每次最多等会合池的 200 毫秒取连接加 200 毫秒写锁（§4.1），不再随 API 负载变长。
+   - 日志不打 uuid/pk 原文，只打 id、来源 IP 和长度。未认证、每个包都能触发的日志（info 及以上）一律用 hbb_common `throttled_log!`，每分钟最多各打一条：uuid 不匹配、ip/pk 不匹配、许可证不符的 `PunchHoleRequest`、`RegisterPeer` 的 "IP change"、`update_pk` 的几行，以及会合模块查库、写库失败（审查 A-5、C-1/C-7/C-8/C-17）。攻击者给的 id 先截到 253 字节（按字符边界），再用 `{:?}` 打（转义换行和控制字符，免得一个 id 伪造出整行日志，审查 D-2/D-21）：TCP 打洞请求的 id 不校验长度，最长一帧。以后在这类路径上加日志照此办理。
+   - 查库、写库仍在 `io_loop` 里做：有了上面的上限，写库次数有界；每次最多等会合池的 200 毫秒取连接加 200 毫秒写锁（§4.1）。会合池只有 `io_loop` 用，取连接不随 API 或连接任务的负载变长；写锁和所有写者共用（包括 §4.1 的 checkpoint），最多等 200 毫秒。
 8. 会合端口的资源上限（审查 A-2/A-3/A-4；常量写死，不做配置）：
    - 帧长：21116/TCP 单帧和 21118/WebSocket 单条消息、单帧最多 16 KB（最大的合法消息是带 WebRTC offer 的 `PunchHoleRequest`：新客户端不带候选，约 1 KB；老客户端带全部候选，几 KB）。21115 单帧最多 128 KB：`OnlineRequest` 客户端不分批，界面把当前标签页的全部 id 一次发出（`peers_view.dart` `_queryOnlines` → `client.rs` `query_online_states_`）；地址簿每本最多 5000 台，即使每个 id 16 个字符也只有约 90 KB。超过帧上限的连接直接断开。
    - `OnlineRequest.peers` 超过 16384 条（128 KB 按每个 id 至少 6 字节加 2 字节标签和长度能放下的条数）的整条丢弃，不回包。
@@ -303,7 +303,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 ## 7. 路由第一级（`src/router/`）
 
 - 接口：`async fn select(&self, q: &RouteQuery<'_>) -> RouteDecision { relay: String, reason: &'static str }`。返回单个中继字符串（原版客户端只认一个）；空串语义照旧（被控端退回"hbbs 主机:21117"）。`reason` 取值为 `fixed`（固定中继）、`geo`（双方都有位置）、`geo_a`/`geo_b`（只有 A 或只有 B 有位置）、`rr`（轮询）、`none`（没有配置中继）。
-- 固定中继：每次调用按 `b_id` 查一次 `device_policy.relay_pin`（主键查询，不缓存），所以命令行 `device pin-relay` 写库后下一次连接就生效。有固定中继时直接用它，不看健康状态（运维的明确意图）。`b_id` 为空串时跳过这一步。中继列表、健康状态、GeoIP 都在内存里。
+- 固定中继：每次调用按 `b_id` 查一次 `device_policy.relay_pin`（主键查询，不缓存），所以命令行 `device pin-relay` 写库后下一次连接就生效。有固定中继时直接用它，不看健康状态（运维的明确意图）。`b_id` 为空串时跳过这一步。查库失败时当作没有固定中继，日志按 §6 第 7 条限频、id 截断后用 `{:?}` 打（每条打洞请求都会走到这里，审查 D-19）。中继列表、健康状态、GeoIP 都在内存里。
 - 候选：健康检查判为可达的中继。
 - 代价：`cost(R) = (rtt(A,R) + rtt(B,R)) × weight(R)`，取最小。`rtt` 按笔记 06 §4：大圆距离 × 2 × `detour` / 200 km/ms，加每段的跨运营商组、跨境惩罚；`multi_bgp` 的中继不算跨运营商。
 - 回退：有位置的候选按代价排序、取最小；没有位置的中继不参加排序。一方位置未知时用 `2 × rtt(已知方, R) × weight(R)`。只有双方位置都未知，或候选里一台有位置的都没有时，才在全部候选里轮询。私网、回环、链路本地、ULA 来源地址按 `server_location` 算，`100.64/10` 当作未知（笔记 06 §5.2）。

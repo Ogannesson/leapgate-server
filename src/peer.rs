@@ -119,14 +119,20 @@ pub(crate) type LockPeer = Arc<RwLock<Peer>>;
 #[derive(Clone)]
 pub(crate) struct PeerMap {
     map: Arc<RwLock<HashMap<String, LockPeer>>>,
+    /// The rendezvous pool (PORTA.md §4.1): `io_loop`'s lookups and writes only.
     pub(crate) db: database::Database,
+    /// The main pool, for the lookups of the rendezvous ports' connection tasks (`get_from_main`):
+    /// on the rendezvous pool, a flood of them would queue `io_loop` behind it (review D-15).
+    main: database::Database,
 }
 
 impl PeerMap {
-    pub(crate) fn new(db: sqlx::SqlitePool) -> Self {
+    /// `db`: the rendezvous pool; `main`: the main pool.
+    pub(crate) fn new(db: sqlx::SqlitePool, main: sqlx::SqlitePool) -> Self {
         Self {
             map: Default::default(),
             db: database::Database::new(db),
+            main: database::Database::new(main),
         }
     }
 
@@ -134,6 +140,11 @@ impl PeerMap {
     /// leaves the entry as it was (review U-1: an entry holding a uuid the database does not would
     /// take the id over). The result is the `RegisterPk` answer: `SERVER_ERROR` when the write
     /// failed, which the client only logs before retrying in its next round.
+    ///
+    /// A new address alone (same guid, uuid and pk) goes to memory first and answers OK even if
+    /// the write fails (review D-12): the device must be reachable at its new address now, and
+    /// nothing U-1 guards against changes. A row left with the old IP only means that, loaded
+    /// again after eviction, the entry is found "changed" once more and rewritten.
     pub(crate) async fn update_pk(
         &self,
         id: String,
@@ -154,13 +165,32 @@ impl PeerMap {
             uuid.len(),
             pk.len()
         );
-        let (mut guid, info) = {
+        let (mut guid, info, ip_only) = {
             let r = peer.read().await;
             let mut info = r.info.clone();
             info.ip = ip;
-            (r.guid.clone(), info)
+            let ip_only = !r.guid.is_empty() && r.uuid == uuid && r.pk == pk;
+            (r.guid.clone(), info, ip_only)
         };
         let info_str = serde_json::to_string(&info).unwrap_or_default();
+        if ip_only {
+            {
+                let mut w = peer.write().await;
+                w.socket_addr = addr;
+                w.last_reg_time = Instant::now();
+                w.info = info;
+            }
+            if let Err(err) = self.db.update_pk(&guid, &id, &pk, &info_str).await {
+                throttled_log!(
+                    Duration::from_secs(60),
+                    warn,
+                    "db.update_pk failed, new IP of {:?} kept in memory only: {}",
+                    log_id(&id),
+                    err
+                );
+            }
+            return register_pk_response::Result::OK;
+        }
         if guid.is_empty() {
             match self.db.insert_peer(&id, &uuid, &pk, &info_str).await {
                 Ok(g) => guid = g,
@@ -203,15 +233,26 @@ impl PeerMap {
         }
     }
 
-    /// The entry of `id`, from memory or else loaded from the database. `Ok(None)`: the database
-    /// has no such id; `Err`: the lookup failed, which callers must not take for "no such id"
-    /// (review C-22/U-1: `RegisterPk` would register it as new under another uuid).
+    /// The entry of `id`, from memory or else loaded from the database (`io_loop`: the rendezvous
+    /// pool). `Ok(None)`: the database has no such id; `Err`: the lookup failed, which callers must
+    /// not take for "no such id" (review C-22/U-1: `RegisterPk` would register it as new under
+    /// another uuid).
     #[inline]
     pub(crate) async fn get(&self, id: &str) -> ResultType<Option<LockPeer>> {
+        self.get_through(&self.db, id).await
+    }
+
+    /// `get` for the connection tasks of the rendezvous ports, loading through the main pool.
+    #[inline]
+    pub(crate) async fn get_from_main(&self, id: &str) -> ResultType<Option<LockPeer>> {
+        self.get_through(&self.main, id).await
+    }
+
+    async fn get_through(&self, db: &database::Database, id: &str) -> ResultType<Option<LockPeer>> {
         if let Some(p) = self.map.read().await.get(id).cloned() {
             return Ok(Some(p));
         }
-        let Some(v) = self.db.get_peer(id).await? else {
+        let Some(v) = db.get_peer(id).await? else {
             return Ok(None);
         };
         let peer = Peer {

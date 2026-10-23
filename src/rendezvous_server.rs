@@ -126,8 +126,11 @@ impl LookupBudget {
     }
 
     fn take(&mut self) -> bool {
-        let now = Instant::now();
-        let earned = (now - self.at).as_secs_f64() * LOOKUPS_PER_SEC;
+        self.take_at(Instant::now())
+    }
+
+    fn take_at(&mut self, now: Instant) -> bool {
+        let earned = now.saturating_duration_since(self.at).as_secs_f64() * LOOKUPS_PER_SEC;
         self.tokens = (self.tokens + earned).min(LOOKUP_BURST);
         self.at = now;
         if self.tokens < 1.0 {
@@ -644,8 +647,8 @@ impl RendezvousServer {
                                     throttled_log!(
                                         Duration::from_secs(60),
                                         warn,
-                                        "Peer {} ip/pk mismatch: {} vs {}",
-                                        id,
+                                        "Peer {:?} ip/pk mismatch: {} vs {}",
+                                        log_id(&id),
                                         ip,
                                         peer.info.ip
                                     );
@@ -656,8 +659,8 @@ impl RendezvousServer {
                                 throttled_log!(
                                     Duration::from_secs(60),
                                     warn,
-                                    "Peer {} uuid mismatch from {} ({} bytes)",
-                                    id,
+                                    "Peer {:?} uuid mismatch from {} ({} bytes)",
+                                    log_id(&id),
                                     ip,
                                     rk.uuid.len()
                                 );
@@ -1097,7 +1100,8 @@ impl RendezvousServer {
         // because punch hole won't work if in the same intranet,
         // all routers will drop such self-connections.
         // A failed lookup is not "no such id": no answer, the client times out and may retry.
-        if let Some(peer) = self.pm.get(&id).await.inspect_err(|err| {
+        // Through the main pool: this runs in a connection task (review D-15, PORTA.md §4.1).
+        if let Some(peer) = self.pm.get_from_main(&id).await.inspect_err(|err| {
             throttled_log!(
                 Duration::from_secs(60),
                 warn,
@@ -1716,9 +1720,11 @@ impl RendezvousServer {
         if version.is_empty() || self.inner.sk.is_none() {
             Bytes::new()
         } else {
-            // A failed lookup signs nothing (review C-22).
-            match self.pm.get(&id).await {
-                Ok(Some(peer)) => {
+            // Memory only (review D-15): the callers relay B's answer to a request just forwarded
+            // to it, so B is online, in memory; an id not there is signed nothing, without a lookup
+            // (these connection tasks would queue `io_loop` on the rendezvous pool).
+            match self.pm.get_in_memory(&id).await {
+                Some(peer) => {
                     let pk = peer.read().await.pk.clone();
                     sign::sign(
                         &IdPk {
@@ -1732,7 +1738,7 @@ impl RendezvousServer {
                     )
                     .into()
                 }
-                _ => Bytes::new(),
+                None => Bytes::new(),
             }
         }
     }
@@ -2668,7 +2674,9 @@ mod tests {
             let p = p.read().await;
             assert_eq!((&p.uuid[..], &p.pk[..]), (&b"uuid-real"[..], &pk[..]));
         }
+        // `get_pk` reads memory only (review D-15): signs dbfail2, not dbfail1.
         assert!(h.rs.get_pk("1.4.2", "dbfail1".to_owned()).await.is_empty());
+        assert!(!h.rs.get_pk("1.4.2", "dbfail2".to_owned()).await.is_empty());
         // The rows are as registered (read through the API's pool, still open).
         let rows: Vec<(String, Vec<u8>, Vec<u8>)> =
             sqlx::query_as("select id, uuid, pk from peer where id like 'dbfail%' order by id")
@@ -2679,6 +2687,50 @@ mod tests {
             rows,
             ["dbfail1", "dbfail2"].map(|id| (id.to_owned(), b"uuid-real".to_vec(), pk.to_vec()))
         );
+    }
+
+    /// Review D-12: a device that only changed address (same uuid and pk) is registered at the new
+    /// one even when the database write fails: OK, memory updated, the row left as it was.
+    #[hbb_common::tokio::test]
+    async fn ip_change_registers_without_the_database() {
+        let mut h = harness(true, None).await;
+        let mut server = FramedSocket::new("127.0.0.1:0").await.unwrap();
+        let mut old = FramedSocket::new("127.24.2.1:0").await.unwrap();
+        let mut new = FramedSocket::new("127.24.2.2:0").await.unwrap();
+        let (from_old, from_new) = (old.local_addr().unwrap(), new.local_addr().unwrap());
+        let pk = [4u8; 32];
+        h.rs.handle_udp(&register_pk("ipchg1", b"uuid-ipchg", &pk), from_old, &mut server, "")
+            .await
+            .unwrap();
+        assert_eq!(register_reply(&mut old).await, Some(register_pk_response::Result::OK));
+        let peer = h.rs.pm.get_in_memory("ipchg1").await.unwrap();
+        peer.write().await.last_reg_time = Instant::now() - Duration::from_secs(25);
+        h.rs.pm.db.close().await;
+
+        h.rs.handle_udp(&register_pk("ipchg1", b"uuid-ipchg", &pk), from_new, &mut server, "")
+            .await
+            .unwrap();
+        assert_eq!(register_reply(&mut new).await, Some(register_pk_response::Result::OK));
+        {
+            let p = peer.read().await;
+            assert_eq!(p.socket_addr, from_new);
+            assert_eq!(p.info.ip, from_new.ip().to_string());
+            assert!(p.last_reg_time.elapsed() < Duration::from_secs(5));
+        }
+        let info: String = sqlx::query_scalar("select info from peer where id = 'ipchg1'")
+            .fetch_one(&h.rs.state.db)
+            .await
+            .unwrap();
+        assert!(info.contains(&from_old.ip().to_string()), "{info}");
+        // A pk change with the same failing database is still refused, memory unchanged.
+        h.rs.handle_udp(&register_pk("ipchg1", b"uuid-ipchg", &[5u8; 32]), from_new, &mut server, "")
+            .await
+            .unwrap();
+        assert_eq!(
+            register_reply(&mut new).await,
+            Some(register_pk_response::Result::SERVER_ERROR)
+        );
+        assert_eq!(&peer.read().await.pk[..], &pk[..]);
     }
 
     /// Review U-1: an id added to the database after the lookup found nothing (the command line, an
@@ -2716,8 +2768,10 @@ mod tests {
         let from = client.local_addr().unwrap();
         let pk = [9u8; 32];
         h.rs.pm.db.insert_peer("budget1", b"uuid", &pk, "{}").await.unwrap();
+        // Empty, and stamped a second ahead: nothing is earned however long this thread pauses
+        // (review D-23: `take` earns nothing before `at`).
         h.rs.lookups.tokens = 0.0;
-        h.rs.lookups.at = Instant::now();
+        h.rs.lookups.at = Instant::now() + Duration::from_secs(1);
         h.rs.handle_udp(&register_pk("budget1", b"uuid", &pk), from, &mut server, "")
             .await
             .unwrap();
@@ -2728,11 +2782,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(register_reply(&mut client).await, Some(register_pk_response::Result::OK));
-        // A burst, then `LOOKUPS_PER_SEC`.
+        // A burst, then `LOOKUPS_PER_SEC`, on a fixed clock.
         let mut b = LookupBudget::new();
-        assert_eq!((0..2000).filter(|_| b.take()).count(), LOOKUP_BURST as usize);
-        b.at -= Duration::from_millis(100);
-        assert_eq!((0..2000).filter(|_| b.take()).count(), (LOOKUPS_PER_SEC / 10.0) as usize);
+        let t0 = b.at;
+        assert_eq!((0..2000).filter(|_| b.take_at(t0)).count(), LOOKUP_BURST as usize);
+        let t1 = t0 + Duration::from_millis(100);
+        assert_eq!((0..2000).filter(|_| b.take_at(t1)).count(), (LOOKUPS_PER_SEC / 10.0) as usize);
     }
 
     /// A listener handing every connection to `handle_listener` as if from `from` (`None`: the real

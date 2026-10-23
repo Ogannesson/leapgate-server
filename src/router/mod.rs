@@ -8,7 +8,8 @@ mod geo;
 use crate::config::{Config, GeoConfig, GeoSource, RelayConfig};
 use cost::{Candidate, Carriers, Loc, Locate};
 use hbb_common::{
-    bail, config::RELAY_PORT, futures::future::join_all, log, socket_client::check_port, tokio, ResultType,
+    bail, config::RELAY_PORT, futures::future::join_all, log, socket_client::check_port, throttled_log, tokio,
+    ResultType,
 };
 use sqlx::SqlitePool;
 use std::{
@@ -131,7 +132,13 @@ impl Router {
                     return RouteDecision { relay, reason: "fixed" };
                 }
                 Ok(None) => {}
-                Err(e) => log::error!("route: failed to read relay_pin of {}: {e}", q.b_id),
+                // Throttled: every punch request to an online peer gets here (PORTA.md §6 item 7).
+                Err(e) => throttled_log!(
+                    Duration::from_secs(60),
+                    error,
+                    "route: failed to read relay_pin of {:?}: {e}",
+                    crate::peer::log_id(q.b_id)
+                ),
             }
         }
         let x = self.decide(q.a_ip, q.b_ip);
