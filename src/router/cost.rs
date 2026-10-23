@@ -1,6 +1,7 @@
 //! Cost model of routing level one (PORTA.md §7, note 06 §4 and §5.2). Pure functions over positions,
 //! so every branch can be tested with fake data behind [`Locate`].
 
+use super::measure::Leg;
 use crate::config::{Location, RelayConfig, RoutingConfig};
 use std::{collections::BTreeMap, net::IpAddr};
 
@@ -219,45 +220,101 @@ pub(crate) struct Candidate<'a> {
     pub loc: &'a Loc,
     pub weight: f64,
     pub multi_bgp: bool,
+    /// What A's / B's usable measurement says of this relay (`Unknown` without one).
+    pub meas_a: Leg,
+    pub meas_b: Leg,
 }
 
-/// Costs of the candidates and the basis used: `"geo"` (both ends located), `"geo_a"` / `"geo_b"`
-/// (only A / only B located: `2 × rtt(known, R) × weight`). `None` when neither end is located.
-/// A candidate without a position gets no cost.
-pub(crate) fn score(
-    routing: &RoutingConfig,
-    a: &Loc,
-    b: &Loc,
-    cands: &[Candidate<'_>],
-) -> Option<(&'static str, Vec<Option<f64>>)> {
-    let basis = match (a.pos.is_some(), b.pos.is_some()) {
-        (true, true) => "geo",
-        (true, false) => "geo_a",
-        (false, true) => "geo_b",
-        (false, false) => return None,
+/// A candidate's cost and its two legs (ms, before the weight; measured or estimated as the
+/// end's basis says, `None` for an end with no value).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Cost {
+    pub cost: f64,
+    pub a_ms: Option<f64>,
+    pub b_ms: Option<f64>,
+}
+
+/// The outcome of [`score`].
+#[derive(Debug, PartialEq)]
+pub(crate) struct Scored {
+    /// `"rtt"` (both ends measured), `"rtt_a"` / `"rtt_b"` (only A / only B), else level one's
+    /// `"geo"` / `"geo_a"` / `"geo_b"`.
+    pub reason: &'static str,
+    /// Whether A's / B's measurement replaced its estimates.
+    pub use_a: bool,
+    pub use_b: bool,
+    /// Per candidate; `None`: no part in the choice (no basis for a leg, or down on a measured end).
+    pub costs: Vec<Option<Cost>>,
+}
+
+/// Level two's whole-end replacement (PORTA.md §7): an end uses its measurement when it has a
+/// value for every candidate; the relays it measured down then leave this pair's candidates,
+/// unless none would be left, in which case that end goes back to estimates (A is applied
+/// first). A measured end's leg is its rtt, the other's the level-one estimate. Cost per
+/// candidate as level one: `(leg_a + leg_b) × weight`, `2 × leg × weight` with one leg, none
+/// without. `None` (round-robin) only when neither end is measured nor located.
+pub(crate) fn score(routing: &RoutingConfig, a: &Loc, b: &Loc, cands: &[Candidate<'_>]) -> Option<Scored> {
+    let mut keep = vec![true; cands.len()];
+    let mut usable = |side: fn(&Candidate) -> Leg| {
+        if cands.is_empty() || cands.iter().any(|c| side(c) == Leg::Unknown) {
+            return false;
+        }
+        let next: Vec<bool> = keep.iter().zip(cands).map(|(k, c)| *k && side(c) != Leg::Down).collect();
+        if !next.contains(&true) {
+            return false;
+        }
+        keep = next;
+        true
+    };
+    let use_a = usable(|c| c.meas_a);
+    let use_b = usable(|c| c.meas_b);
+    let reason = match (use_a, use_b, a.pos.is_some(), b.pos.is_some()) {
+        (true, true, ..) => "rtt",
+        (true, false, ..) => "rtt_a",
+        (false, true, ..) => "rtt_b",
+        (false, false, true, true) => "geo",
+        (false, false, true, false) => "geo_a",
+        (false, false, false, true) => "geo_b",
+        (false, false, false, false) => return None,
+    };
+    let leg = |used: bool, meas: Leg, x: &Loc, c: &Candidate| match (used, meas) {
+        (true, Leg::Rtt(ms)) => Some(f64::from(ms)),
+        _ => leg_rtt(routing, x, c.loc, c.multi_bgp),
     };
     let costs = cands
         .iter()
-        .map(|c| {
-            let ra = leg_rtt(routing, a, c.loc, c.multi_bgp);
-            let rb = leg_rtt(routing, b, c.loc, c.multi_bgp);
-            let sum = match (ra, rb) {
+        .zip(keep)
+        .map(|(c, keep)| {
+            if !keep {
+                return None;
+            }
+            let (a_ms, b_ms) = (leg(use_a, c.meas_a, a, c), leg(use_b, c.meas_b, b, c));
+            let sum = match (a_ms, b_ms) {
                 (Some(ra), Some(rb)) => ra + rb,
                 (Some(r), None) | (None, Some(r)) => 2.0 * r,
                 (None, None) => return None,
             };
-            Some(sum * c.weight)
+            Some(Cost {
+                cost: sum * c.weight,
+                a_ms,
+                b_ms,
+            })
         })
         .collect();
-    Some((basis, costs))
+    Some(Scored {
+        reason,
+        use_a,
+        use_b,
+        costs,
+    })
 }
 
 /// Index of the lowest cost (the first one on ties); `None` when nothing has a cost.
-pub(crate) fn pick(costs: &[Option<f64>]) -> Option<usize> {
+pub(crate) fn pick(costs: &[Option<Cost>]) -> Option<usize> {
     costs
         .iter()
         .enumerate()
-        .filter_map(|(i, c)| c.map(|c| (i, c)))
+        .filter_map(|(i, c)| c.map(|c| (i, c.cost)))
         .min_by(|x, y| x.1.total_cmp(&y.1))
         .map(|(i, _)| i)
 }
@@ -337,22 +394,123 @@ mod tests {
         assert_eq!(leg_rtt(&routing, &Loc::default(), &r, false), None);
 
         let none = Loc::default();
-        let cands = [
-            Candidate { loc: &r, weight: 2.0, multi_bgp: false },
-            Candidate { loc: &none, weight: 1.0, multi_bgp: false },
-        ];
-        let (basis, costs) = score(&routing, &a, &b, &cands).unwrap();
-        assert_eq!(basis, "geo");
-        assert!((costs[0].unwrap() - ab * 2.0).abs() < 1e-9);
-        assert_eq!(costs[1], None, "relay without position takes no part");
-        let (basis, costs) = score(&routing, &a, &none, &cands).unwrap();
-        assert_eq!(basis, "geo_a");
-        assert!((costs[0].unwrap() - 2.0 * ab * 2.0).abs() < 1e-9);
-        assert_eq!(score(&routing, &none, &b, &cands).unwrap().0, "geo_b");
+        let cands = [cand(&r, 2.0, Leg::Unknown, Leg::Unknown), cand(&none, 1.0, Leg::Unknown, Leg::Unknown)];
+        let s = score(&routing, &a, &b, &cands).unwrap();
+        assert_eq!((s.reason, s.use_a, s.use_b), ("geo", false, false));
+        let c = s.costs[0].unwrap();
+        assert!((c.cost - ab * 2.0).abs() < 1e-9);
+        assert_eq!((c.a_ms, c.b_ms), (Some(ab), Some(0.0)), "legs before the weight");
+        assert_eq!(s.costs[1], None, "relay without position takes no part");
+        let s = score(&routing, &a, &none, &cands).unwrap();
+        assert_eq!(s.reason, "geo_a");
+        assert!((s.costs[0].unwrap().cost - 2.0 * ab * 2.0).abs() < 1e-9);
+        assert_eq!(s.costs[0].unwrap().b_ms, None);
+        assert_eq!(score(&routing, &none, &b, &cands).unwrap().reason, "geo_b");
         assert!(score(&routing, &none, &none, &cands).is_none());
 
-        assert_eq!(pick(&[None, Some(3.0), Some(1.0), Some(1.0)]), Some(2));
-        assert_eq!(pick(&[None, None]), None);
+        let costs = |v: &[Option<f64>]| {
+            v.iter().map(|c| c.map(|cost| Cost { cost, a_ms: None, b_ms: None })).collect::<Vec<_>>()
+        };
+        assert_eq!(pick(&costs(&[None, Some(3.0), Some(1.0), Some(1.0)])), Some(2));
+        assert_eq!(pick(&costs(&[None, None])), None);
+    }
+
+    fn cand(loc: &Loc, weight: f64, meas_a: Leg, meas_b: Leg) -> Candidate<'_> {
+        Candidate {
+            loc,
+            weight,
+            multi_bgp: false,
+            meas_a,
+            meas_b,
+        }
+    }
+
+    fn costs_of(s: &Scored) -> Vec<Option<f64>> {
+        s.costs.iter().map(|c| c.map(|c| c.cost)).collect()
+    }
+
+    /// Level two (contract 02 §3.3): whole-end replacement, `down`, reasons, the picked legs.
+    #[test]
+    fn measured_ends() {
+        use Leg::{Down, Rtt, Unknown};
+        let routing = Config::default().routing;
+        let a = loc(39.9042, 116.4074, "CN", "cn-telecom"); // Beijing
+        let b = loc(31.2304, 121.4737, "CN", "cn-unicom"); // Shanghai
+        let (r1, r2) = (loc(39.9042, 116.4074, "CN", "cn-telecom"), loc(31.2304, 121.4737, "CN", "cn-unicom"));
+        let est = |x: &Loc, r: &Loc| leg_rtt(&routing, x, r, false).unwrap();
+
+        // Both ends measured: rtt only, the estimates don't matter (r2 would win on them).
+        let cands = [cand(&r1, 1.0, Rtt(10), Rtt(20)), cand(&r2, 1.0, Rtt(40), Rtt(5))];
+        let s = score(&routing, &a, &b, &cands).unwrap();
+        assert_eq!((s.reason, s.use_a, s.use_b), ("rtt", true, true));
+        assert_eq!(costs_of(&s), [Some(30.0), Some(45.0)]);
+        assert_eq!(pick(&s.costs), Some(0));
+        assert_eq!((s.costs[0].unwrap().a_ms, s.costs[0].unwrap().b_ms), (Some(10.0), Some(20.0)));
+
+        // Only A measured: A's rtt, B's estimate.
+        let cands = [cand(&r1, 1.0, Rtt(10), Unknown), cand(&r2, 2.0, Rtt(40), Unknown)];
+        let s = score(&routing, &a, &b, &cands).unwrap();
+        assert_eq!(s.reason, "rtt_a");
+        let c1 = s.costs[1].unwrap();
+        assert_eq!((c1.a_ms, c1.b_ms), (Some(40.0), Some(est(&b, &r2))));
+        assert!((c1.cost - (40.0 + est(&b, &r2)) * 2.0).abs() < 1e-9);
+        // Only B measured.
+        let cands = [cand(&r1, 1.0, Unknown, Rtt(3)), cand(&r2, 1.0, Unknown, Rtt(4))];
+        let s = score(&routing, &a, &b, &cands).unwrap();
+        assert_eq!(s.reason, "rtt_b");
+        assert_eq!(s.costs[0].unwrap().a_ms, Some(est(&a, &r1)));
+
+        // A's measurement misses one candidate: the whole end goes back to estimates.
+        let cands = [cand(&r1, 1.0, Rtt(10), Rtt(20)), cand(&r2, 1.0, Unknown, Rtt(5))];
+        let s = score(&routing, &a, &b, &cands).unwrap();
+        assert_eq!((s.reason, s.use_a, s.use_b), ("rtt_b", false, true));
+        assert_eq!(s.costs[1].unwrap().a_ms, Some(est(&a, &r2)));
+        // Neither measured: level one as before.
+        let cands = [cand(&r1, 1.0, Unknown, Unknown), cand(&r2, 1.0, Rtt(1), Unknown)];
+        assert_eq!(score(&routing, &a, &b, &cands).unwrap().reason, "geo");
+
+        // `down` on a measured end takes the relay out of this pair, even when it is the cheapest.
+        let cands = [cand(&r1, 1.0, Down, Rtt(1)), cand(&r2, 1.0, Rtt(90), Rtt(90))];
+        let s = score(&routing, &a, &b, &cands).unwrap();
+        assert_eq!(s.reason, "rtt");
+        assert_eq!(costs_of(&s), [None, Some(180.0)]);
+        assert_eq!(pick(&s.costs), Some(1));
+        // On an end that is not used, `down` means nothing.
+        let cands = [cand(&r1, 1.0, Down, Rtt(1)), cand(&r2, 1.0, Unknown, Rtt(90))];
+        let s = score(&routing, &a, &b, &cands).unwrap();
+        assert_eq!(s.reason, "rtt_b");
+        assert!(s.costs[0].is_some());
+        // Everything down on A: A's `down` is ignored and A goes back to estimates.
+        let cands = [cand(&r1, 1.0, Down, Rtt(7)), cand(&r2, 1.0, Down, Rtt(8))];
+        let s = score(&routing, &a, &b, &cands).unwrap();
+        assert_eq!((s.reason, s.use_a), ("rtt_b", false));
+        assert!(s.costs.iter().all(Option::is_some));
+        // A first: A leaves only r1, which B has down, so B goes back to estimates.
+        let cands = [cand(&r1, 1.0, Rtt(9), Down), cand(&r2, 1.0, Down, Rtt(8))];
+        let s = score(&routing, &a, &b, &cands).unwrap();
+        assert_eq!((s.reason, s.use_a, s.use_b), ("rtt_a", true, false));
+        assert_eq!(costs_of(&s)[1], None);
+        assert_eq!(s.costs[0].unwrap().b_ms, Some(est(&b, &r1)));
+        // Rule 1 looks at every reachable candidate, also one A's `down` took out: B has nothing for
+        // r1, so B stays on estimates.
+        let cands = [cand(&r1, 1.0, Down, Unknown), cand(&r2, 1.0, Rtt(9), Rtt(8))];
+        let s = score(&routing, &a, &b, &cands).unwrap();
+        assert_eq!((s.reason, s.use_a, s.use_b), ("rtt_a", true, false));
+
+        // Neither end located, one measured: still a cost (no round-robin), `2 × leg × weight`.
+        let none = Loc::default();
+        let cands = [cand(&r1, 1.0, Rtt(10), Unknown), cand(&none, 1.0, Rtt(4), Unknown)];
+        let s = score(&routing, &none, &none, &cands).unwrap();
+        assert_eq!(s.reason, "rtt_a");
+        assert_eq!(costs_of(&s), [Some(20.0), Some(8.0)]);
+        assert_eq!(s.costs[1].unwrap().b_ms, None);
+        // A relay without a position next to located ones: `2 × measured leg`.
+        let cands = [cand(&r2, 1.0, Rtt(30), Unknown), cand(&none, 1.0, Rtt(20), Unknown)];
+        let s = score(&routing, &a, &b, &cands).unwrap();
+        assert_eq!(s.costs[1].unwrap().cost, 40.0);
+        assert!((s.costs[0].unwrap().cost - (30.0 + est(&b, &r2))).abs() < 1e-9);
+        // No candidates: no end counts as measured.
+        assert!(score(&routing, &none, &none, &[]).is_none());
     }
 
     struct Fake;

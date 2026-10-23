@@ -461,9 +461,8 @@ pub(crate) async fn touch(
 /// `"udp-punch"`.
 const PORTA_FEATURES: &[&str] = &[];
 
-/// `POST /api/porta/v1/heartbeat` body (contract 01 §2.3); absent keys are absent values. The id
-/// comes from the signature (`SignedBody`). `conns` is not used; the keys of block 02
-/// (`routing_rev`, `probes`) are not read yet and serde skips them.
+/// `POST /api/porta/v1/heartbeat` body (contract 01 §2.3, 02 §2.2); absent keys are absent values.
+/// The id comes from the signature (`SignedBody`). `conns` is not used.
 #[derive(Deserialize)]
 struct PortaHeartbeatReq {
     #[serde(default)]
@@ -480,6 +479,12 @@ struct PortaHeartbeatReq {
     sysinfo_hash: String,
     /// Kept byte for byte: the hash is over these bytes.
     sysinfo: Option<Box<RawValue>>,
+    /// Rev of the relay list the client holds (0: none yet).
+    #[serde(default)]
+    routing_rev: i64,
+    /// The client's latest round of relay measurements; any JSON here, a bad one only drops the
+    /// round (`Router::record_probes`), never the heartbeat.
+    probes: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -492,6 +497,16 @@ struct PortaHeartbeatResp {
     need_sysinfo: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     strategy: Option<PortaStrategy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    routing: Option<PortaRouting>,
+}
+
+/// The relays to measure (routing level two), sent when the client's `routing_rev` is not `rev`.
+#[derive(Serialize)]
+struct PortaRouting {
+    rev: i64,
+    probe_interval_secs: u64,
+    relays: Vec<String>,
 }
 
 /// Every effective option (values are strings, `''` deletes the key) and their `rev`.
@@ -501,11 +516,13 @@ struct PortaStrategy {
     options: BTreeMap<String, String>,
 }
 
-/// `POST /api/porta/v1/heartbeat` (contract 01 §3.6): a signed heartbeat. Records it in memory
-/// (`Peer::porta_hb`), stores a sysinfo that came with it, writes the device row (`touch`, as
-/// `porta`), and answers signed: `need_sysinfo` when the stored sysinfo is missing or its hash is not
-/// the reported one, the effective options when their rev is not the reported one. Bad body 400,
-/// sysinfo over `MAX_SYSINFO_LEN` 413, database error 503 (all unsigned).
+/// `POST /api/porta/v1/heartbeat` (contract 01 §3.6, 02 §3.4): a signed heartbeat. Records it in
+/// memory (`Peer::porta_hb`) along with its relay measurements (routing level two), stores a
+/// sysinfo that came with it, writes the device row (`touch`, as `porta`), and answers signed:
+/// `need_sysinfo` when the stored sysinfo is missing or its hash is not the reported one, the
+/// effective options when their rev is not the reported one, the relays to measure when their rev
+/// is not the reported one. Bad body 400, sysinfo over `MAX_SYSINFO_LEN` 413, database error 503
+/// (all unsigned).
 pub(crate) async fn porta_heartbeat(State(state): State<AppState>, signed: SignedBody) -> Response {
     let req: PortaHeartbeatReq = match parse_body(&signed.body) {
         Ok(req) => req,
@@ -529,6 +546,10 @@ pub(crate) async fn porta_heartbeat(State(state): State<AppState>, signed: Signe
         at: Instant::now(),
         porta_ver,
     });
+    // Under the verified id: nobody can report measurements for another device.
+    if let Some(probes) = &req.probes {
+        state.router.record_probes(&signed.id, probes);
+    }
     let db = &state.db;
     if let Some((raw, fields)) = sysinfo {
         if let Err(err) = store_sysinfo(db, &signed.id, &req.uuid, raw, fields, CLIENT_PORTA).await {
@@ -546,12 +567,18 @@ pub(crate) async fn porta_heartbeat(State(state): State<AppState>, signed: Signe
         Ok(v) => v,
         Err(err) => return porta_internal(format!("{err:#}")),
     };
+    let (routing_rev, relays) = state.router.routing();
     let resp = PortaHeartbeatResp {
         api: 1,
         features: PORTA_FEATURES,
         time: crate::common::now() as i64,
         need_sysinfo,
         strategy: (req.strategy_rev != rev).then_some(PortaStrategy { rev, options }),
+        routing: (req.routing_rev != routing_rev).then_some(PortaRouting {
+            rev: routing_rev,
+            probe_interval_secs: crate::router::PROBE_INTERVAL_SECS,
+            relays,
+        }),
     };
     signed_json(&state, &signed.sig, StatusCode::OK, &resp)
 }
@@ -1296,10 +1323,11 @@ mod tests {
 
     /// The body the client sends: one compact serialization, so the sysinfo bytes inside it are the
     /// ones its hash is over. `hash` overrides the hash sent; returns the body and the own hash.
-    /// Carries keys this block does not read (`conns`, block 02's `routing_rev`, a bad `probes`).
-    fn porta_body(rev: i64, sysinfo: Option<&Value>, hash: Option<&str>) -> (String, String) {
+    /// Carries a key nobody reads (`conns`) and bad `probes`; `routing_rev` is the server's (`rr`),
+    /// so no `routing` comes back.
+    fn porta_body(rev: i64, rr: i64, sysinfo: Option<&Value>, hash: Option<&str>) -> (String, String) {
         let mut v = json!({"uuid": b64(UUID), "ver": 1005010, "porta": "0.3.0", "strategy_rev": rev,
-                           "conns": [3], "routing_rev": 7, "probes": "not an object"});
+                           "conns": [3], "routing_rev": rr, "probes": "not an object"});
         let raw = sysinfo.map(|s| serde_json::to_string(s).unwrap()).unwrap_or_default();
         let own_hash = sha256_b64(&raw);
         if let Some(s) = sysinfo {
@@ -1329,8 +1357,9 @@ mod tests {
             async move { dev.post(app, "heartbeat", body.as_bytes()).await }
         };
 
+        let rr = t.state.router.routing().0;
         // No row yet: sysinfo wanted, every option pushed; signed, `features` empty, `time` now.
-        let r = hb(porta_body(0, None, Some("")).0).await;
+        let r = hb(porta_body(0, rr, None, Some("")).0).await;
         assert_eq!(r.status, StatusCode::OK);
         assert_eq!(r.headers["content-type"], "application/json; charset=utf-8");
         assert!(testutil::verify_server_sig(&t.state, &r.sig, &r.headers, &r.body));
@@ -1343,14 +1372,14 @@ mod tests {
         assert_eq!(device_row(db, "porta1").await, (String::new(), String::new(), "porta".into(), 1005010));
 
         // The rev echoed back: no strategy; the row has no sysinfo yet, so it is still wanted.
-        let v = hb(porta_body(rev, None, Some("")).0).await.json();
+        let v = hb(porta_body(rev, rr, None, Some("")).0).await.json();
         assert_eq!(v.get("strategy"), None);
         assert_eq!(v["need_sysinfo"], json!(true));
 
         // With the sysinfo: stored byte for byte (the hash the client computed is the stored text's),
         // not wanted any more; the answer is just api, features, time.
         let s = sysinfo_obj("h1");
-        let (body, hash) = porta_body(rev, Some(&s), None);
+        let (body, hash) = porta_body(rev, rr, Some(&s), None);
         let v = hb(body).await.json();
         assert_eq!(v.as_object().unwrap().keys().collect::<Vec<_>>(), ["api", "features", "time"]);
         let (stored, host, client, _) = device_row(db, "porta1").await;
@@ -1360,13 +1389,13 @@ mod tests {
         );
         assert_eq!(sha256_b64(&stored), hash);
         // Without the sysinfo: the same hash wants nothing, another one wants it again.
-        assert_eq!(hb(porta_body(rev, None, Some(&hash)).0).await.json().get("need_sysinfo"), None);
-        assert_eq!(hb(porta_body(rev, None, Some("other")).0).await.json()["need_sysinfo"], json!(true));
+        assert_eq!(hb(porta_body(rev, rr, None, Some(&hash)).0).await.json().get("need_sysinfo"), None);
+        assert_eq!(hb(porta_body(rev, rr, None, Some("other")).0).await.json()["need_sysinfo"], json!(true));
 
         // An option changed: pushed again, with every effective option. (Not the body sent just
         // above, which within the same second would be a replay.)
         set_option(db, "porta1", "allow-auto-disconnect", "Y").await;
-        let v = hb(porta_body(rev, None, None).0).await.json();
+        let v = hb(porta_body(rev, rr, None, None).0).await.json();
         let rev2 = v["strategy"]["rev"].as_i64().unwrap();
         assert_ne!(rev2, rev);
         assert_eq!(v["strategy"]["options"], json!({"allow-auto-disconnect": "Y", "relay-server": ""}));
@@ -1428,5 +1457,50 @@ mod tests {
         // An unreadable version is 0.
         dev.post(&t.app, "heartbeat", json!({"porta": "x", "ver": 2}).to_string().as_bytes()).await;
         assert_eq!(peer.read().await.porta_hb.as_ref().unwrap().porta_ver, 0);
+    }
+
+    /// Contract 02 §3.4: `routing` when the client's `routing_rev` is not the server's; `probes` are
+    /// kept under the verified id, and bad ones never fail the heartbeat.
+    #[tokio::test]
+    async fn porta_heartbeat_routing_and_probes() {
+        let t = testutil::app().await;
+        let router = &t.state.router;
+        router.set_configured(vec!["r1.example:21117".to_owned(), "r2.example".to_owned()]);
+        let (rev, _) = router.routing();
+        let dev = testutil::porta_device(&t.state, "porta4", UUID).await;
+
+        let r = dev.post(&t.app, "heartbeat", json!({"routing_rev": 0}).to_string().as_bytes()).await;
+        assert_eq!(r.status, StatusCode::OK);
+        assert!(testutil::verify_server_sig(&t.state, &r.sig, &r.headers, &r.body));
+        assert_eq!(
+            r.json()["routing"],
+            json!({"rev": rev, "probe_interval_secs": 300, "relays": ["r1.example:21117", "r2.example"]})
+        );
+        assert!(r.json()["routing"]["rev"].is_i64());
+        let r = dev.post(&t.app, "heartbeat", json!({"routing_rev": rev}).to_string().as_bytes()).await;
+        assert_eq!(r.json().get("routing"), None);
+
+        // Bad probes: the heartbeat is answered as usual and nothing is recorded.
+        for (i, probes) in [json!("x"), json!(5), json!({"routing_rev": rev}), json!({"routing_rev": "x", "age_s": 0})]
+            .into_iter()
+            .enumerate()
+        {
+            let body = json!({"routing_rev": rev, "ver": i, "probes": probes}).to_string();
+            let r = dev.post(&t.app, "heartbeat", body.as_bytes()).await;
+            assert_eq!(r.status, StatusCode::OK, "{body}");
+            assert_eq!(r.json()["api"], json!(1));
+        }
+        assert!(router.status_text().ends_with("measurements: 0 devices, 0 fresh\n"));
+
+        // Good probes are kept under the signed id, whatever id the body names.
+        let probes = json!({"routing_rev": rev, "age_s": 5, "rtt": {"r1.example:21117": 23}, "down": ["r2.example"]});
+        let body = json!({"id": "other", "routing_rev": rev, "probes": probes}).to_string();
+        assert_eq!(dev.post(&t.app, "heartbeat", body.as_bytes()).await.status, StatusCode::OK);
+        assert!(router.status_text().ends_with("measurements: 1 devices, 1 fresh\n"));
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let mine = router.test(ip, ip, "porta4", "").await;
+        assert!(mine.contains("(rtt_a)") && mine.contains("[A rtt 23ms, B est ?]"), "{mine}");
+        let other = router.test(ip, ip, "other", "").await;
+        assert!(other.contains("(rr)"), "{other}");
     }
 }

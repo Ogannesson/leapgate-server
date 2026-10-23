@@ -154,8 +154,20 @@ pub(super) async fn runtime(
         ("route", "test") => {
             let a = parse_ip(&args.next("ipA")?)?;
             let b = parse_ip(&args.next("ipB")?)?;
+            // Whose relay measurements to use (routing level two); `-` tells the console "none".
+            let mut id = |name: &str| -> ResultType<String> {
+                match args.value(&[name]) {
+                    None => Ok("-".to_owned()),
+                    // The console splits its command on spaces.
+                    Some(id) if id.is_empty() || id == "-" || id.contains(char::is_whitespace) => {
+                        bail!("Not a device id: {id:?}")
+                    }
+                    Some(id) => Ok(id),
+                }
+            };
+            let (a_id, b_id) = (id("--a")?, id("--b")?);
             args.finish()?;
-            console(console_addr, &format!("tg {a} {b}"), CONSOLE_WAIT).await
+            console(console_addr, &format!("tg {a} {b} {a_id} {b_id}"), CONSOLE_WAIT).await
         }
         ("geo", "lookup") => {
             let ip = parse_ip(&args.next("ip")?)?;
@@ -417,11 +429,22 @@ mod tests {
         assert_eq!(cli(&ctx, &["relay", "status"], "").await.unwrap(), "got rs\n");
         assert_eq!(
             cli(&ctx, &["route", "test", "1.2.3.4", "::ffff:5.6.7.8"], "").await.unwrap(),
-            "got tg 1.2.3.4 5.6.7.8\n"
+            "got tg 1.2.3.4 5.6.7.8 - -\n"
+        );
+        assert_eq!(
+            cli(&ctx, &["route", "test", "1.2.3.4", "5.6.7.8", "--b", "123456789"], "").await.unwrap(),
+            "got tg 1.2.3.4 5.6.7.8 - 123456789\n"
+        );
+        assert_eq!(
+            cli(&ctx, &["route", "test", "--a", "a1b2c3", "1.2.3.4", "5.6.7.8", "--b=987654"], "").await.unwrap(),
+            "got tg 1.2.3.4 5.6.7.8 a1b2c3 987654\n"
         );
         assert_eq!(cli(&ctx, &["geo", "update"], "").await.unwrap(), "got gu\n");
         assert!(cli(&ctx, &["route", "test", "1.2.3.4", "nope"], "").await.is_err());
         assert!(cli(&ctx, &["route", "test", "1.2.3.4"], "").await.is_err());
+        for bad in ["", "-", "a b"] {
+            assert!(cli(&ctx, &["route", "test", "1.2.3.4", "5.6.7.8", "--a", bad], "").await.is_err(), "{bad:?}");
+        }
         assert!(cli(&ctx, &["geo", "lookup", "x"], "").await.is_err());
 
         let (_dir2, ctx2) = super::super::tests::ctx(NO_CONSOLE).await;

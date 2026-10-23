@@ -43,7 +43,7 @@ const USAGE: &str = "Usage: porta-server <command> [options]
   device key <device> | device key reset [--forget] <device>
   strategy show [<device>] | strategy set <device|'*'> <key> <value>
   strategy unset|forget <device|'*'> <key> | strategy repush <device|'*'>
-  relay status | route test <ipA> <ipB>
+  relay status | route test <ipA> <ipB> [--a <device>] [--b <device>]
   geo lookup <ip> | geo update
   stats [--days N]
   import rustdesk-api <db path> [--dry-run]
@@ -179,7 +179,7 @@ pub(super) async fn exec(ctx: &Ctx, mut args: Args, input: &mut dyn BufRead) -> 
 /// Flags that take a value (`--name value` or `--name=value`).
 const VALUE_FLAGS: &[&str] = &[
     "-p", "--port", "-c", "--config", "--porta-config", "--display-name", "--email", "--owner",
-    "--note", "--user", "--group", "--days",
+    "--note", "--user", "--group", "--days", "--a", "--b",
 ];
 const BOOL_FLAGS: &[&str] = &[
     "-h", "--help", "--admin", "--share-devices", "--legacy", "--dry-run", "--forget",

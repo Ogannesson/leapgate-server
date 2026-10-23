@@ -301,6 +301,35 @@ mod tests {
         assert_eq!((peer.pk, peer.pk_pinned_at), (b"\x03".to_vec(), None));
     }
 
+    // Migration 0005 (phase 3 routing level two) on a phase-1 database with connection records: the two
+    // leg columns are added, NULL on the old rows.
+    #[tokio::test]
+    async fn migration_0005_on_a_phase_1_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite3");
+        let url = path.to_str().unwrap();
+        {
+            let opt = sqlx::sqlite::SqliteConnectOptions::new().filename(url).create_if_missing(true);
+            let pool = sqlx::SqlitePool::connect_with(opt).await.unwrap();
+            let mut phase1 = sqlx::migrate!("./migrations");
+            phase1.migrations = phase1.migrations.iter().filter(|m| m.version < 4).cloned().collect::<Vec<_>>().into();
+            phase1.run(&pool).await.unwrap();
+            sqlx::query(
+                "insert into conn_attempt(started_at, a_ip, a_port, via, b_id, conn_type, a_nat_type, a_force_relay,
+                   a_has_v6, signal, server_forced_relay, route_reason)
+                 values(1, '1.2.3.4', 1, 'tcp', '123456', 0, 0, 0, 0, 'punch_hole', 0, 'geo')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+        }
+        let pool = super::open(url, true).await.unwrap();
+        let row: (String, Option<f64>, Option<f64>) =
+            sqlx::query_as("select route_reason, route_a_ms, route_b_ms from conn_attempt").fetch_one(&pool).await.unwrap();
+        assert_eq!(row, ("geo".to_owned(), None, None));
+    }
+
     // Review D-11: both pools cut the WAL back on restart and leave checkpoints to
     // `spawn_checkpoints`, whose `checkpoint` truncates it to zero bytes without losing what it held.
     #[tokio::test]

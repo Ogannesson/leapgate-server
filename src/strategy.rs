@@ -42,7 +42,13 @@ async fn epoch(db: &SqlitePool, device_id: &str) -> ResultType<i64> {
 /// first 8 bytes as big-endian i64, masked to non-negative; 0 becomes 1.
 pub fn rev(options: &BTreeMap<String, String>, global_epoch: i64, device_epoch: i64) -> i64 {
     let canonical = serde_json::json!([options, global_epoch, device_epoch]).to_string();
-    let digest = Sha256::digest(canonical.as_bytes());
+    digest_rev(canonical.as_bytes())
+}
+
+/// sha256 of `bytes`, first 8 bytes as big-endian i64, masked to non-negative; 0 becomes 1. Also the
+/// routing list's `rev` (PORTA.md §7 level two).
+pub fn digest_rev(bytes: &[u8]) -> i64 {
+    let digest = Sha256::digest(bytes);
     let mut first = [0u8; 8];
     first.copy_from_slice(&digest[..8]);
     match i64::from_be_bytes(first) & i64::MAX {
