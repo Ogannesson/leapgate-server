@@ -29,6 +29,9 @@
 |---|---|---|
 | `Cargo.toml`、`Cargo.lock`、`src/lib.rs`、`src/main.rs` | 依赖、模块声明、入口（服务模式 / 命令行模式分派） | 骨架 |
 | `migrations/0001_init.sql` | 全部表（§4） | 骨架 |
+| `migrations/0002_*.sql`、`migrations/0003_*.sql` | 只加、换索引（§4.2） | 设备 |
+| `src/conn_limit.rs` | 会合端口和 21114 共用的连接数限流：总数加每来源（§6 第 8 条、§9.4） | 会合 |
+| `src/api/listen.rs` | 21114 的 accept 循环：连接上限，请求头、整请求、读写无进度超时，写下限（§9.4） | API |
 | `src/state.rs` | `AppState`：进程内共享的句柄（§3） | 骨架 |
 | `src/config.rs` | `porta.toml` 解析（§5） | 骨架 |
 | `src/database.rs` | 连接池、迁移、hbbs 原有的 peer 查询 | 骨架 |
@@ -46,7 +49,9 @@
 
 骨架实现的 `Router`（只按配置列表轮询）和 `ConnTracker`（各挂钩方法为空操作）是能跑的最小版本，让会合模块在并行阶段就能调用和测试；路由、结果记录模块再替换内部实现，不改签名。骨架阶段为后面各模块建好空文件和函数签名（`todo!()` 只允许出现在并行模块名下的文件里，且不允许留到合并后），并行模块在签名内实现。签名需要调整时，改动方在汇报里写清楚，由集成阶段统一。
 
-依赖由骨架一次加齐，并行模块不改 `Cargo.toml`：`axum` 0.8、`argon2`、`bcrypt`、`md-5`、`sha2`、`maxminddb` 0.32（`mmap`）、`toml`、`flate2`（GeoIP 解压，之前当死依赖删了）、sqlx 补 `migrate` 特性，dev 依赖 `tower`（`ServiceExt::oneshot`）。版本选发布满两周的。
+依赖由骨架一次加齐，并行模块不改 `Cargo.toml`：`axum` 0.8、`argon2`、`bcrypt`、`md-5`、`sha2`、`maxminddb` 0.32（`mmap`）、`toml`、`flate2`（GeoIP 解压，之前当死依赖删了）、sqlx 补 `migrate` 特性，dev 依赖 `tower`（`ServiceExt::oneshot`）。版本选发布满两周的。之后审查轮次补的：`hyper`（`server`、`http1`）、`hyper-util`（`tokio`、`service`）改为直接依赖，`tower` 从 dev 依赖挪进正式依赖，用于 21114 自写的 accept 循环（axum 0.8 的 `serve` 不给 hyper 配 timer，请求头超时不生效，§9.4）；这三个都是 axum 已经在编译的同一份，没有引入新包。
+
+上表的"归属"是第一期并行开发时的分工；之后的审查修复按问题分组派活，不再受它约束。
 
 删掉：`src/mod.rs`（孤儿文件）、`database::tests::test_insert`（出错不报、等于空跑，`peer_roundtrip` 已覆盖）、`common::check_software_update`（向 RustDesk 官方外呼）。
 
