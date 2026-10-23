@@ -19,9 +19,11 @@
 7. **记录每台设备的客户端类型和版本**，为以后退出兼容做准备。
 8. **命令行管理**和**从 rustdesk-api 一次性导入**（§14、§15）。
 
-第三期加了：**Porta 上报路径和设备签名**（`/api/porta/v1/`，第三期实施契约 01 块，§9.5）。Porta 客户端的心跳、sysinfo、被控端审计改走这条路径，每个请求用设备私钥签名，第一次验签通过就锁定这台设备的公钥；原版客户端照走 §9.3 的兼容接口。
+第三期加了：
+- **Porta 上报路径和设备签名**（`/api/porta/v1/`，第三期实施契约 01 块，§9.5）。Porta 客户端的心跳、sysinfo、被控端审计改走这条路径，每个请求用设备私钥签名，第一次验签通过就锁定这台设备的公钥；原版客户端照走 §9.3 的兼容接口。
+- **路由第二级**（第三期实施契约 02 块，§7 第二级）：Porta 客户端测到各中继的 TCP 建连耗时，随 Porta 心跳上报；选中继时某一端有可用的实测就整端代替估算。
 
-不做（第一期）：OIDC 和第三方登录、邮箱验证码和 TOTP、Web 管理后台、路由第二级（客户端测速）、TCP 注册（走代理/WebSocket/禁 UDP 的被控端原版就显示离线，维持现状）、修改 ID（`RegisterPk.old_id`）、`HttpProxyRequest`（API 经 21116 回落）、WebRTC 信令转发、转发 `udp_port`（UDP 打洞）、心跳下发 `disconnect`、`audit/conn/active`、`PUT /api/audit`、旧版地址簿 `GET/POST /api/ab`，以及总方案第 4 节列的全部"明确不做"。hbbr（`src/relay_server.rs`）不改逻辑。
+不做（第一期）：OIDC 和第三方登录、邮箱验证码和 TOTP、Web 管理后台、路由第二级（客户端测速；第三期做，见 §7 第二级）、TCP 注册（走代理/WebSocket/禁 UDP 的被控端原版就显示离线，维持现状）、修改 ID（`RegisterPk.old_id`）、`HttpProxyRequest`（API 经 21116 回落）、WebRTC 信令转发、转发 `udp_port`（UDP 打洞）、心跳下发 `disconnect`、`audit/conn/active`、`PUT /api/audit`、旧版地址簿 `GET/POST /api/ab`，以及总方案第 4 节列的全部"明确不做"。hbbr（`src/relay_server.rs`）不改逻辑。
 
 ## 2. 代码布局与文件归属
 
@@ -43,6 +45,8 @@
 | `src/api/mod.rs` | axum 路由表、通用响应和请求体解析、Bearer 认证提取器、静态说明页 | 骨架 |
 | `src/rendezvous_server.rs`、`src/kx.rs`、`src/peer.rs`、`src/common.rs` | 会合逻辑和挂钩（§6） | 会合 |
 | `src/router/` | 路由第一级、健康检查、GeoIP 加载与更新（§7） | 路由 |
+| `src/router/measure.rs` | 第三期：路由第二级的测量表（每台设备最近一轮测量，只在内存，§7 第二级） | 第三期 02 |
+| `migrations/0005_route_legs.sql` | 第三期：`conn_attempt.route_a_ms`、`route_b_ms`（§4.2、§8） | 第三期 02 |
 | `src/conn_tracker.rs` | 连接结果记录与统计（§8） | 结果记录 |
 | `src/api/account.rs`、`src/api/group.rs` | 账号接口、组面板（§9.2、§11、§12.3） | 账号 |
 | `src/api/ab.rs` | 地址簿 12 个接口（§12） | 地址簿 |
@@ -93,10 +97,11 @@
 
 ### 4.2 表结构（`migrations/0001_init.sql` 照此实现，列名、类型、约束不得自行改动）
 
-下面是 `0001` 的原样；之后的迁移除 `0004` 加一列外只动索引，现行索引以迁移文件为准：
+下面是 `0001` 的原样；之后的迁移除 `0004`、`0005` 加列外只动索引，现行索引以迁移文件为准：
 - `0002`：三张审计表各加 `created_at` 索引（保留期删除，§9.3）；`device_user` 换成 `device_user_seen(user_id, last_seen_at)`。
 - `0003`：`audit_conn_session` 换成 `audit_conn_session_dev(session_id, device_id, conn_type)`（备注更新，§9.3）；`audit_conn_dev` 换成部分索引 `audit_conn_open(device_id, conn_id) where closed_at is null`（认证成功和 close 上报找未关闭的记录，§9.3）；加部分索引 `device_owned_seen(last_seen_at, user_id, id) where user_id is not null`（设备表淘汰）；`token_user` 换成 `token_user_device(user_id, device_id)`。
 - `0004`（第三期）：`alter table peer add column pk_pinned_at integer`，锁定时间（unix 秒），NULL 表示未锁定。放 `peer` 不放 `device`，因为 `device` 行会被淘汰。笔记 02 预留的 `token.device_verified` 没加（第三期没人读写，等签名登录设计时再加）。
+- `0005`（第三期）：`conn_attempt` 加 `route_a_ms real`、`route_b_ms real`：选中中继两段的延迟（毫秒，未乘权重），实测还是估计看 `route_reason`（§8）。`route_reason` 的取值因此多了 `rtt`、`rtt_a`、`rtt_b`（§7）。每行多约 16 字节，§8 的行大小估算不变。
 
 ```sql
 -- hbbs 原表，原样保留（见笔记 02 §2.4）
@@ -290,7 +295,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 改动都按"只加挂钩、不重写流程"做，行为和原版保持一致，除非下面明确要求。
 1. **KeyExchange v1**：21116/TCP 每条连接 accept 后、有 `sk` 时先发 `KeyExchange`（v1：签名的临时公钥 + `signed_params`），读第一帧：是 `KeyExchange` 且 `keys.len()==2` 就建立加密，之后收发都加解密；第一帧不是 `KeyExchange` 就按明文 `RendezvousMessage` 处理。写半边存进 `tcp_punch` 时要带上加密器（`Sink` 改型）。完整步骤和客户端测试里的服务端替身见笔记 02 §6.2。21118（WebSocket）**不做** KeyExchange、服务端也不先发：客户端 `use_ws()` 时 `secure_tcp`/`secure_tcp_required` 都直接跳过（客户端 `src/common.rs` `secure_tcp_impl`），`Sink::Ws` 不带加密器。`sk` 为 None（`-k` 传的是公钥）时，启动时打一条 error 日志："没有私钥，无法做 KeyExchange，登录过的客户端会连接失败；请用 `-k -` 或 `-k <base64 私钥>`"。
 2. **IPv6 信令转发**：按笔记 02 §6.5 的表补 `socket_addr_v6`（以及 `PunchHole` 的 `force_relay`、`PunchHoleResponse` 的 `upnp_port`）。不转发 `udp_port` 和 WebRTC 字段。hbbs 强制中继（`ALWAYS_USE_RELAY` 或 mask 异或）时清空转发的 v6 地址并置 `force_relay`（笔记 02 §6.4）。
-3. **路由挂钩**：`handle_punch_hole_request` 里调 `router.select(&RouteQuery{a_ip, b_ip, b_id, a_token, conn_type}).await`；`RelayResponse` 分支和控制台 `tg` 也改调 router（`b_id` 传空串）。新增控制台命令 `gu`：让路由模块立即执行一次 GeoIP 下载/重新加载并回显结果（§14 `geo update` 用）。`io_loop` 的中继定时器分支、`Data::RelayServers` 删掉，健康检查挪进 router（笔记 02 §3.5）。控制台 `rs` 无参数时打印 `router.status_text()`。
+3. **路由挂钩**：`handle_punch_hole_request` 里调 `router.select(&RouteQuery{a_ip, b_ip, a_id, b_id, a_token, conn_type}).await`，`a_id` 是 `PunchHoleRequest.porta_from_id`（第三期，字段号 1000，发起方自报的设备 ID，不认证；超过 253 字节当空串），只用来查 A 的第二级测量（§7）；选中中继两段的延迟随结果记录写进 `conn_attempt`（§8）。`RelayResponse` 分支和控制台 `tg` 也改调 router（`RelayResponse` 的 `a_id`、`b_id` 都传空串）。新增控制台命令 `gu`：让路由模块立即执行一次 GeoIP 下载/重新加载并回显结果（§14 `geo update` 用）。`io_loop` 的中继定时器分支、`Data::RelayServers` 删掉，健康检查挪进 router（笔记 02 §3.5）。控制台 `rs` 无参数时打印 `router.status_text()`。
 4. **结果记录挂钩**：H1~H5 五处调用 `tracker`（笔记 02 §4.4），只取字段、不阻塞（tracker 内部用通道异步落库）。
 5. 修掉控制台 `aur` 把中继列表清空的那一行（笔记 02 §3.4）。
 5a. 21118（WebSocket）只在 TCP 对端是回环地址时才信任 `X-Real-IP`/`X-Forwarded-For`，否则用 TCP 对端地址（原版对任何来源都信任，直连 21118 就能伪造来源 IP，影响按 IP 选中继、限流和记录；笔记 02 §5）。反向代理和 porta-server 同机部署时行为不变；这时反代转发到 21118 的 location 必须覆盖 `X-Real-IP`（和 21114 同一条硬性部署要求，见 §10），否则客户端自带的头会被原样采信。
@@ -320,9 +325,9 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
    - 发往 UDP 的消息（转发给 B 的 `PunchHole`、`RequestRelay` 等）进一个最多 4096 条的有界队列，连接任务不等、队列满了就丢弃（每分钟最多一条 warn），`io_loop` 卡住时内存不随攻击带宽增长。`RequestRelay` 不校验任何东西就转给 B，所以：每条连接最多 12 条，超过就断开（客户端每次尝试一条，最多 3 次）；转发时只带客户端会设的字段（`id`、`uuid`、`relay_server`、`secure`、`conn_type`、`token`、`switch_code`，加服务端填的 `socket_addr`），`uuid`、`token`、`switch_code` 截到 64 字节、`relay_server` 截到 253 字节，不带 `licence_key`；`PunchHoleRequest` 转发的 `socket_addr_v6` 超过 18 字节（`AddrMangle` 编码的 IPv6 地址长度）就清空（审查 C-13）。
 9. **局域网多候选地址**（第三期，porta-cardo `1a46681`）：`handle_local_addr` 把 `LocalAddr.porta_local_addrs`（字段号 1000，`repeated bytes`，Porta 被控端报的物理网卡局域网地址，`AddrMangle` 编码）原样放进发给控制端的 `PunchHoleResponse{is_local}` 的同名字段。只做限长，不解码、不打日志：超过 18 字节（`AddrMangle` 能编出的最长值，IPv6 地址 16 字节加 2 字节端口；IPv4 最多 11 字节）的丢掉，剩下的取前 8 个（Porta 客户端最多报 8 个）。原版客户端不发这个字段，响应和原来一样。用途和客户端两侧怎么用见 `client/PORTA.md` §3。
 
-## 7. 路由第一级（`src/router/`）
+## 7. 路由（`src/router/`）
 
-- 接口：`async fn select(&self, q: &RouteQuery<'_>) -> RouteDecision { relay: String, reason: &'static str }`。返回单个中继字符串（原版客户端只认一个）；空串语义照旧（被控端退回"hbbs 主机:21117"）。`reason` 取值为 `fixed`（固定中继）、`geo`（双方都有位置）、`geo_a`/`geo_b`（只有 A 或只有 B 有位置）、`rr`（轮询）、`none`（没有配置中继）。
+- 接口：`async fn select(&self, q: &RouteQuery<'_>) -> RouteDecision { relay: String, reason: &'static str, a_ms: Option<f64>, b_ms: Option<f64> }`。返回单个中继字符串（原版客户端只认一个）；空串语义照旧（被控端退回"hbbs 主机:21117"）。`reason` 取值为 `fixed`（固定中继）、`rtt`（两端都用实测，第二级）、`rtt_a`/`rtt_b`（只有 A 或只有 B 用实测）、`geo`（双方都有位置）、`geo_a`/`geo_b`（只有 A 或只有 B 有位置）、`rr`（轮询）、`none`（没有配置中继）。`a_ms`/`b_ms` 是选中中继两段的延迟（毫秒，未乘权重；实测还是估计看 `reason`），`fixed`、`rr`、`none` 和没有值的那一段为 `None`。
 - 固定中继：每次调用按 `b_id` 查一次 `device_policy.relay_pin`（主键查询，不缓存），所以命令行 `device pin-relay` 写库后下一次连接就生效。有固定中继时直接用它，不看健康状态（运维的明确意图）。`b_id` 为空串时跳过这一步。查库失败时当作没有固定中继，日志按 §6 第 7 条限频、id 截断后用 `{:?}` 打（每条打洞请求都会走到这里，审查 D-19）。中继列表、健康状态、GeoIP 都在内存里。
 - 候选：健康检查判为可达的中继。
 - 代价：`cost(R) = (rtt(A,R) + rtt(B,R)) × weight(R)`，取最小。`rtt` 按笔记 06 §4：大圆距离 × 2 × `detour` / 200 km/ms，加每段的跨运营商组、跨境惩罚；`multi_bgp` 的中继不算跨运营商。
@@ -338,10 +343,29 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 - 每次决策打一行 debug 日志：双方国家/运营商组、候选代价、选中的中继和 `reason`。
 - 运营商组：内置中国三大运营商的主要 ASN 表（写代码前到 bgp.he.net 或 PeeringDB 核对），查不到时按"ASN 相等算同组"。不用 AS 名称做字符串匹配。
 
+### 第二级（第三期，`measure.rs`、`cost.rs`）
+设计依据是总仓库 `docs/第三期实施契约/02-路由第二级.md`（下称"契约 02"），这里按代码的最终行为写。Porta 客户端在服务进程里测到每台候选中继的 TCP 建连耗时（每台 3 次取最小，约 5 分钟一轮），随 Porta 心跳上报（§9.5）；服务端选中继时，某一端有可用的实测就用实测代替这一端的估计。
+- **下发的列表**：配置里的全部中继（含健康检查暂判不可达的）的前 32 台（`MAX_PROBED`）原串，和 `PunchHole.relay_server` 下发的是同一个字符串。超过 32 台时启动（和 `rs` 替换）打一条 warn：第 33 台起永远没有实测，它可达时两端都退回估计，等于第二级失效。版本号 `rev`：对"这些原串用 `\n` 连起来 + `\n` + 测速间隔（常量 300 秒，`PROBE_INTERVAL_SECS`）"做 sha256，取法同 §10 的策略 `rev`（`strategy::digest_rev`）；重启后同一份配置算出同一个 rev，`rs` 换了列表就变。`rev` 和列表放在同一把锁下，读到的总是配对的。
+- **测量表**（`Measurements`，只在内存，不落库）：键是 Porta 心跳**验签得来**的设备 ID（伪造不了别人的测量），每台存最近一轮：列表版本、测量时刻（收到时刻 − `age_s`，不依赖两边时钟）、按列表下标排的每台结果（`Rtt(ms)` / `Down` / `Unknown`）。一条约 ID + 32 × 4 字节。
+  - 写入：`probes` 形状不对（`routing_rev`、`age_s` 缺失或类型不对，`rtt` 不是"字符串 → 整数"，`down` 不是字符串数组）、`routing_rev` 不是当前版本、`age_s > 900` 的整轮丢弃，只打 trace，心跳照常处理。`rtt` 的键必须逐字等于列表里的原串、值在 1~10000，否则这一台留 `Unknown`；`down` 同样只认列表里的原串；同一台两边都有时以 `rtt` 为准。
+  - 上限 1 万台（`MAX_MEASURED`，同 `device` 表）。已有这个 ID 就覆盖；满了先删所有过期的，仍满就删测量时刻最老的一条。不需要定时清理。
+  - 读出：版本不是当前的、或测量时刻超过 15 分钟（`MEASURE_TTL`）的视为没有。`decide` 在一次加锁里取 A、B 两份。
+- **整端替换**（`cost::score`）：
+  1. 一端"用实测"的条件：这一端有可用的测量，并且对当前**每一台可达候选**都不是 `Unknown`。不满足就整端用估计。
+  2. 用实测的一端标 `Down` 的中继从这一对的候选里去掉；去掉后一台不剩时，忽略这一端的 `down`、把它当作"不用实测"。先处理 A，再在 A 留下的候选上处理 B（A 只留下 B 标 `Down` 的中继时，B 退回估计）。
+  3. 每台候选的一段：用实测的一端取实测值，否则取第一级的估计；代价沿用第一级：两段都有 `(a + b) × weight`，只有一段 `2 × 那一段 × weight`，都没有不参加排序。所以没有位置的中继在实测端也有值，和有位置的中继混排。
+  4. `reason`：两端都用实测 `rtt`，只有 A `rtt_a`，只有 B `rtt_b`，都不用时同第一级（两端都没位置返回 `None` 走轮询）；一端用实测时即使两端都没位置也有代价，不轮询。
+  5. 选中那台的两段放进 `RouteDecision.a_ms`/`b_ms`。
+  - 固定中继仍然最先判断（`b_id` 非空时查 `device_policy`）。
+- **两端的 ID**：B 的 ID 就是打洞请求的目标 ID；A 的 ID 来自 `PunchHoleRequest.porta_from_id`，不认证：A 冒用别人的 ID，只会让 A 自己这次连接按别人的测量选路，拿不到任何数据。原版客户端不发，A 段按估计。
+- **`RelayResponse` 分支不走第二级**：那里 `a_id`、`b_id` 都是空串（只在 B 回报的中继等于 hbbs 自己的 `local_ip` 时才调路由）；它也不遵守固定中继，是第一期就有的问题（已知，未排期）。
+- `relay status`（控制台 `rs`）末尾多一行 `measurements: <N> devices, <M> fresh`（表里的设备数、其中现在可用的数）。`route test --a/--b`（控制台 `tg` 的第 3、4 个参数）见 §14。
+
 ## 8. 连接结果记录（`src/conn_tracker.rs`）
 
 - 按笔记 02 §4.4 实现：内存跟踪器（键 `try_into_v4(A:p1)`、`(A 公网 IP, B id)`、`try_into_v4(A:p3)`），每 5 秒扫一遍把到期的记录定稿写入 `conn_attempt`，定稿规则照笔记，下面几条是对笔记的补充和更正。热路径（H1~H5）只做内存操作，不 await 数据库。
-- `a_user`/`a_device_id`：H1 只把 `PunchHoleRequest.token` 原串存进内存记录，反查放在后台（定稿写库时）调 `auth::token_owner`（async）；`a_user` 存 `user.name`，`a_device_id` 存 `token.device_id`；未登录或令牌已失效时两者都是 NULL。
+- `a_user`/`a_device_id`：H1 只把 `PunchHoleRequest.token` 原串存进内存记录，反查放在后台（定稿写库时）调 `auth::token_owner`（async）；`a_user` 存 `user.name`，`a_device_id` 存 `token.device_id`；未登录或令牌已失效时两者都是 NULL。第三期不用不认证的 `porta_from_id` 填 `a_device_id`，也不另存它（契约 02 D2-1）：用没用上 A 的测量看 `route_reason`。
+- `route_reason`、`route_a_ms`、`route_b_ms`（第三期，迁移 0005）：H1 时路由模块的 `reason`、`a_ms`、`b_ms`；`forced_relay` 时 `relay_offered` 被改成 `local_ip`，这三列仍记路由模块的原判断。重复请求合并进同一行时，三列和 `relay_offered` 一起跟着"B 回答之前最近一次成功的请求"走。
 - `outcome` 取值全集：`rejected`、`no_reply`、`relay`、`relay_or_v6`、`relay_failed`、`relay_unmatched`、`direct_lan`、`direct_tcp`、`direct_tcp_or_v6`。
 - 窗口（命名常量，标注"待实测"）：直连判定窗口 `W = max(45 秒, 6 × (reply_at − started_at) + 20 秒)`（A 的直连超时 = 打洞耗时 × 6，没有封顶；客户端的打洞耗时还包含连 hbbs 和 KeyExchange 的时间，hbbs 看不到，20 秒余量约能覆盖 3 秒，实测时要专门覆盖慢建连）；H5 匹配时要求 `RequestRelay` 落在 `reply_at + W` 以内；一条记录最多合并 3 次 `RequestRelay`（客户端最多回落 3 次），而且只在它第一次 `relay_req_at` 之后 60 秒内合并，超出的另起一条 `relay_only`；匹配到 `RequestRelay` 的记录，等最后一次 `relay_req_at` + 20 秒后才定稿，那时有 `relay_resp_at` 记 `relay`，没有记 `relay_failed`。
 - H5 没匹配到打洞记录：写一行 `signal='relay_only'`：`started_at`、`relay_req_at` 取收到的时刻；`a_ip`/`a_port` 取 A:p3；`via` 照实；`b_id = rf.id`；`conn_type`、`a_nat_type`、`a_force_relay`、`a_has_v6`、`server_forced_relay` 填 0；`a_user` 照常反查。有 `relay_resp_at` 记 `relay_unmatched`，没有记 `relay_failed`。
@@ -430,14 +454,15 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 
 **响应签名**：`Porta-Server-Sig: <base64url(签名 64 字节)>`，被签内容 `"porta-server-v1\0" ‖ 请求的签名(64 字节) ‖ sha256(响应体)`，用 `AppState.sk`。2xx 和 `bad_auth` 以外的 401 带签名；`bad_auth`、400、404、405、413、429、503 不带。服务端没有私钥（`-k` 传公钥）时都不带。
 
-**心跳**（`device::porta_heartbeat`）：请求体 JSON 对象，键不出现表示没有：`uuid`、`ver`、`porta`（客户端 `libs/porta` 的版本）、`strategy_rev`、`sysinfo_hash`（标准 base64 的 sha256）、`sysinfo`（对象，按原始字节收）。`conns` 和 02 块的 `routing_rev`、`probes` 目前不读，serde 跳过，坏值也不影响。流程：
-1. 解析；`uuid` 超长 400；`sysinfo` 原文超过 8 KB 413；`sysinfo` 里 `hostname`、`username`、`os`、`version` 类型不对 400。
-2. 写 `Peer.porta_hb = { at: now, porta_ver }`，`porta_ver = get_version_number(porta)` 限到 u32（解析不出为 0）。400、413 的心跳和 Porta 审计都不写它。
+**心跳**（`device::porta_heartbeat`）：请求体 JSON 对象，键不出现表示没有：`uuid`、`ver`、`porta`（客户端 `libs/porta` 的版本）、`strategy_rev`、`sysinfo_hash`（标准 base64 的 sha256）、`sysinfo`（对象，按原始字节收）、`routing_rev`（第三期 02 块：客户端手里那份中继列表的版本，没有为 0）、`probes`（02 块：最近一轮测速，`{routing_rev, age_s, rtt: {原串: 毫秒}, down: [原串]}`，契约 02 §2.2）。`conns` 不读，serde 跳过。`probes` 先收成任意 JSON 值，形状不对只丢这轮测量（§7 第二级），不回 400。流程：
+1. 解析；`uuid` 超长 400；`sysinfo` 原文超过 8 KB 413；`sysinfo` 里 `hostname`、`username`、`os`、`version` 类型不对 400；`routing_rev` 不是整数 400。
+2. 写 `Peer.porta_hb = { at: now, porta_ver }`，`porta_ver = get_version_number(porta)` 限到 u32（解析不出为 0）。400、413 的心跳和 Porta 审计都不写它。带了 `probes`：`router.record_probes(签名头里的 ID, probes)`（§7 第二级）。
 3. 带了 `sysinfo`：`store_sysinfo(…, "porta")`，原文按请求里的字节原样存。
 4. `touch(…, "porta")` 写设备行，得到库里现存的 sysinfo 原文。
 5. 有设备行，且库里 sysinfo 为空或 `base64(sha256(原文)) != sysinfo_hash` → 响应带 `need_sysinfo: true`；没能建行时不带这个键。
 6. `strategy::effective`，`rev != strategy_rev` 时带 `strategy: {rev, options}`（全部生效选项，值一律字符串，空串表示删键）。
-7. 签名回 200：`{"api": 1, "features": [], "time": <服务器 unix 秒>, …}`。`features` 是常量数组，本期为空（04 块加 `"udp-punch"`）；02 块的 `routing` 字段还没有。查库失败一律 503。
+7. `routing_rev` 不等于路由模块当前的列表版本时带 `routing: {rev, probe_interval_secs: 300, relays: [前 32 台原串]}`（§7 第二级；没有配置中继时 `relays` 为 `[]`，客户端停止测速）；相等时不带。
+8. 签名回 200：`{"api": 1, "features": [], "time": <服务器 unix 秒>, …}`。`features` 是常量数组，本期为空（04 块加 `"udp-punch"`；02 块不加特性项，客户端看响应里有没有 `routing`）。查库失败一律 503。
 
 哈希只算在 sysinfo 这个 JSON 值的原始字节上；服务端原样存那段字节，比对时当场算，不加列。兼容路径存的是整个兼容请求体，哈希必然不同，所以设备从兼容路径切到 Porta 路径后会重传一次 sysinfo。
 
@@ -539,7 +564,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 - 控制台 `kl <id>` / `key-reload <id>`（第三期）：只按库重载内存，谁都能触发，效果只是让内存和库对齐。条目在内存里：库里有行就把内存刷成库里的值（含 `pinned`），回 `<id>: reloaded from the database`；库里没有行就移除条目，回 `<id>: not in the database, dropped from memory`。不在内存里回 `<id>: not in memory, nothing to reload`。走主池（连接任务，不占会合池）。
 - `strategy show [<device>]`（列出生效选项和 rev）、`strategy set <device|'*'> <key> <value>`、`strategy unset <device|'*'> <key>`（写成墓碑 `''`，让客户端删掉这个键；`set`、`unset` 拒收 `porta-` 开头的键，§10）、`strategy forget <device|'*'> <key>`（删行，不再下发这个键；设备级删掉后回到全局值）、`strategy repush <device|'*'>`（递增 epoch）
 - `device pin-relay <device> <host|none>`
-- `relay status`（控制台 `rs`）、`route test <ipA> <ipB>`（控制台 `tg`）
+- `relay status`（控制台 `rs`；第三期末尾多一行 `measurements: <N> devices, <M> fresh`，§7 第二级）、`route test <ipA> <ipB> [--a <device>] [--b <device>]`（控制台 `tg <ipA> <ipB> <idA|-> <idB|->`，`-` 表示没有；ID 为空、是 `-` 或含空白时报错）。带 ID 时用这两台设备的第二级测量，每台可达中继后面标出两段用的是实测（`rtt 23ms` / `down`）还是估计（`est 21.3ms`，没有位置为 `est ?`），被实测 `down` 去掉的标 `no cost (measured down)`；不带 ID 时输出和第一级一样。
 - `geo lookup <ip>`（直接读本地 mmdb：国家、经纬度、ASN、运营商组）、`geo update`（走控制台 `gu`，由服务进程执行下载、校验和热切换并回显结果；连不上控制台即服务没在运行时，才在命令行进程里直接下载，不做目录清理）
 - `stats [--days N]`：中继回落率和各结果计数（§8）
 - `import rustdesk-api <db 路径> [--dry-run]`（§15）
@@ -571,6 +596,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 - HTTP 契约测试：用 axum `Router` + 临时 SQLite（`tower::ServiceExt::oneshot`，骨架提供测试辅助），逐条断言 §9.1 的约定（状态码、Content-Type、空 body、字段类型），以及地址簿权限、级联、写接口边界、心跳下发规则（含：sysinfo 已存在时响应里没有 `sysinfo` 键；`modified_at` 是 JSON number）。
 - 会合测试：在回环地址上起真实监听，模拟客户端做 KeyExchange（v0 和 v1 都测）后发 `PunchHoleRequest`，断言 v6 地址被转发、强制中继时被清空、选中的中继符合路由规则（可参照客户端 `src/common.rs` 里的 `rendezvous_stub` 测试写法）。
 - 第三期 01 块（Porta 上报路径）的测试：签名向量和客户端共用一组常量（请求头和响应签名逐字节一致）；验签链每种拒绝原因一条（`bad_auth` 不签名不带 `time`，其余 401 带签名和 `time`）；时间窗用固定 now 测 ±60 接受、±61 拒绝；防重放（乱序 30 秒、64 条后 `floor` 抬升、4096 台时淘汰最久未见）；锁定（首个合法请求后库和内存都锁定、从库重新加载的条目也是锁定、公钥已换时条件更新 0 行请求仍成功、库层守卫挡住旧快照换公钥、只换 IP 照常、行已删回 `SERVER_ERROR`）；会合层（锁定后换公钥回 `UUID_MISMATCH`、换 IP OK、不经控制台改库后注册以库为准、锁定条目的重载计入查库预算、已删行的换 IP 注册回 `SERVER_ERROR`）；防降级（锁定后兼容心跳 `{}`、sysinfo 403、审计不入库、登录照样绑定）；Porta 心跳（`need_sysinfo`、sysinfo 逐字节存、哈希、按 rev 下发策略、`client_type` 切换、响应签名可验、坏请求体、`porta_hb`）；Porta 审计（nonce 两路共用、写库失败 503 且 nonce 不登记、体里 `id` 被忽略、`note` 不走备注分支）；中间件（413/405 的 Porta 格式、超时和 panic 回 503、未知路径 404）；命令行（`device key` 输出、`device key reset` 改库加 `kl` 重载、回复校验、连不上控制台时报错）；迁移 0004 在第一期的库上执行。
+- 第三期 02 块（路由第二级）的测试：`cost::score` 的整端替换（两端、单端、测量没覆盖全部候选退回估计、`down` 去掉候选、全部 `down` 忽略、先 A 后 B、两端都没位置但一端有实测仍有代价、选中那台的两段）；测量表（版本不符、`age_s > 900`、不认识的原串、毫秒越界、形状不对都不影响别的条目，15 分钟按测量时刻过期，满 1 万条先删过期再删最老）；列表版本（同一列表同一值、`rs` 换列表变、空列表非 0、超过 32 台只算前 32）；`select` 用两端测量、固定中继仍优先、换列表后旧测量不用；Porta 心跳（`routing_rev` 相同不带 `routing`、不同带，坏 `probes` 照常 200，测量记在验签得到的 ID 下）；打洞请求带 `porta_from_id` 时 `conn_attempt` 记 `rtt` 和两段、超长按空串；控制台 `tg` 和命令行 `route test` 带不带 ID；迁移 0005 在第一期的库上执行。关键断言做过变异验证。
 - 第一期验收（部署后由维护者用原版客户端做）：登录、地址簿、设备列表、审计正常；被控端本地写死的中继能被远程清掉；中继按双方位置选择；控制端勾选 IPv6 后两端都有 IPv6 时能直连。
 
 ## 17. 工程约定

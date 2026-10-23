@@ -1,16 +1,19 @@
-//! Relay selection, level one (PORTA.md §7): per-device fixed relay, geo cost
+//! Relay selection (PORTA.md §7): per-device fixed relay; level one, the geo cost
 //! `(rtt(A,R) + rtt(B,R)) × weight(R)` over the reachable relays, round-robin fallback, the health check
-//! and GeoIP loading/updating.
+//! and GeoIP loading/updating; level two, the relay measurements Porta devices report, replacing an
+//! end's estimates.
 
 mod cost;
 mod geo;
+mod measure;
 
 use crate::config::{Config, GeoConfig, GeoSource, RelayConfig};
-use cost::{Candidate, Carriers, Loc, Locate};
+use cost::{Candidate, Carriers, Cost, Loc, Locate};
 use hbb_common::{
     bail, config::RELAY_PORT, futures::future::join_all, log, socket_client::check_port, throttled_log, tokio,
     ResultType,
 };
+use measure::{Leg, Measurements};
 use sqlx::SqlitePool;
 use std::{
     fmt::Write as _,
@@ -20,7 +23,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc, RwLock,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// Health check period and per-relay connect timeout (resolution included), as upstream.
@@ -28,6 +31,10 @@ const HEALTH_INTERVAL: Duration = Duration::from_secs(3);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
 /// GeoIP update / mtime check period.
 const GEO_INTERVAL: Duration = Duration::from_secs(24 * 3600);
+/// Level two: only the first this many relays are sent to clients to measure.
+pub const MAX_PROBED: usize = 32;
+/// Level two: how often clients measure (Porta heartbeat `routing.probe_interval_secs`).
+pub const PROBE_INTERVAL_SECS: u64 = 300;
 
 /// Context of one relay choice (note 02 §3.5). IPs are canonical (`::ffff:a.b.c.d` → IPv4).
 pub struct RouteQuery<'a> {
@@ -35,7 +42,10 @@ pub struct RouteQuery<'a> {
     pub a_ip: IpAddr,
     /// Controlled side (B), its last UDP registration address.
     pub b_ip: IpAddr,
-    /// B's id, for `device_policy.relay_pin`.
+    /// A's own id as it claims (`PunchHoleRequest.porta_from_id`, not authenticated; empty when
+    /// absent), for its level-two measurement.
+    pub a_id: &'a str,
+    /// B's id, for `device_policy.relay_pin` and its level-two measurement.
     pub b_id: &'a str,
     /// `PunchHoleRequest.token` (empty when A is not logged in).
     pub a_token: &'a str,
@@ -46,9 +56,14 @@ pub struct RouteQuery<'a> {
 pub struct RouteDecision {
     /// Sent to clients as is; empty keeps upstream's meaning (B falls back to "hbbs host:21117").
     pub relay: String,
-    /// Logged and stored in `conn_attempt.route_reason`: "fixed" (device pin), "geo" (both ends located),
+    /// Logged and stored in `conn_attempt.route_reason`: "fixed" (device pin), "rtt" (both ends
+    /// measured), "rtt_a" / "rtt_b" (only A / only B measured), "geo" (both ends located),
     /// "geo_a" / "geo_b" (only A / only B located), "rr" (round-robin), "none" (no relay configured).
     pub reason: &'static str,
+    /// The chosen relay's two legs in ms, before the weight (measured or estimated as `reason`
+    /// says); `None` for "fixed", "rr", "none" and for a leg without a value.
+    pub a_ms: Option<f64>,
+    pub b_ms: Option<f64>,
 }
 
 /// One configured relay and what the health check knows about it.
@@ -80,6 +95,35 @@ struct Relays {
     /// Bumped by `rs` replacements and GeoIP swaps; a health round that started before is discarded.
     gen: u64,
     list: Vec<RelayState>,
+    /// Level two: version of the list sent to clients (`routing_rev` of `list`), so a round is
+    /// matched with the list it measured.
+    rev: i64,
+}
+
+impl Relays {
+    fn new(list: Vec<RelayState>) -> Self {
+        let rev = routing_rev(&list);
+        Self { gen: 0, list, rev }
+    }
+
+    /// The list clients measure: the first `MAX_PROBED` hosts, verbatim.
+    fn probed(&self) -> impl Iterator<Item = &str> {
+        self.list.iter().take(MAX_PROBED).map(|s| s.cfg.host.as_str())
+    }
+}
+
+/// sha256 of the probed hosts joined with `\n`, then `\n` and the probe interval (PORTA.md §7, as the
+/// strategy `rev`): the same configuration gives the same rev across restarts. Warns when relays
+/// beyond `MAX_PROBED` take no part in level two.
+fn routing_rev(list: &[RelayState]) -> i64 {
+    if list.len() > MAX_PROBED {
+        log::warn!(
+            "{} relays configured: only the first {MAX_PROBED} take part in routing level two (client measurements)",
+            list.len()
+        );
+    }
+    let hosts: Vec<&str> = list.iter().take(MAX_PROBED).map(|s| s.cfg.host.as_str()).collect();
+    crate::strategy::digest_rev(format!("{}\n{PROBE_INTERVAL_SECS}", hosts.join("\n")).as_bytes())
 }
 
 /// The loaded GeoIP databases.
@@ -97,6 +141,8 @@ pub struct Router {
     rotation: AtomicUsize,
     /// Serializes GeoIP updates (daily task and console `gu`), which share the `*.part` names.
     geo_lock: tokio::sync::Mutex<()>,
+    /// Level two: the devices' latest measurements.
+    measured: Measurements,
 }
 
 /// A decision with what led to it, for the debug log and `tg`.
@@ -104,8 +150,21 @@ struct Explained {
     decision: RouteDecision,
     a: Loc,
     b: Loc,
-    /// Per configured relay: host, reachable, cost (`None`: no cost, i.e. no position or no basis).
-    rows: Vec<(String, bool, Option<f64>)>,
+    /// Whether A's / B's measurement replaced its estimates.
+    use_a: bool,
+    use_b: bool,
+    rows: Vec<Row>,
+}
+
+/// One configured relay in an [`Explained`].
+struct Row {
+    host: String,
+    reachable: bool,
+    /// `None`: no part in the choice (no position or no basis, or down on a measured end).
+    cost: Option<Cost>,
+    /// What A's / B's usable measurement says of it.
+    meas_a: Leg,
+    meas_b: Leg,
 }
 
 impl Router {
@@ -117,11 +176,27 @@ impl Router {
             db,
             carriers,
             cfg,
-            relays: RwLock::new(Relays { gen: 0, list }),
+            relays: RwLock::new(Relays::new(list)),
             geo: RwLock::new(None),
             rotation: AtomicUsize::new(0),
             geo_lock: tokio::sync::Mutex::new(()),
+            measured: Measurements::default(),
         }
+    }
+
+    /// Level two: the current list `rev` and the hosts clients are to measure (the Porta heartbeat's
+    /// `routing`).
+    pub fn routing(&self) -> (i64, Vec<String>) {
+        let relays = self.relays.read().unwrap();
+        (relays.rev, relays.probed().map(str::to_owned).collect())
+    }
+
+    /// Level two: stores the `probes` of a signed heartbeat as `id`'s latest round (dropped unless it
+    /// is for the current list; a bad shape drops it too, quietly).
+    pub fn record_probes(&self, id: &str, probes: &serde_json::Value) {
+        let relays = self.relays.read().unwrap();
+        let hosts: Vec<&str> = relays.probed().collect();
+        self.measured.record(id, probes, &hosts, relays.rev, Instant::now());
     }
 
     pub async fn select(&self, q: &RouteQuery<'_>) -> RouteDecision {
@@ -129,7 +204,12 @@ impl Router {
             match self.pinned(q.b_id).await {
                 Ok(Some(relay)) => {
                     log::debug!("route b={} fixed relay {relay}", q.b_id);
-                    return RouteDecision { relay, reason: "fixed" };
+                    return RouteDecision {
+                        relay,
+                        reason: "fixed",
+                        a_ms: None,
+                        b_ms: None,
+                    };
                 }
                 Ok(None) => {}
                 // Throttled: every punch request to an online peer gets here (PORTA.md §6 item 7).
@@ -141,7 +221,7 @@ impl Router {
                 ),
             }
         }
-        let x = self.decide(q.a_ip, q.b_ip);
+        let x = self.decide(q.a_ip, q.b_ip, q.a_id, q.b_id);
         log::debug!(
             "route a={} [{}] b={} [{}] costs [{}] -> {:?} ({})",
             q.a_ip,
@@ -150,10 +230,10 @@ impl Router {
             describe(&x.b),
             x.rows
                 .iter()
-                .map(|(host, reachable, cost)| match (reachable, cost) {
-                    (false, _) => format!("{host}=down"),
-                    (true, Some(c)) => format!("{host}={c:.1}"),
-                    (true, None) => format!("{host}=-"),
+                .map(|r| match (r.reachable, r.cost) {
+                    (false, _) => format!("{}=down", r.host),
+                    (true, Some(c)) => format!("{}={:.1}", r.host, c.cost),
+                    (true, None) => format!("{}=-", r.host),
                 })
                 .collect::<Vec<_>>()
                 .join(" "),
@@ -177,57 +257,82 @@ impl Router {
         self.geo.read().unwrap().clone()
     }
 
-    fn decide(&self, a_ip: IpAddr, b_ip: IpAddr) -> Explained {
+    /// `a_id`, `b_id`: whose level-two measurements to use (empty: none).
+    fn decide(&self, a_ip: IpAddr, b_ip: IpAddr, a_id: &str, b_id: &str) -> Explained {
         let geo = self.geo_snapshot();
         let locate = geo.as_ref().map(|g| g.db.as_ref());
         let server = self.cfg.geo.server_location.as_ref();
         let a = cost::client_loc(a_ip, locate, &self.carriers, server);
         let b = cost::client_loc(b_ip, locate, &self.carriers, server);
         let relays = self.relays.read().unwrap();
-        let cands: Vec<&RelayState> = relays.list.iter().filter(|s| s.reachable).collect();
+        let (meas_a, meas_b) = self.measured.pair(a_id, b_id, relays.rev, Instant::now());
+        // Indexed like the list; past the measured part (or without a measurement) unknown.
+        let leg = |m: &Option<Vec<Leg>>, i: usize| m.as_ref().and_then(|m| m.get(i).copied()).unwrap_or(Leg::Unknown);
+        let cands: Vec<(usize, &RelayState)> = relays.list.iter().enumerate().filter(|(_, s)| s.reachable).collect();
         let scored = cost::score(
             &self.cfg.routing,
             &a,
             &b,
             &cands
                 .iter()
-                .map(|s| Candidate {
+                .map(|(i, s)| Candidate {
                     loc: &s.loc,
                     weight: s.cfg.weight,
                     multi_bgp: s.cfg.multi_bgp,
+                    meas_a: leg(&meas_a, *i),
+                    meas_b: leg(&meas_b, *i),
                 })
                 .collect::<Vec<_>>(),
         );
-        let picked = scored
-            .as_ref()
-            .and_then(|(reason, costs)| Some((cost::pick(costs)?, *reason)));
+        let picked = scored.as_ref().and_then(|s| {
+            let i = cost::pick(&s.costs)?;
+            Some((i, s.costs[i]?, s.reason))
+        });
         let decision = if cands.is_empty() {
             RouteDecision {
                 relay: String::new(),
                 reason: "none",
+                a_ms: None,
+                b_ms: None,
             }
-        } else if let Some((i, reason)) = picked {
+        } else if let Some((i, c, reason)) = picked {
             RouteDecision {
-                relay: cands[i].cfg.host.clone(),
+                relay: cands[i].1.cfg.host.clone(),
                 reason,
+                a_ms: c.a_ms,
+                b_ms: c.b_ms,
             }
         } else {
             let i = self.rotation.fetch_add(1, Ordering::Relaxed) % cands.len();
             RouteDecision {
-                relay: cands[i].cfg.host.clone(),
+                relay: cands[i].1.cfg.host.clone(),
                 reason: "rr",
+                a_ms: None,
+                b_ms: None,
             }
         };
-        let mut costs = scored.map(|(_, c)| c).unwrap_or_default().into_iter();
+        let (use_a, use_b) = scored.as_ref().map_or((false, false), |s| (s.use_a, s.use_b));
+        let mut costs = scored.map(|s| s.costs).unwrap_or_default().into_iter();
         let rows = relays
             .list
             .iter()
-            .map(|s| {
-                let cost = if s.reachable { costs.next().flatten() } else { None };
-                (s.cfg.host.clone(), s.reachable, cost)
+            .enumerate()
+            .map(|(i, s)| Row {
+                host: s.cfg.host.clone(),
+                reachable: s.reachable,
+                cost: if s.reachable { costs.next().flatten() } else { None },
+                meas_a: leg(&meas_a, i),
+                meas_b: leg(&meas_b, i),
             })
             .collect();
-        Explained { decision, a, b, rows }
+        Explained {
+            decision,
+            a,
+            b,
+            use_a,
+            use_b,
+            rows,
+        }
     }
 
     /// Console `rs a,b,c` (hosts from `config::parse_relay_list`): replaces the list at run time;
@@ -248,6 +353,7 @@ impl Router {
             })
             .map(|r| RelayState::new(r, &self.carriers))
             .collect();
+        relays.rev = routing_rev(&relays.list);
     }
 
     /// Console `rs` without arguments / `porta-server relay status`.
@@ -294,13 +400,16 @@ impl Router {
                 }
             );
         }
+        let (n, fresh) = self.measured.counts(relays.rev, Instant::now());
+        let _ = writeln!(out, "measurements: {n} devices, {fresh} fresh");
         out
     }
 
-    /// Console `tg a b` / `porta-server route test`: the decision for A=`a`, B=`b`, with an explanation.
-    pub async fn test(&self, a: IpAddr, b: IpAddr) -> String {
+    /// Console `tg a b [idA idB]` / `porta-server route test`: the decision for A=`a`, B=`b`, with an
+    /// explanation; with ids, also which legs are measured (empty id: none).
+    pub async fn test(&self, a: IpAddr, b: IpAddr, a_id: &str, b_id: &str) -> String {
         let (a, b) = (a.to_canonical(), b.to_canonical());
-        let x = self.decide(a, b);
+        let x = self.decide(a, b, a_id, b_id);
         let mut out = format!(
             "A {a}: {}\nB {b}: {}\nrelay: {:?} ({})\n",
             describe(&x.a),
@@ -308,13 +417,32 @@ impl Router {
             x.decision.relay,
             x.decision.reason
         );
-        for (host, reachable, cost) in &x.rows {
-            let what = match (reachable, cost) {
+        // A leg as used: the measurement on a measured end, else the estimate.
+        let leg = |used: bool, meas: Leg, ms: Option<f64>| match (used, meas) {
+            (true, Leg::Rtt(ms)) => format!("rtt {ms}ms"),
+            (true, _) => "down".to_owned(),
+            (false, _) => ms.map_or("est ?".to_owned(), |ms| format!("est {ms:.1}ms")),
+        };
+        let with_ids = !a_id.is_empty() || !b_id.is_empty();
+        for r in &x.rows {
+            let mut what = match (r.reachable, r.cost) {
                 (false, _) => "unreachable".to_owned(),
-                (true, Some(c)) => format!("cost {c:.1}"),
+                (true, Some(c)) => format!("cost {:.1}", c.cost),
+                (true, None) if (x.use_a && r.meas_a == Leg::Down) || (x.use_b && r.meas_b == Leg::Down) => {
+                    "no cost (measured down)".to_owned()
+                }
                 (true, None) => "no cost (position unknown)".to_owned(),
             };
-            let _ = writeln!(out, "  {host}: {what}");
+            if with_ids && r.reachable {
+                let (a_ms, b_ms) = r.cost.map_or((None, None), |c| (c.a_ms, c.b_ms));
+                let _ = write!(
+                    what,
+                    " [A {}, B {}]",
+                    leg(x.use_a, r.meas_a, a_ms),
+                    leg(x.use_b, r.meas_b, b_ms)
+                );
+            }
+            let _ = writeln!(out, "  {}: {what}", r.host);
         }
         out
     }

@@ -910,6 +910,7 @@ impl RendezvousServer {
                                 .select(&RouteQuery {
                                     a_ip: try_into_v4(addr_b).ip(),
                                     b_ip: try_into_v4(addr).ip(),
+                                    a_id: "",
                                     b_id: "",
                                     a_token: "",
                                     conn_type: 0,
@@ -1132,6 +1133,8 @@ impl RendezvousServer {
             server_forced_relay: false,
             relay_offered: String::new(),
             route_reason: "",
+            route_a_ms: None,
+            route_b_ms: None,
         };
         if !key.is_empty() && ph.licence_key != key {
             // Throttled, the id cut: every frame of a connection may be such a request, with an
@@ -1158,6 +1161,8 @@ impl RendezvousServer {
             ph.socket_addr_v6 = Default::default();
         }
         let id = ph.id;
+        // porta: A's own id (routing level two); an overlong one is no id
+        let a_id = if ph.porta_from_id.len() <= MAX_PEER_ID_LEN { ph.porta_from_id.as_str() } else { "" };
         // punch hole request from A, relay to B,
         // check if in same intranet first,
         // fetch local addrs if in same intranet.
@@ -1207,6 +1212,7 @@ impl RendezvousServer {
                 .select(&RouteQuery {
                     a_ip: try_into_v4(addr).ip(),
                     b_ip: try_into_v4(peer_addr).ip(),
+                    a_id,
                     b_id: &id,
                     a_token: &ph.token,
                     conn_type: ph.conn_type.value(),
@@ -1236,6 +1242,8 @@ impl RendezvousServer {
             track.server_forced_relay = forced_relay;
             track.relay_offered = relay_server.clone();
             track.route_reason = route.reason;
+            track.route_a_ms = route.a_ms;
+            track.route_b_ms = route.b_ms;
             // udp_port and the WebRTC offer are not forwarded (PORTA.md §6.2)
             if same_intranet {
                 log::debug!(
@@ -1593,10 +1601,13 @@ impl RendezvousServer {
                         let a = a.to_canonical();
                         if let Some(rs) = fds.next() {
                             if let Ok(b) = rs.parse::<IpAddr>() {
-                                res = self.state.router.test(a, b.to_canonical()).await;
+                                // Optional device ids of A and B (routing level two), `-` for none.
+                                let mut id = || fds.next().filter(|id| *id != "-").unwrap_or("");
+                                let (a_id, b_id) = (id(), id());
+                                res = self.state.router.test(a, b.to_canonical(), a_id, b_id).await;
                             }
                         } else {
-                            res = self.state.router.test(a, a).await;
+                            res = self.state.router.test(a, a, "", "").await;
                         }
                     }
                 }
@@ -2067,9 +2078,12 @@ mod tests {
         let lock = PUNCH_REQS.lock().await;
         assert_eq!(lock.len(), max);
         if max > 0 {
-            // the oldest half is evicted and the newest kept
-            assert_eq!(lock.front().unwrap().to_id, format!("peer{}", max % 31));
-            assert_eq!(lock.back().unwrap().to_id, format!("peer{}", (max * 2 - 1) % 31));
+            // the oldest half is evicted and the newest kept; punch tests running meanwhile add
+            // their own entries (from loopback), each pushing one more of ours out
+            let ours: Vec<&PunchReqEntry> = lock.iter().filter(|e| e.from_ip == "1.2.3.4").collect();
+            let others = max - ours.len();
+            assert_eq!(ours[0].to_id, format!("peer{}", (max + others) % 31));
+            assert_eq!(ours[ours.len() - 1].to_id, format!("peer{}", (max * 2 - 1) % 31));
         }
     }
 
@@ -2436,6 +2450,53 @@ mod tests {
         // aur no longer touches the relay list
         assert_eq!(h.rs.check_cmd("aur N").await, "");
         assert_eq!(h.rs.check_cmd("rs").await, status);
+        // Device ids for level two: `-` is none, and none gives level one's output.
+        let (rev, _) = h.rs.state.router.routing();
+        let probes = serde_json::json!({"routing_rev": rev, "age_s": 0, "rtt": {"r1:21117": 12, "r2": 30}});
+        h.rs.state.router.record_probes("dev-b", &probes);
+        let test = h.rs.check_cmd("tg 1.1.1.1 2.2.2.2 - dev-b").await;
+        assert!(test.contains("(rtt_b)") && test.contains("r1:21117: cost 24.0 [A est ?, B rtt 12ms]"), "{test}");
+        let test = h.rs.check_cmd("tg 1.1.1.1 2.2.2.2 - -").await;
+        assert!(test.contains("(rr)") && !test.contains("[A "), "{test}");
+        assert!(h.rs.check_cmd("rs").await.ends_with("measurements: 1 devices, 1 fresh\n"));
+    }
+
+    /// Routing level two through a punch request: `porta_from_id` picks A's measurements, and the
+    /// record gets the reason and both legs; an overlong `porta_from_id` counts as none.
+    #[hbb_common::tokio::test]
+    async fn punch_request_uses_both_measurements() {
+        let mut h = harness(true, None).await;
+        let router = &h.rs.state.router;
+        let (rev, _) = router.routing();
+        // (A round can't be stored under an overlong id; here it is, to tell "ignored" from "not found".)
+        let long = format!("devA01{}", "x".repeat(MAX_PEER_ID_LEN));
+        for (id, ms) in [("devA01", 15), ("devB01", 25), ("devB02", 35), (long.as_str(), 45)] {
+            router.record_probes(id, &serde_json::json!({"routing_rev": rev, "age_s": 0, "rtt": {RELAY: ms}}));
+        }
+        h.online("devB01", "8.8.8.8:5000").await;
+        h.online("devB02", "8.8.4.4:5000").await;
+        for (b, from) in [("devB01", "devA01".to_owned()), ("devB02", long.clone())] {
+            let mut msg = punch_request(b);
+            msg.mut_punch_hole_request().porta_from_id = from;
+            let mut a = h.connect(Client::V1).await;
+            a.send(&msg).await.unwrap();
+            let (msg, _) = h.to_b().await;
+            assert!(matches!(msg.union, Some(rendezvous_message::Union::PunchHole(_))));
+        }
+        h.rs.state.tracker.flush().await;
+        let rows: Vec<(String, String, Option<f64>, Option<f64>)> =
+            sqlx::query_as("select b_id, route_reason, route_a_ms, route_b_ms from conn_attempt order by b_id")
+                .fetch_all(&h.rs.state.db)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            [
+                ("devB01".to_owned(), "rtt".to_owned(), Some(15.0), Some(25.0)),
+                // The overlong id is not looked up: only B's measurement (A has no position here).
+                ("devB02".to_owned(), "rtt_b".to_owned(), None, Some(35.0)),
+            ]
+        );
     }
 
     // ---- Limits on unauthenticated input (review A-1..A-5) ----

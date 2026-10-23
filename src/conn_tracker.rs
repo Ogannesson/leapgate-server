@@ -131,6 +131,9 @@ pub struct PunchRequest {
     pub relay_offered: String,
     /// `RouteDecision::reason` (empty on failure).
     pub route_reason: &'static str,
+    /// `RouteDecision::a_ms` / `b_ms`: the chosen relay's legs (`None` on failure).
+    pub route_a_ms: Option<f64>,
+    pub route_b_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -657,10 +660,10 @@ async fn insert_row(
     sqlx::query(
         "insert into conn_attempt(started_at, a_ip, a_port, via, a_user, a_device_id, a_version, b_id,
            b_ip, conn_type, a_nat_type, a_force_relay, a_has_v6, a_udp_port, attempts, signal,
-           server_forced_relay, relay_offered, route_reason, reply, reply_at, b_version, b_nat_type,
-           b_has_v6, b_relay, relay_uuid, relay_req_at, relay_req_count, relay_resp_at, outcome,
-           finalized_at)
-         values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+           server_forced_relay, relay_offered, route_reason, route_a_ms, route_b_ms, reply, reply_at,
+           b_version, b_nat_type, b_has_v6, b_relay, relay_uuid, relay_req_at, relay_req_count,
+           relay_resp_at, outcome, finalized_at)
+         values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(a.started_at)
     .bind(a.a_addr.ip().to_string())
@@ -681,6 +684,8 @@ async fn insert_row(
     .bind(req.is_some_and(|r| r.server_forced_relay))
     .bind(req.map(|r| r.relay_offered.as_str()))
     .bind(req.map(|r| r.route_reason))
+    .bind(req.and_then(|r| r.route_a_ms))
+    .bind(req.and_then(|r| r.route_b_ms))
     .bind(a.reply.map(|(kind, _)| kind.as_str()))
     .bind(a.reply.map(|(_, at)| at))
     .bind(a.b_version.as_deref())
@@ -786,6 +791,13 @@ impl ConnTracker {
     /// H5.
     pub fn on_request_relay(&self, req: RelayRequest) {
         self.state.lock().unwrap().request_relay(req, now_ms());
+    }
+
+    /// Tests elsewhere: finalizes every record now (as if all windows had passed) and writes it.
+    #[cfg(test)]
+    pub(crate) async fn flush(&self) {
+        let done = self.state.lock().unwrap().sweep(now_ms() + 24 * 3600 * 1000);
+        write(&self.db, &done).await.unwrap();
     }
 
     /// The 5-second finalizer, the database writer and the hourly purge, spawned on the server's runtime.
@@ -902,6 +914,8 @@ mod tests {
             server_forced_relay: false,
             relay_offered: if signal.is_fail() { String::new() } else { "r1:21117".to_owned() },
             route_reason: if signal.is_fail() { "" } else { "geo" },
+            route_a_ms: None,
+            route_b_ms: None,
         }
     }
 

@@ -74,6 +74,7 @@ fn q<'a>(a: &str, b: &str, b_id: &'a str) -> RouteQuery<'a> {
     RouteQuery {
         a_ip: ip(a),
         b_ip: ip(b),
+        a_id: "",
         b_id,
         a_token: "",
         conn_type: 0,
@@ -90,7 +91,7 @@ async fn empty_list_gives_empty_relay() {
     r.health_round().await;
     assert_eq!(
         pick(&r, "1.0.0.1", "1.0.0.2").await,
-        RouteDecision { relay: String::new(), reason: "none" }
+        RouteDecision { relay: String::new(), reason: "none", a_ms: None, b_ms: None }
     );
 }
 
@@ -133,7 +134,15 @@ async fn geo_cost_and_fallbacks() {
     all.sort();
     assert_eq!(seen, all);
 
-    let text = r.test(ip("::ffff:1.0.0.1"), ip("1.0.0.4")).await;
+    // Geo legs (before the weight) come with the decision: bj 0 + 21.3.
+    let d = pick(&r, "1.0.0.1", "1.0.0.4").await;
+    assert_eq!(d.a_ms, Some(0.0));
+    assert!((d.b_ms.unwrap() - 21.3).abs() < 0.1, "{d:?}");
+    let d = pick(&r, "1.0.0.2", "9.9.9.9").await;
+    assert_eq!((d.a_ms, d.b_ms), (Some(0.0), None));
+    assert_eq!(pick(&r, "9.9.9.9", "100.64.0.1").await.a_ms, None, "round-robin has no legs");
+
+    let text = r.test(ip("::ffff:1.0.0.1"), ip("1.0.0.4"), "", "").await;
     assert!(text.starts_with("A 1.0.0.1: CN/cn-telecom (39.90,116.41)\nB 1.0.0.4: CN/cn-telecom (31.23,121.47)\n"), "{text}");
     assert!(text.contains(&format!("relay: {bjh:?} (geo)\n  {bjh}: cost 21.")), "{text}");
     assert!(text.contains(&format!("  {shh}: cost 41.")), "{text}");
@@ -174,7 +183,10 @@ async fn fixed_relay() {
         .unwrap();
     // The pin wins whatever the list and health say.
     let d = r.select(&q("1.0.0.1", "1.0.0.1", "b1")).await;
-    assert_eq!(d, RouteDecision { relay: "pinned.example:21117".to_owned(), reason: "fixed" });
+    assert_eq!(
+        d,
+        RouteDecision { relay: "pinned.example:21117".to_owned(), reason: "fixed", a_ms: None, b_ms: None }
+    );
     // An empty pin, a device without a row, and an empty b_id (RelayResponse, `tg`) select normally.
     for b_id in ["b2", "b3", ""] {
         assert_eq!(r.select(&q("1.0.0.1", "1.0.0.1", b_id)).await.relay, sh.host);
@@ -208,7 +220,7 @@ async fn health_check() {
     assert!(status.contains(&format!("{up} weight=1 reachable=yes last=")), "{status}");
     assert!(status.contains("ms location=DE/AS3320 (50.11,8.68) (override: lat,lon,country,carrier)"), "{status}");
     assert!(status.contains(&format!("{down} weight=1 reachable=no last=failed")), "{status}");
-    let text = r.test(ip("1.0.0.1"), ip("1.0.0.1")).await;
+    let text = r.test(ip("1.0.0.1"), ip("1.0.0.1"), "", "").await;
     assert!(text.contains(&format!("  {down}: unreachable")), "{text}");
 
     // All fail: the previous reachable set stays.
@@ -270,6 +282,97 @@ async fn stale_round_is_discarded() {
     round.await.unwrap();
     let relays = r.relays.read().unwrap();
     assert_eq!(relays.list[0].last, None);
+}
+
+#[tokio::test]
+async fn routing_rev_follows_the_list() {
+    let (_dir, r) = router(vec![RelayConfig::new("r1:21117".to_owned()), RelayConfig::new("r2".to_owned())]).await;
+    let (rev, hosts) = r.routing();
+    assert_eq!(hosts, ["r1:21117", "r2"]);
+    assert!(rev > 0);
+    // The same configuration gives the same rev (across restarts).
+    let (_dir2, r2) = router(vec![RelayConfig::new("r1:21117".to_owned()), RelayConfig::new("r2".to_owned())]).await;
+    assert_eq!(r2.routing().0, rev);
+    // `rs` with another list changes it; the same hosts again give the same rev.
+    r.set_configured(vec!["r2".to_owned(), "r1:21117".to_owned()]);
+    assert_ne!(r.routing().0, rev);
+    r.set_configured(vec!["r1:21117".to_owned(), "r2".to_owned()]);
+    assert_eq!(r.routing().0, rev);
+    // The interval is part of it: the bare host hash is not the rev.
+    assert_ne!(rev, crate::strategy::digest_rev(b"r1:21117\nr2"));
+    // No relay: an empty list, its rev is not 0.
+    r.set_configured(vec![]);
+    let (rev0, hosts) = r.routing();
+    assert!(hosts.is_empty() && rev0 > 0 && rev0 != rev);
+    // Over 32 relays: only the first 32 are measured, and only they make the rev.
+    let many: Vec<String> = (0..40).map(|i| format!("r{i}")).collect();
+    r.set_configured(many.clone());
+    let (rev40, hosts) = r.routing();
+    assert_eq!(hosts, many[..MAX_PROBED]);
+    r.set_configured(many[..MAX_PROBED].to_vec());
+    assert_eq!(r.routing().0, rev40);
+}
+
+/// Level two through `select`: A's and B's measurements replace the estimates, `a_ms`/`b_ms` are the
+/// chosen relay's legs; another list's round is not used.
+#[tokio::test]
+async fn measurements_replace_estimates() {
+    let bj = relay(BEIJING, "CN", "cn-telecom");
+    let sh = relay(SHANGHAI, "CN", "cn-unicom");
+    let (bjh, shh) = (bj.host.clone(), sh.host.clone());
+    let (_dir, r) = router(vec![bj, sh]).await;
+    r.health_round().await;
+    let (rev, _) = r.routing();
+    let probes = |rtt: serde_json::Value| serde_json::json!({"routing_rev": rev, "age_s": 3, "rtt": rtt});
+    let query = |a_id: &'static str, b_id: &'static str| RouteQuery {
+        a_id,
+        ..q("1.0.0.1", "1.0.0.4", b_id)
+    };
+    // By geo bj wins (21.3 vs 41.3).
+    assert_eq!(r.select(&query("A1", "B1")).await.relay, bjh);
+    r.record_probes("A1", &probes(serde_json::json!({&bjh: 80, &shh: 20})));
+    let d = r.select(&query("A1", "B1")).await;
+    assert_eq!((d.relay.as_str(), d.reason), (shh.as_str(), "rtt_a"));
+    assert_eq!(d.a_ms, Some(20.0));
+    assert!((d.b_ms.unwrap() - 10.0).abs() < 1e-9, "B's estimate to sh: cross-carrier 10 ms");
+    r.record_probes("B1", &probes(serde_json::json!({&bjh: 5, &shh: 90})));
+    let d = r.select(&query("A1", "B1")).await;
+    assert_eq!((d.relay.as_str(), d.reason, d.a_ms, d.b_ms), (bjh.as_str(), "rtt", Some(80.0), Some(5.0)));
+    // B alone (A not identified, as with an original client).
+    let d = r.select(&query("", "B1")).await;
+    assert_eq!((d.relay.as_str(), d.reason), (bjh.as_str(), "rtt_b"));
+    // The fixed relay still comes first.
+    sqlx::query("insert into device_policy(device_id, relay_pin) values('B1', 'pinned:21117')")
+        .execute(&r.db)
+        .await
+        .unwrap();
+    assert_eq!(r.select(&query("A1", "B1")).await.reason, "fixed");
+
+    let status = r.status_text();
+    assert!(status.ends_with("measurements: 2 devices, 2 fresh\n"), "{status}");
+    let text = r.test(ip("1.0.0.1"), ip("1.0.0.4"), "A1", "B1").await;
+    assert!(text.contains(&format!("relay: {bjh:?} (rtt)\n")), "{text}");
+    assert!(text.contains(&format!("  {bjh}: cost 85.0 [A rtt 80ms, B rtt 5ms]\n")), "{text}");
+    assert!(text.contains(&format!("  {shh}: cost 110.0 [A rtt 20ms, B rtt 90ms]\n")), "{text}");
+    let text = r.test(ip("1.0.0.1"), ip("1.0.0.4"), "A1", "").await;
+    assert!(text.contains(&format!("  {bjh}: cost 101.3 [A rtt 80ms, B est 21.3ms]\n")), "{text}");
+    // Without ids the output is level one's.
+    let text = r.test(ip("1.0.0.1"), ip("1.0.0.4"), "", "").await;
+    assert!(text.contains(&format!("relay: {bjh:?} (geo)\n  {bjh}: cost 21.3\n")), "{text}");
+    // A measured down: out of the pair, shown as such.
+    r.record_probes("A1", &serde_json::json!({"routing_rev": rev, "age_s": 0, "rtt": {&shh: 20}, "down": [&bjh]}));
+    let text = r.test(ip("1.0.0.1"), ip("1.0.0.4"), "A1", "B1").await;
+    assert!(text.contains(&format!("relay: {shh:?} (rtt)\n")), "{text}");
+    assert!(text.contains(&format!("  {bjh}: no cost (measured down) [A down, B rtt 5ms]\n")), "{text}");
+
+    // `rs` replaces the list: the rounds were for the old one, so they are not used.
+    r.set_configured(vec![bjh.clone(), shh.clone(), "r3".to_owned()]);
+    let d = r.decide(ip("1.0.0.1"), ip("1.0.0.4"), "A1", "B1").decision;
+    assert!(d.reason.starts_with("geo"), "{d:?}");
+    assert!(r.status_text().ends_with("measurements: 2 devices, 0 fresh\n"));
+    // A round for an old rev is dropped.
+    r.record_probes("A1", &probes(serde_json::json!({&bjh: 1, &shh: 1, "r3": 1})));
+    assert!(r.status_text().ends_with("measurements: 2 devices, 0 fresh\n"));
 }
 
 /// MaxMind DB encoding (https://maxmind.github.io/MaxMind-DB/): a control byte (type, size), then the payload.
