@@ -758,12 +758,13 @@ pub(crate) async fn tag_delete(
 ) -> ApiResult {
     check(&state.db, &user, &guid, WRITE).await?;
     let names: Vec<String> = parse_json(&body)?;
-    // Checked and deduplicated before the transaction (review D-14): the cascade looks up every tag
+    // Deduplicated and counted before the transaction (review D-14): the cascade looks up every tag
     // of every affected peer, under the write lock, and 256 KB holds ~65,000 names. The client
-    // sends the selected tags of the book: at most MAX_TAGS, each within the tag limits.
+    // sends the selected tags of the book, at most MAX_TAGS. The names are not checked against the
+    // tag limits: an imported tag over them (§15) can still be deleted, and a lookup's cost does
+    // not depend on the name's length.
     let mut set = HashSet::new();
     for name in names {
-        check_tag(&name).map_err(ApiError::bad_request)?;
         set.insert(name);
         if set.len() > MAX_TAGS as usize {
             return Err(ApiError::bad_request("Too many tag names"));
@@ -1764,9 +1765,10 @@ mod tests {
         write_err(&t.app, "DELETE", &delete, &token, r#""t3""#, StatusCode::BAD_REQUEST).await;
     }
 
-    /// `DELETE /api/ab/tag` names are checked and deduplicated before the transaction (review
-    /// D-14): over `MAX_TAGS` distinct names, or one over the tag limits, is a 400 that touches
-    /// nothing; a full book of 5000 peers with 64 tags each cascades well within the request timeout.
+    /// `DELETE /api/ab/tag` names are deduplicated and counted before the transaction (review
+    /// D-14): over `MAX_TAGS` distinct names is a 400 that touches nothing; names over the tag
+    /// limits (imported ones, §15) are deleted like any other; a full book of 5000 peers with 64
+    /// tags each cascades well within the request timeout.
     #[tokio::test]
     async fn tag_delete_names_are_capped() {
         let t = testutil::app().await;
@@ -1799,11 +1801,35 @@ mod tests {
         };
         let delete = format!("/api/ab/tag/{book}");
         let over: Vec<String> = std::iter::once("m".to_owned()).chain((0..MAX_TAGS).map(|i| format!("x{i}"))).collect();
-        let long = "y".repeat(MAX_TAG_LEN + 1);
-        for body in [serde_json::to_string(&over).unwrap(), serde_json::json!(["m", long]).to_string(), r#"["m","a\u0001"]"#.to_owned()] {
-            write_err(&t.app, "DELETE", &delete, &token, &body, StatusCode::BAD_REQUEST).await;
-        }
+        write_err(&t.app, "DELETE", &delete, &token, &serde_json::to_string(&over).unwrap(), StatusCode::BAD_REQUEST)
+            .await;
         assert_eq!(carrying_m().await, MAX_PEERS);
+        // Names over the tag limits (as an import leaves them, §15) are matched and deleted.
+        let long = "y".repeat(MAX_TAG_LEN + 1);
+        let ctrl = "a\u{1}".to_owned();
+        for name in [&long, &ctrl] {
+            sqlx::query("insert into ab_tag(ab_guid, name, color) values(?, ?, 1)")
+                .bind(&book)
+                .bind(name)
+                .execute(db)
+                .await
+                .unwrap();
+        }
+        let odd = serde_json::json!(["00", &long, &ctrl]).to_string();
+        sqlx::query("update ab_peer set tags = ? where ab_guid = ? and id = 'p2'")
+            .bind(&odd)
+            .bind(&book)
+            .execute(db)
+            .await
+            .unwrap();
+        write_ok(&t.app, "DELETE", &delete, &token, &serde_json::json!([&long, &ctrl]).to_string()).await;
+        assert_eq!(stored(db, &book, "p2").await.1, ["00"]);
+        let left: i64 = sqlx::query_scalar("select count(*) from ab_tag where ab_guid = ?")
+            .bind(&book)
+            .fetch_one(db)
+            .await
+            .unwrap();
+        assert_eq!(left, 0);
         // ~60,000 entries are fine when they are few distinct names: "m", 998 others and "z".
         let mut names: Vec<String> = std::iter::once("m".to_owned()).chain((0..998).map(|i| format!("x{i}"))).collect();
         names.extend(std::iter::repeat("z".to_owned()).take(60_000));
