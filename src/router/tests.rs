@@ -364,6 +364,10 @@ async fn measurements_replace_estimates() {
     let text = r.test(ip("1.0.0.1"), ip("1.0.0.4"), "A1", "B1").await;
     assert!(text.contains(&format!("relay: {shh:?} (rtt)\n")), "{text}");
     assert!(text.contains(&format!("  {bjh}: no cost (measured down) [A down, B rtt 5ms]\n")), "{text}");
+    // The other end estimated: no value on a relay out of the choice.
+    let text = r.test(ip("1.0.0.1"), ip("1.0.0.4"), "A1", "").await;
+    assert!(text.contains(&format!("  {bjh}: no cost (measured down) [A down, B -]\n")), "{text}");
+    assert!(text.contains(&format!("  {shh}: cost 30.0 [A rtt 20ms, B est 10.0ms]\n")), "{text}");
 
     // `rs` replaces the list: the rounds were for the old one, so they are not used.
     r.set_configured(vec![bjh.clone(), shh.clone(), "r3".to_owned()]);
@@ -373,6 +377,28 @@ async fn measurements_replace_estimates() {
     // A round for an old rev is dropped.
     r.record_probes("A1", &probes(serde_json::json!({&bjh: 1, &shh: 1, "r3": 1})));
     assert!(r.status_text().ends_with("measurements: 2 devices, 0 fresh\n"));
+}
+
+/// Measurements are indexed by the relay's place in the whole list (which clients measure), not
+/// among the reachable ones: an unreachable relay first must not shift them.
+#[tokio::test]
+async fn measurements_follow_list_positions() {
+    let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let l2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up1 = format!("127.0.0.1:{}", l1.local_addr().unwrap().port());
+    let up2 = format!("127.0.0.1:{}", l2.local_addr().unwrap().port());
+    let down = format!("127.0.0.1:{}", closed_port());
+    let hosts = [&down, &up1, &up2].map(|h| RelayConfig::new(h.clone()));
+    let (_dir, r) = router(hosts.to_vec()).await;
+    // One reachable at least, so the round decides: `down` leaves the candidates.
+    r.health_round().await;
+    assert!(r.status_text().contains(&format!("{down} weight=1 reachable=no")));
+    let (rev, _) = r.routing();
+    let probes = |rtt: serde_json::Value| serde_json::json!({"routing_rev": rev, "age_s": 0, "rtt": rtt});
+    r.record_probes("A1", &probes(serde_json::json!({&up1: 80, &up2: 20})));
+    r.record_probes("B1", &probes(serde_json::json!({&up1: 5, &up2: 90})));
+    let d = r.select(&RouteQuery { a_id: "A1", ..q("1.0.0.1", "1.0.0.4", "B1") }).await;
+    assert_eq!((d.relay.as_str(), d.reason, d.a_ms, d.b_ms), (up1.as_str(), "rtt", Some(80.0), Some(5.0)));
 }
 
 /// MaxMind DB encoding (https://maxmind.github.io/MaxMind-DB/): a control byte (type, size), then the payload.

@@ -417,10 +417,12 @@ impl Router {
             x.decision.relay,
             x.decision.reason
         );
-        // A leg as used: the measurement on a measured end, else the estimate.
-        let leg = |used: bool, meas: Leg, ms: Option<f64>| match (used, meas) {
+        // A leg as used: the measurement on a measured end, else the estimate (`-` on a relay out of
+        // the choice, which has none).
+        let leg = |used: bool, meas: Leg, ms: Option<f64>, scored: bool| match (used, meas) {
             (true, Leg::Rtt(ms)) => format!("rtt {ms}ms"),
             (true, _) => "down".to_owned(),
+            (false, _) if !scored => "-".to_owned(),
             (false, _) => ms.map_or("est ?".to_owned(), |ms| format!("est {ms:.1}ms")),
         };
         let with_ids = !a_id.is_empty() || !b_id.is_empty();
@@ -438,8 +440,8 @@ impl Router {
                 let _ = write!(
                     what,
                     " [A {}, B {}]",
-                    leg(x.use_a, r.meas_a, a_ms),
-                    leg(x.use_b, r.meas_b, b_ms)
+                    leg(x.use_a, r.meas_a, a_ms, r.cost.is_some()),
+                    leg(x.use_b, r.meas_b, b_ms, r.cost.is_some())
                 );
             }
             let _ = writeln!(out, "  {}: {what}", r.host);

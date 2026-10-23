@@ -491,6 +491,11 @@ mod tests {
         assert_eq!((s.reason, s.use_a, s.use_b), ("rtt_a", true, false));
         assert_eq!(costs_of(&s)[1], None);
         assert_eq!(s.costs[0].unwrap().b_ms, Some(est(&b, &r1)));
+        // Rule 1 looks at every reachable candidate, also one A's `down` took out: B has nothing for
+        // r1, so B stays on estimates.
+        let cands = [cand(&r1, 1.0, Down, Unknown), cand(&r2, 1.0, Rtt(9), Rtt(8))];
+        let s = score(&routing, &a, &b, &cands).unwrap();
+        assert_eq!((s.reason, s.use_a, s.use_b), ("rtt_a", true, false));
 
         // Neither end located, one measured: still a cost (no round-robin), `2 × leg × weight`.
         let none = Loc::default();

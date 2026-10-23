@@ -357,7 +357,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
   4. `reason`：两端都用实测 `rtt`，只有 A `rtt_a`，只有 B `rtt_b`，都不用时同第一级（两端都没位置返回 `None` 走轮询）；一端用实测时即使两端都没位置也有代价，不轮询。
   5. 选中那台的两段放进 `RouteDecision.a_ms`/`b_ms`。
   - 固定中继仍然最先判断（`b_id` 非空时查 `device_policy`）。
-- **两端的 ID**：B 的 ID 就是打洞请求的目标 ID；A 的 ID 来自 `PunchHoleRequest.porta_from_id`，不认证：A 冒用别人的 ID，只会让 A 自己这次连接按别人的测量选路，拿不到任何数据。原版客户端不发，A 段按估计。
+- **两端的 ID**：B 的 ID 就是打洞请求的目标 ID；A 的 ID 来自 `PunchHoleRequest.porta_from_id`，不认证。A 冒用别人的 ID 只影响 A 自己这次连接的选路，不影响别人；但冒用者能从选路结果侧面推断被冒用设备到各中继的相对延迟，以及它最近 15 分钟是否上报过完整测量（也就是是否在线），被冒用的设备察觉不到。信息量不超过直接向它打洞拿到的公网 IP，接受。不把测量绑定到心跳的来源 IP：HTTP 和 21116 本来就可能从不同出口出去（例如路由器透明代理只代理部分流量）。原版客户端不发，A 段按估计。
 - **`RelayResponse` 分支不走第二级**：那里 `a_id`、`b_id` 都是空串（只在 B 回报的中继等于 hbbs 自己的 `local_ip` 时才调路由）；它也不遵守固定中继，是第一期就有的问题（已知，未排期）。
 - `relay status`（控制台 `rs`）末尾多一行 `measurements: <N> devices, <M> fresh`（表里的设备数、其中现在可用的数）。`route test --a/--b`（控制台 `tg` 的第 3、4 个参数）见 §14。
 
@@ -564,7 +564,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 - 控制台 `kl <id>` / `key-reload <id>`（第三期）：只按库重载内存，谁都能触发，效果只是让内存和库对齐。条目在内存里：库里有行就把内存刷成库里的值（含 `pinned`），回 `<id>: reloaded from the database`；库里没有行就移除条目，回 `<id>: not in the database, dropped from memory`。不在内存里回 `<id>: not in memory, nothing to reload`。走主池（连接任务，不占会合池）。
 - `strategy show [<device>]`（列出生效选项和 rev）、`strategy set <device|'*'> <key> <value>`、`strategy unset <device|'*'> <key>`（写成墓碑 `''`，让客户端删掉这个键；`set`、`unset` 拒收 `porta-` 开头的键，§10）、`strategy forget <device|'*'> <key>`（删行，不再下发这个键；设备级删掉后回到全局值）、`strategy repush <device|'*'>`（递增 epoch）
 - `device pin-relay <device> <host|none>`
-- `relay status`（控制台 `rs`；第三期末尾多一行 `measurements: <N> devices, <M> fresh`，§7 第二级）、`route test <ipA> <ipB> [--a <device>] [--b <device>]`（控制台 `tg <ipA> <ipB> <idA|-> <idB|->`，`-` 表示没有；ID 为空、是 `-` 或含空白时报错）。带 ID 时用这两台设备的第二级测量，每台可达中继后面标出两段用的是实测（`rtt 23ms` / `down`）还是估计（`est 21.3ms`，没有位置为 `est ?`），被实测 `down` 去掉的标 `no cost (measured down)`；不带 ID 时输出和第一级一样。
+- `relay status`（控制台 `rs`；第三期末尾多一行 `measurements: <N> devices, <M> fresh`，§7 第二级）、`route test <ipA> <ipB> [--a <device>] [--b <device>]`（控制台 `tg <ipA> <ipB> <idA|-> <idB|->`，`-` 表示没有；ID 为空、是 `-` 或含空白时报错）。带 ID 时用这两台设备的第二级测量，每台可达中继后面标出两段用的是实测（`rtt 23ms` / `down`）还是估计（`est 21.3ms`，没有位置为 `est ?`），被实测 `down` 去掉的标 `no cost (measured down)`，这一行里用估计的那一端显示 `-`（没参加计算，没有值）；不带 ID 时输出和第一级一样。
 - `geo lookup <ip>`（直接读本地 mmdb：国家、经纬度、ASN、运营商组）、`geo update`（走控制台 `gu`，由服务进程执行下载、校验和热切换并回显结果；连不上控制台即服务没在运行时，才在命令行进程里直接下载，不做目录清理）
 - `stats [--days N]`：中继回落率和各结果计数（§8）
 - `import rustdesk-api <db 路径> [--dry-run]`（§15）
