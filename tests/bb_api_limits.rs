@@ -1,9 +1,12 @@
 //! 黑盒测试：21114 的连接保护（审查 C-9）：连接总数和每来源上限、请求头超时、整请求超时、
-//! 按路由的请求体上限、慢读者断开。每个测试起一个真实的 porta-server 进程（见 `bb_api_support`），
-//! 用裸 TCP 看服务端什么时候关连接、回什么。
+//! 按路由的请求体上限、慢读者断开、`/api/ab/peers` 的每用户名额。每个测试起一个真实的 porta-server
+//! 进程（见 `bb_api_support`），用裸 TCP 看服务端什么时候关连接、回什么。
 //!
-//! 常量照实现的取值（src/api/listen.rs、src/api/mod.rs）：总数 512、每来源 32、请求头 10 秒、
-//! 整请求 20 秒、读写无进度 30 秒；登录等接口请求体 16 KB，`DELETE /api/ab/peer` 2 MB。
+//! 常量照实现的取值（src/api/listen.rs、src/api/mod.rs、src/api/ab.rs）：总数 512、每来源 32、
+//! 请求头 10 秒、整请求 20 秒（上报类 10 秒）、读写无进度 30 秒；登录等接口请求体 16 KB，
+//! `DELETE /api/ab/peer` 2 MB；`/api/ab/peers` 每个用户同时最多 2 页。
+//! 写下限（慢慢读的客户端）要服务端发送缓冲小才测得出，回环上内核会把它涨到几 MB，所以在
+//! src/api/listen.rs 的单元测试里测。
 
 mod bb_api_support;
 
@@ -179,17 +182,23 @@ async fn bodies_over_the_route_limit_get_413() {
 }
 
 #[tokio::test]
-async fn a_body_trickling_in_gets_the_internal_error_answer_after_20s() {
+async fn a_body_trickling_in_gets_the_internal_error_answer_in_time() {
     let s = Server::start().await;
     let uid = s.create_user("alice", "pw", false).await;
     let token = s.issue_token(uid).await;
     let addr = api_addr(&s);
     // §9.1：审计和 currentUser 的内部错误回 200 + {"error"}，其他接口回 400 + {"error"}。
-    let cases = [("/api/login", None, 400), ("/api/audit/conn", None, 200), ("/api/currentUser", Some(token), 200)];
+    // §9.4：上报类（心跳、sysinfo、审计）10 秒，要在客户端 Rust 侧的 12 秒 HTTP 超时之前答复；其余 20 秒。
+    let cases = [
+        ("/api/login", None, 400, 20),
+        ("/api/audit/conn", None, 200, 10),
+        ("/api/heartbeat", None, 400, 10),
+        ("/api/currentUser", Some(token), 200, 20),
+    ];
     let start = Instant::now();
     let runs: Vec<_> = cases
         .into_iter()
-        .map(|(path, token, want)| {
+        .map(|(path, token, want, secs)| {
             thread::spawn(move || {
                 let mut stream = TcpStream::connect(addr).unwrap();
                 let auth = token.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
@@ -210,19 +219,111 @@ async fn a_body_trickling_in_gets_the_internal_error_answer_after_20s() {
                 }
                 let took = start.elapsed();
                 let (status, body) = read_response(&mut stream);
-                (path, want, status, body, took)
+                (path, want, secs, status, body, took)
             })
         })
         .collect();
     for run in runs {
-        let (path, want, status, body, took) = run.join().unwrap();
+        let (path, want, secs, status, body, took) = run.join().unwrap();
         assert_eq!(status, want, "{path}: {:?}", String::from_utf8_lossy(&body));
         assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), serde_json::json!({"error": "Request timeout"}), "{path}");
         assert!(
-            (Duration::from_secs(19)..Duration::from_secs(26)).contains(&took),
-            "{path}: answered after {took:?}, expected about 20 s"
+            (Duration::from_secs(secs - 1)..Duration::from_secs(secs + 5)).contains(&took),
+            "{path}: answered after {took:?}, expected about {secs} s"
         );
     }
+}
+
+/// 一页约 12 MB（1000 条、每条约 12 KB）：大于服务端发送缓冲加客户端的小接收窗口，不读就一直写不完。
+async fn fill_big_page(s: &Server, guid: &str) {
+    s.exec(&format!(
+        "with recursive n(i) as (select 1 union all select i + 1 from n where i < 1000)
+         insert into ab_peer(ab_guid, id, data, tags, created_at, updated_at)
+         select '{guid}', 'p' || i, '{{\"note\":\"' || hex(randomblob(6000)) || '\"}}', '[]', 0, 0 from n"
+    ))
+    .await;
+}
+
+/// 用接收缓冲只有几 KB 的新连接请求一页，读到响应头就不再读，把连接交回去（一直占着这一页）。
+async fn hold_page(addr: SocketAddr, request: &str) -> TcpStream {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(4096).unwrap();
+    let mut stream = socket.connect(addr).await.unwrap().into_std().unwrap();
+    stream.set_nonblocking(false).unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut head = vec![0u8; 1024];
+    stream.read_exact(&mut head).unwrap();
+    assert!(head.starts_with(b"HTTP/1.1 200"), "{}", String::from_utf8_lossy(&head));
+    stream
+}
+
+fn page_request(guid: &str, token: &str, page_size: u32) -> String {
+    format!(
+        "POST /api/ab/peers?current=1&pageSize={page_size}&ab={guid} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\n\r\n"
+    )
+}
+
+/// §12.1：同一个用户同时最多 2 页在组装或发送中，第 3 页排队，排队计入整请求 20 秒超时；
+/// 别的用户不受影响（审查 D-4：一个慢读的用户不能占满所有人的名额）。
+#[tokio::test]
+async fn a_users_third_page_waits_within_the_request_timeout() {
+    let s = Server::start().await;
+    let alice = s.issue_token(s.create_user("alice", "pw", false).await).await;
+    let bob = s.issue_token(s.create_user("bob", "pw", false).await).await;
+    let alice_book = s.post("/api/ab/personal", Some(&alice), "").await.json()["guid"].as_str().unwrap().to_owned();
+    let bob_book = s.post("/api/ab/personal", Some(&bob), "").await.json()["guid"].as_str().unwrap().to_owned();
+    fill_big_page(&s, &alice_book).await;
+    let addr = api_addr(&s);
+    // 两页都发不完：读写无进度 30 秒后才断开，下面的步骤都在这之前做完。
+    let held = [hold_page(addr, &page_request(&alice_book, &alice, 1000)).await, hold_page(addr, &page_request(&alice_book, &alice, 1000)).await];
+    let start = Instant::now();
+    let r = s.post(&format!("/api/ab/peers?current=1&pageSize=100&ab={bob_book}"), Some(&bob), "").await;
+    assert_eq!((r.status, r.json()["total"].as_i64()), (200, Some(0)), "{:?}", r.text());
+    assert!(start.elapsed() < Duration::from_secs(3), "bob waited {:?}", start.elapsed());
+    let request = page_request(&alice_book, &alice, 1);
+    let third = thread::spawn(move || {
+        let start = Instant::now();
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        let (status, body) = read_response(&mut stream);
+        (status, body, start.elapsed())
+    });
+    let (status, body, took) = third.join().unwrap();
+    assert_eq!(status, 400, "{:?}", String::from_utf8_lossy(&body));
+    assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), serde_json::json!({"error": "Request timeout"}));
+    assert!((Duration::from_secs(19)..Duration::from_secs(26)).contains(&took), "answered after {took:?}");
+    // 连接一断，名额跟着归还，alice 又能取页。
+    drop(held);
+    settle().await;
+    let r = s.post(&format!("/api/ab/peers?current=1&pageSize=1&ab={alice_book}"), Some(&alice), "").await;
+    assert_eq!((r.status, r.json()["total"].as_i64()), (200, Some(1000)), "{:?}", r.text());
+}
+
+/// `DELETE /api/ab/peer` 的数组边读边数（审查 D-16）：2 MB 上限内塞约 70 万个元素的请求，读到第 5001 个
+/// 就回 400，不展开成整个列表（原先每个这样的请求约占 50 MB）。看进程的内存峰值：几个并发的这种请求
+/// 只多占请求体本身那么多。
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_huge_peer_delete_array_is_refused_without_amplifying_memory() {
+    let s = Server::start().await;
+    let token = s.issue_token(s.create_user("alice", "pw", false).await).await;
+    let guid = s.post("/api/ab/personal", Some(&token), "").await.json()["guid"].as_str().unwrap().to_owned();
+    let path = format!("/api/ab/peer/{guid}");
+    let huge = format!("[{}\"\"]", "\"\",".repeat((2 << 20) / 3 - 1));
+    assert!(huge.len() <= 2 << 20, "{}", huge.len());
+    let r = s.request("DELETE", &path, Some(&token), Some("[]"), &[]).await;
+    assert_eq!((r.status, r.body.len()), (200, 0), "{:?}", r.text());
+    let before = s.peak_rss_kb();
+    let rs = hbb_common::futures::future::join_all((0..4).map(|_| s.request("DELETE", &path, Some(&token), Some(&huge), &[]))).await;
+    let grew = s.peak_rss_kb() - before;
+    for r in rs {
+        assert_eq!(r.status, 400, "{:?}", r.text());
+        let msg = r.json()["error"].as_str().unwrap().to_owned();
+        assert!(msg.contains("too many peer ids"), "{msg}");
+    }
+    eprintln!("peak RSS grew by {grew} KB");
+    assert!(grew < 24 * 1024, "peak RSS grew by {grew} KB for 4 requests of 2 MB");
 }
 
 #[tokio::test]
