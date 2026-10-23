@@ -1,22 +1,34 @@
 //! Device reports: sysinfo and heartbeat / strategy push (PORTA.md §9.3, §10; notes 01, 03 §4).
 //! No authentication (compatibility debt); only devices registered with hbbs, checked by `uuid`.
+//! Porta clients' signed heartbeat (`porta_heartbeat`, phase 3 contract 01 §3.6) shares the row
+//! writes (`touch`, `store_sysinfo`).
 
-use super::{ok_json, parse_json, text, ApiResult, ClientIp};
+use super::{
+    devauth::{parse_body, porta_error, porta_internal, signed_json, SignedBody},
+    ok_json, parse_json, text, ApiResult, ClientIp,
+};
 use crate::{
     conn_tracker::{clip, has_room, now_ms, source_key, IP_WINDOW_MS},
-    peer::MAX_PEER_ID_LEN,
+    peer::{PortaHb, MAX_PEER_ID_LEN},
     state::AppState,
 };
-use axum::{body::Bytes, extract::State, http::StatusCode, response::IntoResponse};
+use axum::{
+    body::Bytes,
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
 use hbb_common::throttled_log;
 use once_cell::sync::Lazy;
 use serde_derive::{Deserialize, Serialize};
+use serde_json::value::RawValue;
+use sha2::{Digest as _, Sha256};
 use sqlx::{SqliteConnection, SqlitePool};
 use std::{
     collections::{BTreeMap, HashMap},
     net::IpAddr,
     sync::Mutex,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// Longest `uuid` (base64 text) the device reports and the login accept. Real ones are the base64
@@ -101,22 +113,43 @@ pub(crate) fn report_allowed(ip: IpAddr) -> bool {
     REPORT_BUDGETS.lock().unwrap_or_else(|e| e.into_inner()).allow(ip, now_ms())
 }
 
+/// Result of `uuid_matches`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum UuidCheck {
+    Mismatch,
+    Match,
+    /// Matches, and a signed Porta report pinned the device's key: the unsigned reports of the id are
+    /// refused from then on (phase 3 contract 01 §3.5: they are what a downgrade would fall back to),
+    /// the login's binding is not.
+    MatchPinned,
+}
+
 /// Identity check of the unauthenticated device reports and of the login's device binding (§9.3):
 /// hbbs' `peer` table must know `id` (real clients register before they report), and `uuid` must be
 /// present and decode (standard base64) to `peer.uuid` byte for byte. An id over `MAX_PEER_ID_LEN`
-/// or a uuid over `MAX_UUID_LEN` bytes fails without a query.
-pub(crate) async fn uuid_matches(db: &SqlitePool, id: &str, uuid: Option<&str>) -> Result<bool, sqlx::Error> {
+/// or a uuid over `MAX_UUID_LEN` bytes fails without a query. The reports pass on `Match` only.
+pub(crate) async fn uuid_matches(db: &SqlitePool, id: &str, uuid: Option<&str>) -> Result<UuidCheck, sqlx::Error> {
     let Some(uuid) = uuid.filter(|u| u.len() <= MAX_UUID_LEN) else {
-        return Ok(false);
+        return Ok(UuidCheck::Mismatch);
     };
     if id.len() > MAX_PEER_ID_LEN {
-        return Ok(false);
+        return Ok(UuidCheck::Mismatch);
     }
-    let known: Option<Vec<u8>> = sqlx::query_scalar("select uuid from peer where id = ?")
-        .bind(id)
-        .fetch_optional(db)
-        .await?;
-    Ok(known.is_some_and(|known| base64::decode(uuid).is_ok_and(|u| u == known)))
+    let known: Option<(Vec<u8>, bool)> =
+        sqlx::query_as("select uuid, pk_pinned_at is not null from peer where id = ?")
+            .bind(id)
+            .fetch_optional(db)
+            .await?;
+    Ok(match known {
+        Some((known, pinned)) if base64::decode(uuid).is_ok_and(|u| u == known) => {
+            if pinned {
+                UuidCheck::MatchPinned
+            } else {
+                UuidCheck::Match
+            }
+        }
+        _ => UuidCheck::Mismatch,
+    })
 }
 
 /// Late binding (§11) of a device that passed `uuid_matches` and has no owner, written as
@@ -211,45 +244,87 @@ struct SysinfoReq {
 }
 
 /// `POST /api/sysinfo`: plain text `SYSINFO_UPDATED` on success, never `ID_NOT_FOUND`; a refusal
-/// (over the source's budget, too long, not a registered device, no room in the device table) is
-/// 403 with an empty body, which the client retries after 120 s. Rare (a device sends it when it
-/// starts or its sysinfo changes), so it always writes in a `make_room` transaction.
+/// (over the source's budget, too long, not a registered device or one whose key is pinned, no room
+/// in the device table) is 403 with an empty body, which the client retries after 120 s.
 pub(crate) async fn sysinfo(State(state): State<AppState>, ClientIp(ip): ClientIp, body: Bytes) -> ApiResult {
     let refused = || Ok(StatusCode::FORBIDDEN.into_response());
     if !report_allowed(ip) || body.len() > MAX_SYSINFO_LEN {
         return refused();
     }
-    let mut req: SysinfoReq = parse_json(&body)?;
-    if !uuid_matches(&state.db, &req.id, req.uuid.as_deref()).await? {
+    let req: SysinfoReq = parse_json(&body)?;
+    if uuid_matches(&state.db, &req.id, req.uuid.as_deref()).await? != UuidCheck::Match {
         return refused();
     }
-    for field in [&mut req.hostname, &mut req.username, &mut req.os, &mut req.version] {
+    let fields = SysinfoFields {
+        hostname: req.hostname,
+        username: req.username,
+        os: req.os,
+        version: req.version,
+    };
+    let uuid = req.uuid.as_deref().unwrap_or_default();
+    if !store_sysinfo(&state.db, &req.id, uuid, &String::from_utf8_lossy(&body), fields, CLIENT_RUSTDESK).await? {
+        return refused();
+    }
+    Ok(text("SYSINFO_UPDATED"))
+}
+
+/// `device.client_type`: the path the device reported on last (`touch`, `store_sysinfo`).
+const CLIENT_RUSTDESK: &str = "rustdesk";
+const CLIENT_PORTA: &str = "porta";
+
+/// The sysinfo values stored again in their own columns (clipped to `MAX_SYSINFO_FIELD_LEN`).
+#[derive(Default, Deserialize)]
+pub(crate) struct SysinfoFields {
+    #[serde(default)]
+    hostname: String,
+    #[serde(default)]
+    username: String,
+    #[serde(default)]
+    os: String,
+    #[serde(default)]
+    version: String,
+}
+
+/// Stores the sysinfo text `raw` of `id` (already checked) and its split `f`, with the reported
+/// `uuid` for the late binding (§11) and the path it came on: in a `make_room` transaction, so it
+/// creates the row if needed within the device table's limit. False when there was no room (nothing
+/// written). Rare (a device sends it when it starts or its sysinfo changes), so it always writes.
+pub(crate) async fn store_sysinfo(
+    db: &SqlitePool,
+    id: &str,
+    uuid: &str,
+    raw: &str,
+    mut f: SysinfoFields,
+    client_type: &str,
+) -> Result<bool, sqlx::Error> {
+    for field in [&mut f.hostname, &mut f.username, &mut f.os, &mut f.version] {
         clip(field, MAX_SYSINFO_FIELD_LEN);
     }
-    let mut tx = state.db.begin_with(BEGIN_WRITE).await?;
-    if !make_room(&mut tx, &req.id).await? {
-        return refused();
+    let mut tx = db.begin_with(BEGIN_WRITE).await?;
+    if !make_room(&mut tx, id).await? {
+        return Ok(false);
     }
     const SET: &str = "uuid = ?2, hostname = ?3, username = ?4, os = ?5, version = ?6,
-         client_type = 'rustdesk', sysinfo = ?7, last_seen_at = ?8";
+         client_type = ?9, sysinfo = ?7, last_seen_at = ?8";
     sqlx::query(&format!(
         "insert into device(id, uuid, hostname, username, os, version, client_type, sysinfo,
                             first_seen_at, last_seen_at, user_id)
-         values(?1, ?2, ?3, ?4, ?5, ?6, 'rustdesk', ?7, ?8, ?8, {OWNER_FROM_TOKEN})
+         values(?1, ?2, ?3, ?4, ?5, ?6, ?9, ?7, ?8, ?8, {OWNER_FROM_TOKEN})
          on conflict(id) do update set {SET}, user_id = coalesce(user_id, excluded.user_id)"
     ))
-    .bind(&req.id)
-    .bind(req.uuid.as_deref().unwrap_or_default())
-    .bind(&req.hostname)
-    .bind(&req.username)
-    .bind(&req.os)
-    .bind(&req.version)
-    .bind(String::from_utf8_lossy(&body))
+    .bind(id)
+    .bind(uuid)
+    .bind(&f.hostname)
+    .bind(&f.username)
+    .bind(&f.os)
+    .bind(&f.version)
+    .bind(raw)
     .bind(crate::common::now() as i64)
+    .bind(client_type)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(text("SYSINFO_UPDATED"))
+    Ok(true)
 }
 
 /// Heartbeat body (note 01 §1.4). `conns` is not used (no `disconnect` in phase 1).
@@ -280,7 +355,8 @@ struct Strategy {
 }
 
 /// `POST /api/heartbeat`: always a JSON object (at least `{}`); strategy only when `modified_at != rev`.
-/// Over the source's budget or not a registered device: `{}`. The client has no branch for either
+/// Over the source's budget, not a registered device or one whose key is pinned (it reports signed
+/// on `/api/porta/v1/`): `{}`. The client has no branch for either
 /// (rustdesk@bd92623:src/hbbs_http/sync.rs `start_hbbs_sync_async` only looks for keys) and sends
 /// the next one 15 s later. No room for a new row (`make_room`): served without the row, so without
 /// the `sysinfo` key.
@@ -293,65 +369,13 @@ pub(crate) async fn heartbeat(
         return Ok(ok_json(&HeartbeatResp::default()));
     }
     let req: HeartbeatReq = parse_json(&body)?;
-    if !uuid_matches(&state.db, &req.id, req.uuid.as_deref()).await? {
+    if uuid_matches(&state.db, &req.id, req.uuid.as_deref()).await? != UuidCheck::Match {
         return Ok(ok_json(&HeartbeatResp::default()));
     }
     let uuid = req.uuid.as_deref().unwrap_or_default();
-    let now = crate::common::now() as i64;
-    let ip = ip.to_string();
-    let seen: Option<(i64, i64, String, bool)> =
-        sqlx::query_as("select ver, last_seen_at, last_ip, sysinfo = '' from device where id = ?")
-            .bind(&req.id)
-            .fetch_optional(&state.db)
-            .await?;
-    // Whether the stored row has no sysinfo yet; `None` when there is no row.
-    let no_sysinfo: Option<bool> = match seen {
-        Some((ver, last_seen, last_ip, no_sysinfo))
-            if ver == req.ver && last_ip == ip && now - last_seen < LAST_SEEN_STEP =>
-        {
-            Some(no_sysinfo)
-        }
-        // Changed, or `last_seen_at` due. `None` if the row was evicted since the select: served
-        // without it, the next heartbeat makes a new one.
-        Some(_) => sqlx::query_scalar(&format!(
-            "update device set ver = ?3, last_seen_at = ?4, last_ip = ?5,
-               user_id = coalesce(user_id, {OWNER_FROM_TOKEN})
-             where id = ?1 returning sysinfo = ''"
-        ))
-        .bind(&req.id)
-        .bind(uuid)
-        .bind(req.ver)
-        .bind(now)
-        .bind(&ip)
-        .fetch_optional(&state.db)
-        .await?,
-        None => {
-            let mut tx = state.db.begin_with(BEGIN_WRITE).await?;
-            if make_room(&mut tx, &req.id).await? {
-                // `on conflict`: another first heartbeat of the same device may have made the row.
-                let no_sysinfo = sqlx::query_scalar(&format!(
-                    "insert into device(id, uuid, ver, first_seen_at, last_seen_at, last_ip, user_id)
-                     values(?1, ?2, ?3, ?4, ?4, ?5, {OWNER_FROM_TOKEN})
-                     on conflict(id) do update set ver = ?3, last_seen_at = ?4, last_ip = ?5,
-                       user_id = coalesce(user_id, excluded.user_id)
-                     returning sysinfo = ''"
-                ))
-                .bind(&req.id)
-                .bind(uuid)
-                .bind(req.ver)
-                .bind(now)
-                .bind(&ip)
-                .fetch_one(&mut *tx)
-                .await?;
-                tx.commit().await?;
-                Some(no_sysinfo)
-            } else {
-                None
-            }
-        }
-    };
+    let stored = touch(&state.db, &req.id, uuid, req.ver, &ip.to_string(), CLIENT_RUSTDESK).await?;
     let mut resp = HeartbeatResp {
-        sysinfo: no_sysinfo.filter(|&missing| missing),
+        sysinfo: stored.is_some_and(|s| s.is_empty()).then_some(true),
         ..Default::default()
     };
     let (rev, options) = crate::strategy::effective(&state.db, &req.id).await?;
@@ -362,6 +386,174 @@ pub(crate) async fn heartbeat(
         });
     }
     Ok(ok_json(&resp))
+}
+
+/// A heartbeat's write of the device row of `id` (already checked): `ver`, `last_ip` and the path it
+/// came on (`client_type`) are written when one changed, `last_seen_at` also once the stored one is
+/// `LAST_SEEN_STEP` old, else nothing is written; a missing row is created within the table's limit
+/// (`make_room`). Rows written with no owner get the late binding (`OWNER_FROM_TOKEN`, with the
+/// reported `uuid`). Returns the stored sysinfo text (`''`: none yet); `None` when there is no row
+/// (no room for it, or evicted meanwhile: served without it, the next heartbeat makes a new one).
+pub(crate) async fn touch(
+    db: &SqlitePool,
+    id: &str,
+    uuid: &str,
+    ver: i64,
+    ip: &str,
+    client_type: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    let now = crate::common::now() as i64;
+    let seen: Option<(i64, i64, String, String, String)> =
+        sqlx::query_as("select ver, last_seen_at, last_ip, client_type, sysinfo from device where id = ?")
+            .bind(id)
+            .fetch_optional(db)
+            .await?;
+    match seen {
+        Some((old_ver, last_seen, last_ip, old_type, sysinfo))
+            if old_ver == ver && last_ip == ip && old_type == client_type && now - last_seen < LAST_SEEN_STEP =>
+        {
+            Ok(Some(sysinfo))
+        }
+        // Changed, or `last_seen_at` due.
+        Some(_) => {
+            sqlx::query_scalar(&format!(
+                "update device set ver = ?3, last_seen_at = ?4, last_ip = ?5, client_type = ?6,
+                   user_id = coalesce(user_id, {OWNER_FROM_TOKEN})
+                 where id = ?1 returning sysinfo"
+            ))
+            .bind(id)
+            .bind(uuid)
+            .bind(ver)
+            .bind(now)
+            .bind(ip)
+            .bind(client_type)
+            .fetch_optional(db)
+            .await
+        }
+        None => {
+            let mut tx = db.begin_with(BEGIN_WRITE).await?;
+            if !make_room(&mut tx, id).await? {
+                return Ok(None);
+            }
+            // `on conflict`: another first heartbeat of the same device may have made the row.
+            let sysinfo = sqlx::query_scalar(&format!(
+                "insert into device(id, uuid, ver, first_seen_at, last_seen_at, last_ip, client_type, user_id)
+                 values(?1, ?2, ?3, ?4, ?4, ?5, ?6, {OWNER_FROM_TOKEN})
+                 on conflict(id) do update set ver = ?3, last_seen_at = ?4, last_ip = ?5, client_type = ?6,
+                   user_id = coalesce(user_id, excluded.user_id)
+                 returning sysinfo"
+            ))
+            .bind(id)
+            .bind(uuid)
+            .bind(ver)
+            .bind(now)
+            .bind(ip)
+            .bind(client_type)
+            .fetch_one(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok(Some(sysinfo))
+        }
+    }
+}
+
+/// Features of this server the Porta client may use (response `features`); block 04 adds
+/// `"udp-punch"`.
+const PORTA_FEATURES: &[&str] = &[];
+
+/// `POST /api/porta/v1/heartbeat` body (contract 01 §2.3); absent keys are absent values. The id
+/// comes from the signature (`SignedBody`). `conns` is not used; the keys of block 02
+/// (`routing_rev`, `probes`) are not read yet and serde skips them.
+#[derive(Deserialize)]
+struct PortaHeartbeatReq {
+    #[serde(default)]
+    uuid: String,
+    #[serde(default)]
+    ver: i64,
+    /// The client's `libs/porta` version (`PortaHb::porta_ver`), not stored.
+    #[serde(default)]
+    porta: String,
+    #[serde(default)]
+    strategy_rev: i64,
+    /// Standard base64 of the sha256 of the client's `sysinfo` bytes.
+    #[serde(default)]
+    sysinfo_hash: String,
+    /// Kept byte for byte: the hash is over these bytes.
+    sysinfo: Option<Box<RawValue>>,
+}
+
+#[derive(Serialize)]
+struct PortaHeartbeatResp {
+    api: u32,
+    features: &'static [&'static str],
+    time: i64,
+    /// Only `true`, only when wanted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    need_sysinfo: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    strategy: Option<PortaStrategy>,
+}
+
+/// Every effective option (values are strings, `''` deletes the key) and their `rev`.
+#[derive(Serialize)]
+struct PortaStrategy {
+    rev: i64,
+    options: BTreeMap<String, String>,
+}
+
+/// `POST /api/porta/v1/heartbeat` (contract 01 §3.6): a signed heartbeat. Records it in memory
+/// (`Peer::porta_hb`), stores a sysinfo that came with it, writes the device row (`touch`, as
+/// `porta`), and answers signed: `need_sysinfo` when the stored sysinfo is missing or its hash is not
+/// the reported one, the effective options when their rev is not the reported one. Bad body 400,
+/// sysinfo over `MAX_SYSINFO_LEN` 413, database error 503 (all unsigned).
+pub(crate) async fn porta_heartbeat(State(state): State<AppState>, signed: SignedBody) -> Response {
+    let req: PortaHeartbeatReq = match parse_body(&signed.body) {
+        Ok(req) => req,
+        Err(resp) => return resp,
+    };
+    if req.uuid.len() > MAX_UUID_LEN {
+        return porta_error(StatusCode::BAD_REQUEST, "bad_request", "uuid too long");
+    }
+    let sysinfo = match &req.sysinfo {
+        Some(raw) if raw.get().len() > MAX_SYSINFO_LEN => {
+            return porta_error(StatusCode::PAYLOAD_TOO_LARGE, "too_large", "sysinfo too large")
+        }
+        Some(raw) => match parse_body::<SysinfoFields>(raw.get().as_bytes()) {
+            Ok(fields) => Some((raw.get(), fields)),
+            Err(resp) => return resp,
+        },
+        None => None,
+    };
+    let porta_ver = hbb_common::get_version_number(&req.porta).clamp(0, u32::MAX as i64) as u32;
+    signed.peer.write().await.porta_hb = Some(PortaHb {
+        at: Instant::now(),
+        porta_ver,
+    });
+    let db = &state.db;
+    if let Some((raw, fields)) = sysinfo {
+        if let Err(err) = store_sysinfo(db, &signed.id, &req.uuid, raw, fields, CLIENT_PORTA).await {
+            return porta_internal(err);
+        }
+    }
+    let stored = match touch(db, &signed.id, &req.uuid, req.ver, &signed.ip.to_string(), CLIENT_PORTA).await {
+        Ok(stored) => stored,
+        Err(err) => return porta_internal(err),
+    };
+    let need_sysinfo = stored
+        .is_some_and(|s| s.is_empty() || base64::encode(Sha256::digest(s.as_bytes())) != req.sysinfo_hash)
+        .then_some(true);
+    let (rev, options) = match crate::strategy::effective(db, &signed.id).await {
+        Ok(v) => v,
+        Err(err) => return porta_internal(format!("{err:#}")),
+    };
+    let resp = PortaHeartbeatResp {
+        api: 1,
+        features: PORTA_FEATURES,
+        time: crate::common::now() as i64,
+        need_sysinfo,
+        strategy: (req.strategy_rev != rev).then_some(PortaStrategy { rev, options }),
+    };
+    signed_json(&state, &signed.sig, StatusCode::OK, &resp)
 }
 
 /// `explain query plan` of `sql` (parameters written as literals): the `detail` of every step.
@@ -532,7 +724,7 @@ mod tests {
         let t = testutil::app().await;
         let db = &t.state.db;
         let matches = |id: String, uuid: Option<String>| async move {
-            super::uuid_matches(db, &id, uuid.as_deref()).await.unwrap()
+            super::uuid_matches(db, &id, uuid.as_deref()).await.unwrap() == super::UuidCheck::Match
         };
         add_peer(db, "111", UUID).await;
         assert!(matches("111".into(), Some(b64(UUID))).await);
@@ -1058,5 +1250,183 @@ mod tests {
         // The pushed rev is the one strategy::effective computes.
         let (rev, _) = crate::strategy::effective(db, "dev1").await.unwrap();
         assert_eq!(rev, rev5);
+    }
+
+    // ---- Phase 3 contract 01: pinned devices on the compatibility path, the Porta heartbeat ----
+
+    async fn pin(db: &SqlitePool, id: &str) {
+        sqlx::query("update peer set pk_pinned_at = 1 where id = ?").bind(id).execute(db).await.unwrap();
+    }
+
+    /// §3.5: once the key is pinned, the unsigned heartbeat and sysinfo of the id are refused like a
+    /// mismatch; the login still binds; other ids are served as before.
+    #[tokio::test]
+    async fn pinned_devices_refuse_unsigned_reports() {
+        let t = testutil::app().await;
+        let db = &t.state.db;
+        let uuid = b64(UUID);
+        add_peer(db, "pinned", UUID).await;
+        add_peer(db, "free11", UUID).await;
+        pin(db, "pinned").await;
+        assert_eq!(
+            super::uuid_matches(db, "pinned", Some(&uuid)).await.unwrap(),
+            super::UuidCheck::MatchPinned
+        );
+        assert_eq!(heartbeat(&t.app, json!({"id": "pinned", "uuid": uuid, "ver": 1, "modified_at": 0})).await, json!({}));
+        let (status, _, body) = send(&t.app, "POST", "/api/sysinfo", None, &sysinfo_body("pinned", Some(&uuid), "h")).await;
+        assert_eq!((status, body.is_empty()), (StatusCode::FORBIDDEN, true));
+        assert!(!has_row(db, "pinned").await);
+        let (amy, _) = testutil::create_user(db, "pin-amy", "pw", false).await;
+        login(&t.app, "pin-amy", "pinned", &uuid).await;
+        assert_eq!(owner(db, "pinned").await, Some(amy));
+
+        let r = heartbeat(&t.app, json!({"id": "free11", "uuid": uuid, "ver": 1, "modified_at": 0})).await;
+        assert!(r["modified_at"].is_i64());
+        assert!(has_row(db, "free11").await);
+    }
+
+    fn sysinfo_obj(hostname: &str) -> Value {
+        json!({"cpu": "Intel, 3.6GHz, 8/4 cores", "memory": "16GB", "os": "windows / Windows 11 Pro - 10.0.26100",
+               "hostname": hostname, "username": "alice", "version": "1.5.1"})
+    }
+
+    fn sha256_b64(raw: &str) -> String {
+        base64::encode(<sha2::Sha256 as sha2::Digest>::digest(raw.as_bytes()))
+    }
+
+    /// The body the client sends: one compact serialization, so the sysinfo bytes inside it are the
+    /// ones its hash is over. `hash` overrides the hash sent; returns the body and the own hash.
+    /// Carries keys this block does not read (`conns`, block 02's `routing_rev`, a bad `probes`).
+    fn porta_body(rev: i64, sysinfo: Option<&Value>, hash: Option<&str>) -> (String, String) {
+        let mut v = json!({"uuid": b64(UUID), "ver": 1005010, "porta": "0.3.0", "strategy_rev": rev,
+                           "conns": [3], "routing_rev": 7, "probes": "not an object"});
+        let raw = sysinfo.map(|s| serde_json::to_string(s).unwrap()).unwrap_or_default();
+        let own_hash = sha256_b64(&raw);
+        if let Some(s) = sysinfo {
+            v["sysinfo"] = s.clone();
+        }
+        v["sysinfo_hash"] = json!(hash.unwrap_or(&own_hash));
+        let body = serde_json::to_string(&v).unwrap();
+        assert!(body.contains(&raw));
+        (body, own_hash)
+    }
+
+    async fn device_row(db: &SqlitePool, id: &str) -> (String, String, String, i64) {
+        sqlx::query_as("select sysinfo, hostname, client_type, ver from device where id = ?")
+            .bind(id)
+            .fetch_one(db)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn porta_heartbeat_sysinfo_and_strategy() {
+        let t = testutil::app().await;
+        let db = &t.state.db;
+        let dev = testutil::porta_device(&t.state, "porta1", UUID).await;
+        let hb = |body: String| {
+            let (dev, app) = (&dev, &t.app);
+            async move { dev.post(app, "heartbeat", body.as_bytes()).await }
+        };
+
+        // No row yet: sysinfo wanted, every option pushed; signed, `features` empty, `time` now.
+        let r = hb(porta_body(0, None, Some("")).0).await;
+        assert_eq!(r.status, StatusCode::OK);
+        assert_eq!(r.headers["content-type"], "application/json; charset=utf-8");
+        assert!(testutil::verify_server_sig(&t.state, &r.sig, &r.headers, &r.body));
+        let v = r.json();
+        let rev = v["strategy"]["rev"].as_i64().unwrap();
+        assert_eq!(rev, crate::strategy::effective(db, "porta1").await.unwrap().0);
+        assert_eq!(v["strategy"]["options"], json!({"relay-server": ""}));
+        assert_eq!((&v["api"], &v["features"], &v["need_sysinfo"]), (&json!(1), &json!([]), &json!(true)));
+        assert!((v["time"].as_i64().unwrap() - crate::common::now() as i64).abs() <= 2);
+        assert_eq!(device_row(db, "porta1").await, (String::new(), String::new(), "porta".into(), 1005010));
+
+        // The rev echoed back: no strategy; the row has no sysinfo yet, so it is still wanted.
+        let v = hb(porta_body(rev, None, Some("")).0).await.json();
+        assert_eq!(v.get("strategy"), None);
+        assert_eq!(v["need_sysinfo"], json!(true));
+
+        // With the sysinfo: stored byte for byte (the hash the client computed is the stored text's),
+        // not wanted any more; the answer is just api, features, time.
+        let s = sysinfo_obj("h1");
+        let (body, hash) = porta_body(rev, Some(&s), None);
+        let v = hb(body).await.json();
+        assert_eq!(v.as_object().unwrap().keys().collect::<Vec<_>>(), ["api", "features", "time"]);
+        let (stored, host, client, _) = device_row(db, "porta1").await;
+        assert_eq!(
+            (stored.as_str(), host.as_str(), client.as_str()),
+            (serde_json::to_string(&s).unwrap().as_str(), "h1", "porta")
+        );
+        assert_eq!(sha256_b64(&stored), hash);
+        // Without the sysinfo: the same hash wants nothing, another one wants it again.
+        assert_eq!(hb(porta_body(rev, None, Some(&hash)).0).await.json().get("need_sysinfo"), None);
+        assert_eq!(hb(porta_body(rev, None, Some("other")).0).await.json()["need_sysinfo"], json!(true));
+
+        // An option changed: pushed again, with every effective option. (Not the body sent just
+        // above, which within the same second would be a replay.)
+        set_option(db, "porta1", "allow-auto-disconnect", "Y").await;
+        let v = hb(porta_body(rev, None, None).0).await.json();
+        let rev2 = v["strategy"]["rev"].as_i64().unwrap();
+        assert_ne!(rev2, rev);
+        assert_eq!(v["strategy"]["options"], json!({"allow-auto-disconnect": "Y", "relay-server": ""}));
+
+        // The path the device reported on last: a compatibility heartbeat (key unpinned for it)
+        // makes it `rustdesk` again.
+        sqlx::query("update peer set pk_pinned_at = null where id = 'porta1'").execute(db).await.unwrap();
+        heartbeat(&t.app, json!({"id": "porta1", "uuid": b64(UUID), "ver": 1005010, "modified_at": 0})).await;
+        assert_eq!(device_row(db, "porta1").await.2, "rustdesk");
+    }
+
+    #[tokio::test]
+    async fn porta_heartbeat_bad_bodies() {
+        let t = testutil::app().await;
+        let dev = testutil::porta_device(&t.state, "porta2", UUID).await;
+        let bad = [
+            ("nope".to_owned(), StatusCode::BAD_REQUEST, "bad_request"),
+            (json!({"uuid": "u".repeat(MAX_UUID_LEN + 1)}).to_string(), StatusCode::BAD_REQUEST, "bad_request"),
+            (json!({"ver": "x"}).to_string(), StatusCode::BAD_REQUEST, "bad_request"),
+            (json!({"sysinfo": {"hostname": 5}}).to_string(), StatusCode::BAD_REQUEST, "bad_request"),
+            (json!({"sysinfo": 5}).to_string(), StatusCode::BAD_REQUEST, "bad_request"),
+            (json!({"sysinfo": {"pad": "p".repeat(MAX_SYSINFO_LEN)}}).to_string(), StatusCode::PAYLOAD_TOO_LARGE, "too_large"),
+        ];
+        for (body, want, code) in bad {
+            let r = dev.post(&t.app, "heartbeat", body.as_bytes()).await;
+            assert_eq!(r.status, want, "{body:.80}");
+            assert_eq!(r.json()["error"], code, "{body:.80}");
+            assert!(!r.headers.contains_key(crate::api::devauth::SIG_HEADER));
+        }
+        // None of them recorded a heartbeat or made a row.
+        assert!(t.state.pm.get_in_memory("porta2").await.unwrap().read().await.porta_hb.is_none());
+        assert!(!has_row(&t.state.db, "porta2").await);
+        // A sysinfo at the limit is stored.
+        let mut s = json!({"pad": ""});
+        s["pad"] = json!("p".repeat(MAX_SYSINFO_LEN - s.to_string().len()));
+        let r = dev.post(&t.app, "heartbeat", json!({"sysinfo": s}).to_string().as_bytes()).await;
+        assert_eq!(r.status, StatusCode::OK);
+        assert_eq!(device_row(&t.state.db, "porta2").await.0, s.to_string());
+    }
+
+    /// The in-memory record of the last signed heartbeat (for block 04): written by the heartbeat
+    /// only, not by a refused one or by a Porta audit.
+    #[tokio::test]
+    async fn porta_heartbeat_is_recorded_in_memory() {
+        let t = testutil::app().await;
+        let dev = testutil::porta_device(&t.state, "porta3", UUID).await;
+        let audit = dev.post(&t.app, "audit/alarm", br#"{"typ":1}"#).await;
+        assert_eq!(audit.status, StatusCode::OK);
+        let peer = t.state.pm.get_in_memory("porta3").await.unwrap();
+        assert!(peer.read().await.porta_hb.is_none());
+        let r = dev.post(&t.app, "heartbeat", json!({"porta": "0.3.1", "ver": 1}).to_string().as_bytes()).await;
+        assert_eq!(r.status, StatusCode::OK);
+        {
+            let p = peer.read().await;
+            let hb = p.porta_hb.as_ref().unwrap();
+            assert!(hb.at.elapsed() < std::time::Duration::from_secs(5));
+            assert_eq!(hb.porta_ver, hbb_common::get_version_number("0.3.1") as u32);
+        }
+        // An unreadable version is 0.
+        dev.post(&t.app, "heartbeat", json!({"porta": "x", "ver": 2}).to_string().as_bytes()).await;
+        assert_eq!(peer.read().await.porta_hb.as_ref().unwrap().porta_ver, 0);
     }
 }

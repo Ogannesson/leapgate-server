@@ -58,6 +58,21 @@ pub(super) async fn exec(ctx: &Ctx, cmd: &str, mut args: Args) -> ResultType<Str
                 format!("{device} uses relay {pin} as the controlled side from its next connection\n")
             })
         }
+        ("device", "key") => {
+            let first = args.next("device id or reset")?;
+            if first != "reset" {
+                args.finish()?;
+                return device_key(db, &first).await;
+            }
+            let forget = args.flag("--forget");
+            let device = args.next("device id")?;
+            args.finish()?;
+            // The console splits its command on spaces.
+            if device.is_empty() || device.contains(char::is_whitespace) {
+                bail!("Not a device id: {device:?}");
+            }
+            key_reset(ctx, &device, forget).await
+        }
         ("strategy", "show") => {
             let device = args.next_opt().filter(|d| d != GLOBAL);
             args.finish()?;
@@ -69,6 +84,10 @@ pub(super) async fn exec(ctx: &Ctx, cmd: &str, mut args: Args) -> ResultType<Str
             let value = if sub == "set" { args.next("option value")? } else { String::new() };
             args.finish()?;
             check_scope_key(&scope, &key)?;
+            // The Porta client's own options; it skips them in a pushed strategy too.
+            if key.starts_with("porta-") {
+                bail!("Options starting with porta- are the Porta client's own and are never pushed");
+            }
             sqlx::query(
                 "insert into strategy_option(scope, key, value) values(?, ?, ?)
                  on conflict(scope, key) do update set value = excluded.value",
@@ -157,6 +176,84 @@ pub(super) async fn runtime(
         }
         _ => bail!("Unknown command '{cmd} {sub}'\n\n{USAGE}"),
     }
+}
+
+/// `device key <id>`: what the database has on the device's key (read only).
+async fn device_key(db: &SqlitePool, id: &str) -> ResultType<String> {
+    let Some((pk, pinned_at, uuid)) =
+        sqlx::query_as::<_, (Vec<u8>, Option<i64>, Vec<u8>)>("select pk, pk_pinned_at, uuid from peer where id = ?")
+            .bind(id)
+            .fetch_optional(db)
+            .await?
+    else {
+        bail!("No registered device {id}");
+    };
+    // A reinstall that lost its id shows here: its new id has the same machine uuid.
+    let others: Vec<String> = sqlx::query_scalar("select id from peer where uuid = ? and id <> ? order by id")
+        .bind(&uuid)
+        .bind(id)
+        .fetch_all(db)
+        .await?;
+    let pinned = match pinned_at {
+        Some(at) => format!("pinned since {}", fmt_time(at)),
+        None => "not pinned".to_owned(),
+    };
+    Ok(format!(
+        "Device {id}\nKey fingerprint: {}\nKey: {pinned}\nuuid: {} bytes\nOther ids with this uuid: {}\n",
+        fingerprint(&pk),
+        uuid.len(),
+        if others.is_empty() { "none".to_owned() } else { others.join(", ") }
+    ))
+}
+
+/// Lowercase hex, a space every 4 characters: what the client shows (rustdesk `pk_to_fingerprint`).
+fn fingerprint(pk: &[u8]) -> String {
+    let hex: String = pk.iter().map(|b| format!("{b:02x}")).collect();
+    let mut out = String::with_capacity(hex.len() * 5 / 4);
+    for (i, c) in hex.chars().enumerate() {
+        if i > 0 && i % 4 == 0 {
+            out.push(' ');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `device key reset [--forget] <id>` (PORTA.md §14): unpins the key of `id`, keeping its uuid and
+/// key (a reinstall keeps its id by the usual rule: same uuid, same IP may change the key), or with
+/// `forget` deletes its row (the uuid changed too; the next registration of the id is a new device).
+/// Only the command line changes the database: whoever can open its file may. Then the running
+/// server's console reloads the entry from the database (`kl`, which anyone may trigger and only
+/// aligns memory); unreachable, the change stands and the command fails, saying a running server
+/// must be restarted. (The server also reloads a pinned entry by itself on a registration with
+/// another key, so an unpinning reaches it at the device's next registration anyway.)
+async fn key_reset(ctx: &Ctx, id: &str, forget: bool) -> ResultType<String> {
+    let sql = if forget {
+        "delete from peer where id = ?"
+    } else {
+        "update peer set pk_pinned_at = null where id = ?"
+    };
+    if sqlx::query(sql).bind(id).execute(&ctx.db).await?.rows_affected() == 0 {
+        bail!(
+            "No registered device {id}. If an earlier reset of it was not reloaded by the server, \
+             restart porta-server."
+        );
+    }
+    let done = if forget {
+        format!("{id}: forgotten; the next registration of this id is taken as a new device\n")
+    } else {
+        format!("{id}: key no longer pinned (uuid and key kept); the next signed report pins the key it is signed with\n")
+    };
+    // Every answer of a server that reloaded starts with "<id>: " (`PeerMap::reload_from_main`).
+    let failure = match console(ctx.console, &format!("kl {id}"), CONSOLE_WAIT).await {
+        Ok(reply) if reply.starts_with(&format!("{id}: ")) => return Ok(done + &reply),
+        Ok(reply) => format!("it answered {:?}", reply.trim_end()),
+        Err(err) => err.to_string(),
+    };
+    bail!(
+        "{done}The database is changed, but the server did not reload it ({failure}).\n\
+         If porta-server is running, restart it for this to take effect."
+    )
 }
 
 fn parse_ip(s: &str) -> ResultType<IpAddr> {
@@ -293,6 +390,21 @@ mod tests {
                 let mut buf = [0u8; 1024];
                 let n = s.read(&mut buf).await.unwrap();
                 let reply = format!("got {}", String::from_utf8_lossy(&buf[..n]));
+                s.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        addr
+    }
+
+    /// A console that answers `reply` to anything.
+    async fn console_replying(reply: &'static str) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 1024];
+                s.read(&mut buf).await.unwrap();
                 s.write_all(reply.as_bytes()).await.unwrap();
             }
         });
@@ -446,6 +558,92 @@ mod tests {
         assert!(lines[2].starts_with("300") && lines[2].contains("1.3.9") && lines[2].ends_with("rendezvous only"), "{legacy}");
         assert!(lines[3].starts_with("400") && lines[3].contains("1.4.0") && lines[3].ends_with("rendezvous only"), "{legacy}");
         assert!(lines[4].contains("never sent a heartbeat"), "{legacy}");
+    }
+
+    #[test]
+    fn fingerprint_like_the_client() {
+        // rustdesk `pk_to_fingerprint`: lowercase hex, a space every 4 characters.
+        assert_eq!(super::fingerprint(&[0xab, 0x01, 0xff]), "ab01 ff");
+        let fp = super::fingerprint(&[0x0f; 32]);
+        assert_eq!(fp.len(), 64 + 15);
+        assert!(fp.starts_with("0f0f 0f0f ") && fp.ends_with(" 0f0f"));
+    }
+
+    async fn peer(db: &sqlx::SqlitePool, id: &str, uuid: &[u8], pk: &[u8], pinned_at: Option<i64>) {
+        crate::database::Database::new(db.clone()).insert_peer(id, uuid, pk, "{}").await.unwrap();
+        sqlx::query("update peer set pk_pinned_at = ? where id = ?").bind(pinned_at).bind(id).execute(db).await.unwrap();
+    }
+
+    async fn pinned_at(db: &sqlx::SqlitePool, id: &str) -> Option<Option<i64>> {
+        sqlx::query_scalar("select pk_pinned_at from peer where id = ?").bind(id).fetch_optional(db).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn device_key_and_reset() {
+        let (_dir, ctx) = ctx(NO_CONSOLE).await;
+        let db = &ctx.db;
+        peer(db, "dev001", b"machine-1", &[0xab; 32], Some(1_700_000_000)).await;
+        peer(db, "dev002", b"machine-1", &[0xcd; 32], None).await;
+        peer(db, "dev003", b"machine-2", &[0xef; 32], None).await;
+
+        let out = cli(&ctx, &["device", "key", "dev001"], "").await.unwrap();
+        assert!(out.contains(&format!("Key fingerprint: {}\n", super::fingerprint(&[0xab; 32]))), "{out}");
+        assert!(out.contains(&format!("Key: pinned since {}\n", super::fmt_time(1_700_000_000))), "{out}");
+        assert!(out.contains("uuid: 9 bytes\n") && out.contains("Other ids with this uuid: dev002\n"), "{out}");
+        let out = cli(&ctx, &["device", "key", "dev003"], "").await.unwrap();
+        assert!(out.contains("Key: not pinned\n") && out.contains("Other ids with this uuid: none\n"), "{out}");
+        assert!(cli(&ctx, &["device", "key", "nosuch"], "").await.is_err());
+
+        // No server console: the database is changed all the same (not rolled back), and the command
+        // fails saying a running server must be restarted. Reset keeps the uuid and key.
+        let err = cli(&ctx, &["device", "key", "reset", "dev001"], "").await.unwrap_err().to_string();
+        assert!(err.contains("no longer pinned") && err.contains("restart it"), "{err}");
+        assert_eq!(pinned_at(db, "dev001").await, Some(None));
+        let (uuid, pk): (Vec<u8>, Vec<u8>) =
+            sqlx::query_as("select uuid, pk from peer where id = 'dev001'").fetch_one(db).await.unwrap();
+        assert_eq!((uuid, pk), (b"machine-1".to_vec(), vec![0xab; 32]));
+        let err = cli(&ctx, &["device", "key", "reset", "--forget", "dev001"], "").await.unwrap_err().to_string();
+        assert!(err.contains("forgotten") && err.contains("restart it"), "{err}");
+        assert_eq!(pinned_at(db, "dev001").await, None);
+        let err = cli(&ctx, &["device", "key", "reset", "dev001"], "").await.unwrap_err().to_string();
+        assert!(err.contains("No registered device") && err.contains("restart porta-server"), "{err}");
+        assert!(cli(&ctx, &["device", "key", "reset", "a b"], "").await.is_err());
+        assert!(cli(&ctx, &["device", "key", "reset"], "").await.is_err());
+
+        // With a server running: the command line changes the database, then the console reloads
+        // the entry (`kl`; the server side is in `rendezvous_server`'s tests). The console is sent
+        // `kl <id>` (`fake_console` echoes it).
+        let (_dir2, ctx2) = super::super::tests::ctx(fake_console().await).await;
+        peer(&ctx2.db, "dev004", b"machine-4", &[0x44; 32], Some(1)).await;
+        let err = cli(&ctx2, &["device", "key", "reset", "dev004"], "").await.unwrap_err().to_string();
+        assert!(err.contains(r#""got kl dev004""#), "{err}");
+        // Answered like the server: success.
+        let (_dir3, ctx3) = super::super::tests::ctx(console_replying("dev005: reloaded from the database\n").await).await;
+        peer(&ctx3.db, "dev005", b"machine-5", &[0x55; 32], Some(1)).await;
+        let out = cli(&ctx3, &["device", "key", "reset", "dev005"], "").await.unwrap();
+        assert!(out.contains("no longer pinned") && out.ends_with("dev005: reloaded from the database\n"), "{out}");
+        assert_eq!(pinned_at(&ctx3.db, "dev005").await, Some(None));
+        let out = cli(&ctx3, &["device", "key", "reset", "dev005", "--forget"], "").await.unwrap();
+        assert!(out.contains("forgotten"), "{out}");
+        assert_eq!(pinned_at(&ctx3.db, "dev005").await, None);
+        // A failed or empty answer: the change stands, the command fails saying to restart.
+        for reply in ["Failed: x", ""] {
+            let (_dir4, ctx4) = super::super::tests::ctx(console_replying(reply).await).await;
+            peer(&ctx4.db, "dev006", b"machine-6", &[0x66; 32], Some(1)).await;
+            let err = cli(&ctx4, &["device", "key", "reset", "dev006"], "").await.unwrap_err().to_string();
+            assert!(err.contains("restart it") && err.contains(&format!("{reply:?}")), "{err}");
+            assert_eq!(pinned_at(&ctx4.db, "dev006").await, Some(None));
+        }
+    }
+
+    #[tokio::test]
+    async fn strategy_never_takes_porta_keys() {
+        let (_dir, ctx) = ctx(NO_CONSOLE).await;
+        for words in [&["strategy", "set", "*", "porta-api-caps", "x"][..], &["strategy", "unset", "dev1", "porta-x"]] {
+            let err = cli(&ctx, words, "").await.unwrap_err().to_string();
+            assert!(err.contains("porta-"), "{err}");
+        }
+        assert_eq!(rows(&ctx.db).await, vec![row("*", "relay-server", "")]);
     }
 
     #[tokio::test]
