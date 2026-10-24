@@ -375,10 +375,11 @@ impl<S> Sessions<S> {
         }
     }
 
-    /// Registers a session for A at `a_ip`: refused when it is in the table already or A's source
-    /// (`source_key` of the address normalized from `::ffff:a.b.c.d`, which a dual-stack 21116
-    /// gives every IPv4 client) holds `ICE_SESSIONS_PER_SOURCE`. Takes `sink` on success only:
-    /// on a refusal the caller still has it to reject with.
+    /// Registers a session for A at `a_ip` (`try_into_v4` of the connection's address, as
+    /// `conn_attempt` has it): refused when it is in the table already or A's source (`source_key`
+    /// of the address, a `::ffff:a.b.c.d` normalized here too: a dual-stack 21116 gives every IPv4
+    /// client one) holds `ICE_SESSIONS_PER_SOURCE`. Takes `sink` on success only: on a refusal the
+    /// caller still has it to reject with.
     pub fn register(
         &mut self,
         session: [u8; 16],
@@ -815,5 +816,16 @@ mod tests {
         assert_eq!(t.close(&[1; 16]), None);
         assert_eq!(count(&t), 0);
         assert!(t.per_source.is_empty() && t.map.is_empty());
+    }
+
+    /// §2.3 ②: an answered session is not sent again, with a send still left.
+    #[test]
+    fn resend_refused_once_answered() {
+        let mut t: Sessions<u32> = Sessions::new();
+        let mut fwd = RendezvousMessage::new();
+        fwd.set_leapgate_ice(LeapgateIce { ver: 1, ..Default::default() });
+        assert!(t.register([7; 16], &mut Some(7), fwd, "B7".to_owned(), ip("203.0.113.9")).is_ok());
+        assert_eq!(t.take_sink_for_answer(&[7; 16]), Some(7));
+        assert_eq!(t.resend(&[7; 16]), None);
     }
 }

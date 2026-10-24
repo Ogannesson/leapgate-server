@@ -1172,8 +1172,9 @@ impl RendezvousServer {
             _ => None,
         }
         .ok_or(Reason::UNSUPPORTED)?;
+        let a_ip = try_into_v4(addr).ip();
         let registered =
-            ICE_SESSIONS.lock().unwrap().register(session, sink, forward.clone(), o.id, addr.ip());
+            ICE_SESSIONS.lock().unwrap().register(session, sink, forward.clone(), o.id, a_ip);
         match registered {
             Ok(()) => {}
             Err(ice_signal::Refused::Duplicate) => return Err(Reason::BAD),
@@ -3631,7 +3632,8 @@ mod tests {
     }
 
     /// §2.3 ②: the same OFFER again on the connection sends the cached FORWARD, byte for byte, to
-    /// B's current address; once only. Another session on the connection is ignored.
+    /// the current address of the B it was registered for, whatever id the resend names; once
+    /// only. Another session on the connection is ignored.
     #[hbb_common::tokio::test]
     async fn ice_offer_resend() {
         let mut h = harness(true, None).await;
@@ -3643,10 +3645,13 @@ mod tests {
         a.send(&offer).await.unwrap();
         let (first, to) = h.to_b().await;
         assert_eq!(to, "8.8.8.8:5000".parse().unwrap());
-        // B registers again from elsewhere.
+        // B registers again from elsewhere; the resend names another device that is online.
         h.online("B1", "8.8.4.4:6000").await;
+        h.online("B2", "1.1.1.1:7000").await;
         a.send(&ice_offer(&ice_session(), "B1", "", ice_params(&["192.168.1.11:50000"]))).await.unwrap();
-        a.send(&offer).await.unwrap();
+        let mut to_b2 = offer.clone();
+        to_b2.mut_leapgate_ice().mut_offer().id = "B2".to_owned();
+        a.send(&to_b2).await.unwrap();
         let (second, to) = h.to_b().await;
         assert_eq!(to, "8.8.4.4:6000".parse().unwrap());
         assert_eq!(second.write_to_bytes().unwrap(), first.write_to_bytes().unwrap());
@@ -3671,21 +3676,24 @@ mod tests {
     }
 
     /// §2.3 ④: B's ANSWER, on a connection of B's own, reaches A with B's candidates filtered by
-    /// B's proofs and B's `IdPk` signed by S; B's connection is closed. The session stays,
-    /// answered, until A's connection ends; a second ANSWER and one for an unknown session are
-    /// ignored.
+    /// B's proofs (a public IPv4 with one stays, one without goes) and B's `IdPk` signed by S;
+    /// B's connection is closed. The session stays, answered, until A's connection ends; a second
+    /// ANSWER and one for an unknown session are ignored.
     #[hbb_common::tokio::test]
     async fn ice_answer_reaches_a_with_the_signed_pk() {
         let mut h = harness(true, None).await;
         let (mut a, s) = ice_registered(&mut h, "198.51.100.36:5000").await;
-        let cands = ["10.0.0.2:1", "203.0.113.9:2", "[fd00::5]:3"];
+        let cands = ["10.0.0.2:1", "203.0.113.9:2", "[fd00::5]:3", "203.0.113.10:4"];
+        let mut answer = ice_answer(&s, ice_params(&cands));
+        let proof = ice_stun::seal("203.0.113.9:2".parse().unwrap(), crate::common::now());
+        answer.mut_leapgate_ice().mut_answer().proofs = vec![proof.into()];
         let mut b = h.connect(Client::V1).await;
-        b.send(&ice_answer(&s, ice_params(&cands))).await.unwrap();
+        b.send(&answer).await.unwrap();
         let leapgate_ice::Union::Answer(ans) = recv_ice(&mut a).await else {
             panic!("expected answer");
         };
         assert_eq!(ans.session[..], s[..]);
-        assert_eq!(*ans.params, ice_params(&[cands[0], cands[2]]));
+        assert_eq!(*ans.params, ice_params(&cands[..3]));
         assert!(ans.proofs.is_empty());
         let signed = sign::verify(&ans.pk, &h.server_pk).expect("signed by S");
         let id_pk = IdPk::parse_from_bytes(&signed).unwrap();
@@ -3724,23 +3732,29 @@ mod tests {
         }
     }
 
-    /// §2.3 ④: a malformed ANSWER, or one for a B no longer in memory (no pk to sign), rejects A's
-    /// session and removes it.
+    /// §2.3 ④: a malformed ANSWER (one of another version too), or one for a B no longer in memory
+    /// (no pk to sign), rejects A's session and removes it: A's close records nothing.
     #[hbb_common::tokio::test]
     async fn ice_answer_refused() {
         let mut h = harness(true, None).await;
-        let (mut a, s) = ice_registered(&mut h, "198.51.100.37:5000").await;
         let mut bad = ice_params(&["10.0.0.2:1"]);
         bad.candidates.push(Bytes::from_static(&[0; 9]));
-        let mut b = h.connect(Client::V1).await;
-        b.send(&ice_answer(&s, bad)).await.unwrap();
-        let leapgate_ice::Union::Reject(r) = recv_ice(&mut a).await else {
-            panic!("expected reject");
-        };
-        assert_eq!((r.session[..] == s[..], r.reason.enum_value().unwrap()), (true, Reason::BAD));
-        assert!(ICE_SESSIONS.lock().unwrap().close(&session_key(&s)).is_none(), "removed");
-        ice_closed(&mut b).await;
-        drop(a);
+        let mut v2 = ice_answer(&[0; 16], ice_params(&["10.0.0.2:1"]));
+        v2.mut_leapgate_ice().ver = 2;
+        for (from, answer) in [("198.51.100.37:5000", ice_answer(&[0; 16], bad)), ("198.51.100.41:5000", v2)] {
+            let (mut a, s) = ice_registered(&mut h, from).await;
+            let mut answer = answer;
+            answer.mut_leapgate_ice().mut_answer().session = Bytes::copy_from_slice(&s);
+            let mut b = h.connect(Client::V1).await;
+            b.send(&answer).await.unwrap();
+            let leapgate_ice::Union::Reject(r) = recv_ice(&mut a).await else {
+                panic!("expected reject");
+            };
+            assert_eq!((r.session[..] == s[..], r.reason.enum_value().unwrap()), (true, Reason::BAD), "{from}");
+            assert!(ICE_SESSIONS.lock().unwrap().peek_unanswered(&session_key(&s)).is_none(), "removed");
+            ice_closed(&mut b).await;
+            drop(a);
+        }
 
         let (mut a, s) = ice_registered(&mut h, "198.51.100.38:5000").await;
         h.rs.pm.remove("B1").await;
@@ -3750,11 +3764,11 @@ mod tests {
             panic!("expected reject");
         };
         assert_eq!((r.session[..] == s[..], r.reason.enum_value().unwrap()), (true, Reason::UNSUPPORTED));
-        assert!(ICE_SESSIONS.lock().unwrap().close(&session_key(&s)).is_none(), "removed");
-        // A closes: a rejected session is not counted as abandoned.
+        assert!(ICE_SESSIONS.lock().unwrap().peek_unanswered(&session_key(&s)).is_none(), "removed");
+        // A closes: a rejected session is not counted as abandoned (an answered one would be, as
+        // a row within the 3 seconds `ice_rows` waits for one).
         drop(a);
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(ice_rows(&h, 0).await.is_empty());
+        assert!(ice_rows(&h, 1).await.is_empty());
     }
 
     /// §2.3 ⑦, §3.7 (P-A): A's first RESULT for its own session is recorded; one for another
@@ -3813,6 +3827,25 @@ mod tests {
         assert_eq!((r.session[..] == s[..], r.reason.enum_value().unwrap()), (true, Reason::UNSUPPORTED));
         ice_closed(&mut b).await;
         assert!(ICE_SESSIONS.lock().unwrap().close(&session_key(&s)).is_none(), "removed");
+    }
+
+    /// §3.4.2: B's REJECT of another version is ignored, B's connection closed and A's session
+    /// left as it was.
+    #[hbb_common::tokio::test]
+    async fn ice_reject_of_another_version_is_ignored() {
+        let mut h = harness(true, None).await;
+        let (mut a, s) = ice_registered(&mut h, "198.51.100.42:5000").await;
+        let mut reject = ice_msg(leapgate_ice::Union::Reject(LeapgateIceReject {
+            session: Bytes::copy_from_slice(&s),
+            reason: Reason::UNSUPPORTED.into(),
+            ..Default::default()
+        }));
+        reject.mut_leapgate_ice().ver = 2;
+        let mut b = h.connect(Client::V1).await;
+        b.send(&reject).await.unwrap();
+        ice_closed(&mut b).await;
+        assert!(a.next_timeout(300).await.is_none(), "nothing for A");
+        assert_eq!(ICE_SESSIONS.lock().unwrap().peek_unanswered(&session_key(&s)).as_deref(), Some("B1"));
     }
 
     /// Review C-28/C-2: 21118 reads a message of `MAX_FRAME` bytes and closes the connection on a

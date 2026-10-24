@@ -518,7 +518,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 5. 有设备行，且库里 sysinfo 为空或 `base64(sha256(原文)) != sysinfo_hash` → 响应带 `need_sysinfo: true`；没能建行时不带这个键。
 6. `strategy::effective`，`rev != strategy_rev` 时带 `strategy: {rev, options}`（全部生效选项，值一律字符串，空串表示删键）。
 7. `routing_rev` 不等于路由模块当前的列表版本时带 `routing: {rev, probe_interval_secs: 300, relays: [前 32 台原串]}`（§7 第二级；没有配置中继时 `relays` 为 `[]`，客户端停止测速）；相等时不带。
-8. 签名回 200：`{"api": 1, "features": [], "time": <服务器 unix 秒>, …}`。`features` 是常量数组，05 块合入后为 `["ice"]`（自研 ICE，常量，没有会合私钥时照样宣告；02 块不加特性项，客户端看响应里有没有 `routing`）。查库失败一律 503。
+8. 签名回 200：`{"api": 1, "features": ["ice"], "time": <服务器 unix 秒>, …}`。`features` 是常量数组，05 块合入后为 `["ice"]`（自研 ICE，常量，没有会合私钥时照样宣告；02 块不加特性项，客户端看响应里有没有 `routing`）。查库失败一律 503。
 
 哈希只算在 sysinfo 这个 JSON 值的原始字节上；服务端原样存那段字节，比对时当场算，不加列。兼容路径存的是整个兼容请求体，哈希必然不同，所以设备从兼容路径切到 Leapgate 路径后会重传一次 sysinfo。
 
