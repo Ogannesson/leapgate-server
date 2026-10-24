@@ -1505,9 +1505,17 @@ mod tests {
         let other = router.test(ip, ip, "other", "").await;
         assert!(other.contains("(rr)"), "{other}");
 
+        // Probes that are dropped (for another list) leave the last round alone.
+        let stale = json!({"routing_rev": rev + 1, "age_s": 0, "rtt": {"r1.example:21117": 40}});
+        let body = json!({"routing_rev": rev, "ver": 99, "probes": stale}).to_string();
+        assert_eq!(dev.post(&t.app, "heartbeat", body.as_bytes()).await.status, StatusCode::OK);
+        assert!(router.status_text().ends_with("measurements: 1 devices, 1 fresh\n"));
+
         // No `probes` (the client dropped its round, e.g. one taken through a TUN): the last round
-        // goes at once, not after `MEASURE_TTL`.
-        let r = dev.post(&t.app, "heartbeat", json!({"routing_rev": rev}).to_string().as_bytes()).await;
+        // goes at once, not after `MEASURE_TTL`. (`ver` only keeps the body apart from the earlier
+        // one, which a replay of the same signature would hit.)
+        let body = json!({"routing_rev": rev, "ver": 100}).to_string();
+        let r = dev.post(&t.app, "heartbeat", body.as_bytes()).await;
         assert_eq!(r.status, StatusCode::OK);
         assert!(router.status_text().ends_with("measurements: 0 devices, 0 fresh\n"));
         let mine = router.test(ip, ip, "leapgate4", "").await;

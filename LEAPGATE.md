@@ -348,7 +348,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 - **下发的列表**：配置里的全部中继（含健康检查暂判不可达的）的前 32 台（`MAX_PROBED`）原串，和 `PunchHole.relay_server` 下发的是同一个字符串。超过 32 台时启动（和 `rs` 替换）打一条 warn：第 33 台起永远没有实测，它可达时两端都退回估计，等于第二级失效。版本号 `rev`：对"这些原串用 `\n` 连起来 + `\n` + 测速间隔（常量 300 秒，`PROBE_INTERVAL_SECS`）"做 sha256，取法同 §10 的策略 `rev`（`strategy::digest_rev`）；重启后同一份配置算出同一个 rev，`rs` 换了列表就变。`rev` 和列表放在同一把锁下，读到的总是配对的。
 - **测量表**（`Measurements`，只在内存，不落库）：键是 Leapgate 心跳**验签得来**的设备 ID（伪造不了别人的测量），每台存最近一轮：列表版本、测量时刻（收到时刻 − `age_s`，不依赖两边时钟）、按列表下标排的每台结果（`Rtt(ms)` / `Down` / `Unknown`）。一条约 ID + 32 × 4 字节。
   - 写入：`probes` 形状不对（`routing_rev`、`age_s` 缺失或类型不对，`rtt` 不是"字符串 → 整数"，`down` 不是字符串数组）、`routing_rev` 不是当前版本、`age_s > 900` 的整轮丢弃，只打 trace，心跳照常处理。`rtt` 的键必须逐字等于列表里的原串、值在 1~10000，否则这一台留 `Unknown`；`down` 同样只认列表里的原串；同一台两边都有时以 `rtt` 为准。
-  - 删除：Leapgate 心跳不带 `probes` 时当场删掉这台的记录（`Router::forget_probes`）。客户端只在此刻没有有效的一轮时省略它：作废了经代理测的一轮（契约 02 §4.2 第 4 步，作废时客户端同时清掉旧结果），或最近一轮已超过 900 秒。不删的话旧记录要等 15 分钟才过期，这段时间按开代理之前的延迟选路（2026-10-24 端到端发现，最初的实现漏了这一条）。`probes` 带了但被上一条丢弃时不删旧记录；心跳没发出去（断网）时服务端什么也收不到，旧记录照常保留到过期。
+  - 删除：Leapgate 心跳不带 `probes`（显式的 `null` 同样算不带）时当场删掉这台的记录（`Router::forget_probes`）。客户端在手里没有当前列表的有效一轮时省略它，例如：作废了经代理测的一轮（契约 02 §4.2 第 4 步，作废时客户端同时清掉旧结果），最近一轮已超过 900 秒，服务进程刚启动、首轮还没跑完，刚换到新列表、新列表的首轮还没跑完，开了 Socks5 代理、WebSocket 或没配 Key。不删的话旧记录要等 15 分钟才过期，这段时间按开代理之前的延迟选路（2026-10-24 端到端发现，最初的实现漏了这一条）。代价：客户端服务进程重启后，第一次心跳就删掉服务端里还没过期的旧测量，首轮测完、下一次心跳上报之前（约 15~60 秒）这台按估计值选路；旧测量可能来自换网之前，删掉更稳妥。`probes` 带了但被上一条丢弃时不删旧记录；心跳没发出去（断网）时服务端什么也收不到，旧记录照常保留到过期。
   - 上限 1 万台（`MAX_MEASURED`，同 `device` 表）。已有这个 ID 就覆盖；满了先删所有过期的，仍满就删测量时刻最老的一条。不需要定时清理。
   - 读出：版本不是当前的、或测量时刻超过 15 分钟（`MEASURE_TTL`）的视为没有。`decide` 在一次加锁里取 A、B 两份。
 - **整端替换**（`cost::score`）：
@@ -358,7 +358,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
   4. `reason`：两端都用实测 `rtt`，只有 A `rtt_a`，只有 B `rtt_b`，都不用时同第一级（两端都没位置返回 `None` 走轮询）；一端用实测时即使两端都没位置也有代价，不轮询。
   5. 选中那台的两段放进 `RouteDecision.a_ms`/`b_ms`。
   - 固定中继仍然最先判断（`b_id` 非空时查 `device_policy`）。
-- **两端的 ID**：B 的 ID 就是打洞请求的目标 ID；A 的 ID 来自 `PunchHoleRequest.leapgate_from_id`，不认证。A 冒用别人的 ID 只影响 A 自己这次连接的选路，不影响别人；但冒用者能从选路结果侧面推断被冒用设备到各中继的相对延迟，以及它最近 15 分钟是否上报过完整测量（也就是是否在线），被冒用的设备察觉不到。信息量不超过直接向它打洞拿到的公网 IP，接受。不把测量绑定到心跳的来源 IP：HTTP 和 21116 本来就可能从不同出口出去（例如路由器透明代理只代理部分流量）。原版客户端不发，A 段按估计。
+- **两端的 ID**：B 的 ID 就是打洞请求的目标 ID；A 的 ID 来自 `PunchHoleRequest.leapgate_from_id`，不认证。A 冒用别人的 ID 只影响 A 自己这次连接的选路，不影响别人；但冒用者能从选路结果侧面推断被冒用设备到各中继的相对延迟，以及它最近一次心跳是否带了完整测量（也就是是否在线，在线时是否正在代理或 TUN 后面、刚重启；作废的一轮会让记录当场消失，粒度是一个心跳周期），被冒用的设备察觉不到。信息量不超过直接向它打洞拿到的公网 IP，接受。不把测量绑定到心跳的来源 IP：HTTP 和 21116 本来就可能从不同出口出去（例如路由器透明代理只代理部分流量）。原版客户端不发，A 段按估计。
 - **`RelayResponse` 分支不走第二级**：那里 `a_id`、`b_id` 都是空串（只在 B 回报的中继等于 hbbs 自己的 `local_ip` 时才调路由）；它也不遵守固定中继，是第一期就有的问题（已知，未排期）。
 - `relay status`（控制台 `rs`）末尾多一行 `measurements: <N> devices, <M> fresh`（表里的设备数、其中现在可用的数）。`route test --a/--b`（控制台 `tg` 的第 3、4 个参数）见 §14。
 
@@ -457,7 +457,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 
 **心跳**（`device::leapgate_heartbeat`）：请求体 JSON 对象，键不出现表示没有：`uuid`、`ver`、`leapgate`（客户端 `libs/leapgate` 的版本）、`strategy_rev`、`sysinfo_hash`（标准 base64 的 sha256）、`sysinfo`（对象，按原始字节收）、`routing_rev`（第三期 02 块：客户端手里那份中继列表的版本，没有为 0）、`probes`（02 块：最近一轮测速，`{routing_rev, age_s, rtt: {原串: 毫秒}, down: [原串]}`，契约 02 §2.2）。`conns` 不读，serde 跳过。`probes` 先收成任意 JSON 值，形状不对只丢这轮测量（§7 第二级），不回 400。流程：
 1. 解析；`uuid` 超长 400；`sysinfo` 原文超过 8 KB 413；`sysinfo` 里 `hostname`、`username`、`os`、`version` 类型不对 400；`routing_rev` 不是整数 400。
-2. 写 `Peer.leapgate_hb = { at: now, leapgate_ver }`，`leapgate_ver = get_version_number(leapgate)` 限到 u32（解析不出为 0）。400、413 的心跳和 Leapgate 审计都不写它。带了 `probes`：`router.record_probes(签名头里的 ID, probes)`（§7 第二级）。
+2. 写 `Peer.leapgate_hb = { at: now, leapgate_ver }`，`leapgate_ver = get_version_number(leapgate)` 限到 u32（解析不出为 0）。400、413 的心跳和 Leapgate 审计都不写它。带了 `probes`：`router.record_probes(签名头里的 ID, probes)`；没带（或是 `null`）：`router.forget_probes(签名头里的 ID)`（§7 第二级）。
 3. 带了 `sysinfo`：`store_sysinfo(…, "leapgate")`，原文按请求里的字节原样存。
 4. `touch(…, "leapgate")` 写设备行，得到库里现存的 sysinfo 原文。
 5. 有设备行，且库里 sysinfo 为空或 `base64(sha256(原文)) != sysinfo_hash` → 响应带 `need_sysinfo: true`；没能建行时不带这个键。
@@ -597,7 +597,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 - HTTP 契约测试：用 axum `Router` + 临时 SQLite（`tower::ServiceExt::oneshot`，骨架提供测试辅助），逐条断言 §9.1 的约定（状态码、Content-Type、空 body、字段类型），以及地址簿权限、级联、写接口边界、心跳下发规则（含：sysinfo 已存在时响应里没有 `sysinfo` 键；`modified_at` 是 JSON number）。
 - 会合测试：在回环地址上起真实监听，模拟客户端做 KeyExchange（v0 和 v1 都测）后发 `PunchHoleRequest`，断言 v6 地址被转发、强制中继时被清空、选中的中继符合路由规则（可参照客户端 `src/common.rs` 里的 `rendezvous_stub` 测试写法）。
 - 第三期 01 块（Leapgate 上报路径）的测试：签名向量和客户端共用一组常量（请求头和响应签名逐字节一致）；验签链每种拒绝原因一条（`bad_auth` 不签名不带 `time`，其余 401 带签名和 `time`）；时间窗用固定 now 测 ±60 接受、±61 拒绝；防重放（乱序 30 秒、64 条后 `floor` 抬升、4096 台时淘汰最久未见）；锁定（首个合法请求后库和内存都锁定、从库重新加载的条目也是锁定、公钥已换时条件更新 0 行请求仍成功、库层守卫挡住旧快照换公钥、只换 IP 照常、行已删回 `SERVER_ERROR`）；会合层（锁定后换公钥回 `UUID_MISMATCH`、换 IP OK、不经控制台改库后注册以库为准、锁定条目的重载计入查库预算、已删行的换 IP 注册回 `SERVER_ERROR`）；防降级（锁定后兼容心跳 `{}`、sysinfo 403、审计不入库、登录照样绑定）；Leapgate 心跳（`need_sysinfo`、sysinfo 逐字节存、哈希、按 rev 下发策略、`client_type` 切换、响应签名可验、坏请求体、`leapgate_hb`）；Leapgate 审计（nonce 两路共用、写库失败 503 且 nonce 不登记、体里 `id` 被忽略、`note` 不走备注分支）；中间件（413/405 的 Leapgate 格式、超时和 panic 回 503、未知路径 404）；命令行（`device key` 输出、`device key reset` 改库加 `kl` 重载、回复校验、连不上控制台时报错）；迁移 0004 在第一期的库上执行。
-- 第三期 02 块（路由第二级）的测试：`cost::score` 的整端替换（两端、单端、测量没覆盖全部候选退回估计、`down` 去掉候选、全部 `down` 忽略、先 A 后 B、两端都没位置但一端有实测仍有代价、选中那台的两段）；测量表（版本不符、`age_s > 900`、不认识的原串、毫秒越界、形状不对都不影响别的条目，15 分钟按测量时刻过期，满 1 万条先删过期再删最老）；列表版本（同一列表同一值、`rs` 换列表变、空列表非 0、超过 32 台只算前 32）；`select` 用两端测量、固定中继仍优先、换列表后旧测量不用；Leapgate 心跳（`routing_rev` 相同不带 `routing`、不同带，坏 `probes` 照常 200，测量记在验签得到的 ID 下）；打洞请求带 `leapgate_from_id` 时 `conn_attempt` 记 `rtt` 和两段、超长按空串；控制台 `tg` 和命令行 `route test` 带不带 ID；迁移 0005 在第一期的库上执行。关键断言做过变异验证。
+- 第三期 02 块（路由第二级）的测试：`cost::score` 的整端替换（两端、单端、测量没覆盖全部候选退回估计、`down` 去掉候选、全部 `down` 忽略、先 A 后 B、两端都没位置但一端有实测仍有代价、选中那台的两段）；测量表（版本不符、`age_s > 900`、不认识的原串、毫秒越界、形状不对都不影响别的条目，15 分钟按测量时刻过期，满 1 万条先删过期再删最老）；列表版本（同一列表同一值、`rs` 换列表变、空列表非 0、超过 32 台只算前 32）；`select` 用两端测量、固定中继仍优先、换列表后旧测量不用；Leapgate 心跳（`routing_rev` 相同不带 `routing`、不同带，坏 `probes` 照常 200，测量记在验签得到的 ID 下，之后被丢弃的 `probes` 不删它、不带 `probes` 的心跳当场删掉它）；打洞请求带 `leapgate_from_id` 时 `conn_attempt` 记 `rtt` 和两段、超长按空串；控制台 `tg` 和命令行 `route test` 带不带 ID；迁移 0005 在第一期的库上执行。关键断言做过变异验证。
 - 第一期验收（部署后由维护者用原版客户端做）：登录、地址簿、设备列表、审计正常；被控端本地写死的中继能被远程清掉；中继按双方位置选择；控制端勾选 IPv6 后两端都有 IPv6 时能直连。
 
 ## 17. 工程约定
