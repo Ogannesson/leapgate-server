@@ -199,6 +199,13 @@ impl Router {
         self.measured.record(id, probes, &hosts, relays.rev, Instant::now());
     }
 
+    /// Level two: a signed heartbeat without `probes`. The client omits them when it has no valid
+    /// round (it drops one taken through a proxy, contract 02 §4.2 step 4), so `id`'s last round
+    /// stops counting now rather than at `MEASURE_TTL`.
+    pub fn forget_probes(&self, id: &str) {
+        self.measured.forget(id);
+    }
+
     pub async fn select(&self, q: &RouteQuery<'_>) -> RouteDecision {
         if !q.b_id.is_empty() {
             match self.pinned(q.b_id).await {

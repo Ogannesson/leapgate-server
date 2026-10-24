@@ -89,6 +89,11 @@ impl Measurements {
         map.insert(id.to_owned(), Measured { rev, at, legs });
     }
 
+    /// Drops `id`'s round: its heartbeat carried no `probes`, so it has no valid round now.
+    pub fn forget(&self, id: &str) {
+        self.0.lock().unwrap().remove(id);
+    }
+
     /// The usable rounds of A and B (one lock): for list `rev` and not older than `MEASURE_TTL`.
     /// An empty id has none.
     pub fn pair(&self, a: &str, b: &str, rev: i64, now: Instant) -> (Option<Vec<Leg>>, Option<Vec<Leg>>) {

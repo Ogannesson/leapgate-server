@@ -517,7 +517,8 @@ struct LeapgateStrategy {
 }
 
 /// `POST /api/leapgate/v1/heartbeat` (contract 01 §3.6, 02 §3.4): a signed heartbeat. Records it in
-/// memory (`Peer::leapgate_hb`) along with its relay measurements (routing level two), stores a
+/// memory (`Peer::leapgate_hb`) along with its relay measurements (routing level two; none in the
+/// heartbeat drops the device's last round), stores a
 /// sysinfo that came with it, writes the device row (`touch`, as `leapgate`), and answers signed:
 /// `need_sysinfo` when the stored sysinfo is missing or its hash is not the reported one, the
 /// effective options when their rev is not the reported one, the relays to measure when their rev
@@ -547,8 +548,9 @@ pub(crate) async fn leapgate_heartbeat(State(state): State<AppState>, signed: Si
         leapgate_ver,
     });
     // Under the verified id: nobody can report measurements for another device.
-    if let Some(probes) = &req.probes {
-        state.router.record_probes(&signed.id, probes);
+    match &req.probes {
+        Some(probes) => state.router.record_probes(&signed.id, probes),
+        None => state.router.forget_probes(&signed.id),
     }
     let db = &state.db;
     if let Some((raw, fields)) = sysinfo {
@@ -1502,5 +1504,13 @@ mod tests {
         assert!(mine.contains("(rtt_a)") && mine.contains("[A rtt 23ms, B est ?]"), "{mine}");
         let other = router.test(ip, ip, "other", "").await;
         assert!(other.contains("(rr)"), "{other}");
+
+        // No `probes` (the client dropped its round, e.g. one taken through a TUN): the last round
+        // goes at once, not after `MEASURE_TTL`.
+        let r = dev.post(&t.app, "heartbeat", json!({"routing_rev": rev}).to_string().as_bytes()).await;
+        assert_eq!(r.status, StatusCode::OK);
+        assert!(router.status_text().ends_with("measurements: 0 devices, 0 fresh\n"));
+        let mine = router.test(ip, ip, "leapgate4", "").await;
+        assert!(mine.contains("(rr)"), "{mine}");
     }
 }
