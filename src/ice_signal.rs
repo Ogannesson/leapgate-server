@@ -297,6 +297,46 @@ pub fn answer(session: Bytes, params: LeapgateIceParams, pk: Bytes) -> Rendezvou
     wrap(m)
 }
 
+// The names of §2.13, shared by the logs and the `ice_result` table (§3.7).
+
+/// `ice_result.outcome` of a session registered and not refused whose connection ended without a
+/// RESULT: cancelled by the race, or A went away. Not a RESULT value.
+pub const ABANDONED: &str = "abandoned";
+
+/// `unknown` comes only from a sender off the protocol (the zero value, or a number not in the enum).
+pub fn outcome_name(o: EnumOrUnknown<leapgate_ice_result::Outcome>) -> &'static str {
+    use leapgate_ice_result::Outcome;
+    match o.enum_value() {
+        Ok(Outcome::CONNECTED) => "connected",
+        Ok(Outcome::NO_ANSWER) => "no_answer",
+        Ok(Outcome::BAD_ANSWER) => "bad_answer",
+        Ok(Outcome::NO_PAIR) => "no_pair",
+        Ok(Outcome::KCP_FAILED) => "kcp_failed",
+        Ok(Outcome::SECURE_FAILED) => "secure_failed",
+        Ok(Outcome::UNKNOWN) | Err(_) => "unknown",
+    }
+}
+
+/// `None` for a number not in the enum.
+pub fn kind_name(k: EnumOrUnknown<leapgate_ice_result::Kind>) -> Option<&'static str> {
+    use leapgate_ice_result::Kind;
+    Some(match k.enum_value().ok()? {
+        Kind::HOST => "host",
+        Kind::SRFLX => "srflx",
+        Kind::PRFLX => "prflx",
+    })
+}
+
+/// `None` for a number not in the enum.
+pub fn net_name(n: EnumOrUnknown<leapgate_ice_result::Net>) -> Option<&'static str> {
+    use leapgate_ice_result::Net;
+    Some(match n.enum_value().ok()? {
+        Net::ETHERNET => "ethernet",
+        Net::WLAN => "wlan",
+        Net::OTHER => "other",
+    })
+}
+
 struct Entry<S> {
     /// A's sink; taken to send the answer or a reject.
     sink: Option<S>,

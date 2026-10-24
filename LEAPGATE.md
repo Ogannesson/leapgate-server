@@ -22,8 +22,9 @@
 第三期加了：
 - **Leapgate 上报路径和设备签名**（`/api/leapgate/v1/`，第三期实施契约 01 块，§9.5）。Leapgate 客户端的心跳、sysinfo、被控端审计改走这条路径，每个请求用设备私钥签名，第一次验签通过就锁定这台设备的公钥；原版客户端照走 §9.3 的兼容接口。
 - **路由第二级**（第三期实施契约 02 块，§7 第二级）：Leapgate 客户端测到各中继的 TCP 建连耗时，随 Leapgate 心跳上报；选中继时某一端有可用的实测就整端代替估算。
+- **自研 ICE 的信令和 STUN**（第三期实施契约 05，§6 第 10、11 条）：Leapgate 控制端在上游路径之外再跑一条自研 ICE。服务端在加密的 21116 TCP 上转发两端的候选（转给被控端的 OFFER 加密给它锁定的设备公钥、再用会合私钥签名），在 21116/UDP 上回 STUN Binding 并附反射地址证明，控制端补报的结果记进 `ice_result`（§8）。
 
-不做（第一期）：OIDC 和第三方登录、邮箱验证码和 TOTP、Web 管理后台、路由第二级（客户端测速；第三期做，见 §7 第二级）、TCP 注册（走代理/WebSocket/禁 UDP 的被控端原版就显示离线，维持现状）、修改 ID（`RegisterPk.old_id`）、`HttpProxyRequest`（API 经 21116 回落）、WebRTC 信令转发、转发 `udp_port`（UDP 打洞）、心跳下发 `disconnect`、`audit/conn/active`、`PUT /api/audit`、旧版地址簿 `GET/POST /api/ab`，以及总方案第 4 节列的全部"明确不做"。hbbr（`src/relay_server.rs`）不改逻辑。
+不做（第一期）：OIDC 和第三方登录、邮箱验证码和 TOTP、Web 管理后台、路由第二级（客户端测速；第三期做，见 §7 第二级）、TCP 注册（走代理/WebSocket/禁 UDP 的被控端原版就显示离线，维持现状）、修改 ID（`RegisterPk.old_id`）、`HttpProxyRequest`（API 经 21116 回落）、WebRTC 信令转发、转发 `udp_port`（UDP 打洞）（第三期起直连走自研 ICE，这两项继续不做）、心跳下发 `disconnect`、`audit/conn/active`、`PUT /api/audit`、旧版地址簿 `GET/POST /api/ab`，以及总方案第 4 节列的全部"明确不做"。hbbr（`src/relay_server.rs`）不改逻辑。
 
 ## 2. 代码布局与文件归属
 
@@ -53,6 +54,9 @@
 | `src/api/device.rs`、`src/api/audit.rs` | sysinfo、心跳下发、审计（§9.3、§10）；第三期加 Leapgate 心跳和审计（§9.5） | 设备 |
 | `src/api/devauth.rs` | 第三期：Leapgate 路径的签名头解析、验签提取器 `SignedBody`、防重放表、首次锁定、响应签名（§9.5） | 第三期 01 |
 | `migrations/0004_device_signing.sql` | 第三期：`peer.pk_pinned_at`（§4.2） | 第三期 01 |
+| `src/ice_stun.rs` | 第三期：21116/UDP 上的 STUN Binding 解析和响应、FINGERPRINT、反射地址证明（§6 第 11 条） | 第三期 05 |
+| `src/ice_signal.rs` | 第三期：ICE 候选的编码和过滤、会话表、FORWARD 的加密和签名、`forced_relay` 判据、§2.13 的固定文字（§6 第 10 条） | 第三期 05 |
+| `migrations/0006_ice_result.sql` | 第三期：`ice_result` 表（P-A，§4.2、§8） | 第三期 05 |
 | `src/cli/`、`src/import.rs` | 命令行与导入（§14、§15） | 命令行 |
 
 骨架实现的 `Router`（只按配置列表轮询）和 `ConnTracker`（各挂钩方法为空操作）是能跑的最小版本，让会合模块在并行阶段就能调用和测试；路由、结果记录模块再替换内部实现，不改签名。骨架阶段为后面各模块建好空文件和函数签名（`todo!()` 只允许出现在并行模块名下的文件里，且不允许留到合并后），并行模块在签名内实现。签名需要调整时，改动方在汇报里写清楚，由集成阶段统一。
@@ -74,9 +78,9 @@
   - `tracker: Arc<ConnTracker>`
   - `secret: Arc<SecretBox>`（§13）
   - `cfg: Arc<Config>`
-  - `sk: Option<Arc<sign::SecretKey>>`：`get_server_sk` 的结果，KeyExchange、`IdPk` 签名和 Leapgate 路径的响应签名（§9.5）共用这一份（第三期从 `RendezvousServer` 的 `inner.sk` 挪进来）。`-k` 传的是公钥时为 `None`。
-- 模块自己的小状态（登录失败计数、审计 nonce 去重表、第三期 Leapgate 路径的防重放表）放在模块内的 `static`，不进 `AppState`。
-- `PeerMap` 条目上第三期多了两项内存状态：`pinned`（库里 `pk_pinned_at` 的副本，只用来省掉注定失败的写库，以库为准，§6 第 7 条）和 `leapgate_hb`（最近一次验签通过的 Leapgate 心跳的时刻和 Leapgate 版本，只存内存，条目被淘汰就丢，下一次心跳重写；给第三期 04 块用，目前没人读）。
+  - `sk: Option<Arc<sign::SecretKey>>`：`get_server_sk` 的结果，KeyExchange、`IdPk` 签名、Leapgate 路径的响应签名（§9.5）和转给被控端的 ICE OFFER 签名（§6 第 10 条）共用这一份（第三期从 `RendezvousServer` 的 `inner.sk` 挪进来）。`-k` 传的是公钥时为 `None`。
+- 模块自己的小状态（登录失败计数、审计 nonce 去重表、第三期 Leapgate 路径的防重放表、ICE 会话表、反射地址证明的内存密钥）放在模块内的 `static`，不进 `AppState`。
+- `PeerMap` 条目上第三期多了两项内存状态：`pinned`（库里 `pk_pinned_at` 的副本，只用来省掉注定失败的写库，以库为准，§6 第 7 条）和 `leapgate_hb`（最近一次验签通过的 Leapgate 心跳的时刻和 Leapgate 版本，只存内存，条目被淘汰就丢，下一次心跳重写；ICE 用它判被控端支不支持：新鲜度 180 秒、版本不低于 0.3.1，§6 第 10 条）。
 - Leapgate 新增的代码（路由、结果记录、API、GeoIP、新表）里，IP 在比较、查库、落库前先规范化：`::ffff:a.b.c.d` → IPv4（`to_canonical()` 或 `try_into_v4`）。原版会合逻辑里已有的地址处理保持原样（`same_intranet`、`update_addr`/`RegisterPk` 的 ip 比较、`peer.info.ip` 落库、`tcp_punch` 的键），也不要在 accept 处统一改写地址，否则同公网 IP 的设备拿不到局域网直连，或升级后每台设备都被判成"IP 变了"。
 
 ## 4. 存储
@@ -98,11 +102,28 @@
 
 ### 4.2 表结构（`migrations/0001_init.sql` 照此实现，列名、类型、约束不得自行改动）
 
-下面是 `0001` 的原样；之后的迁移除 `0004`、`0005` 加列外只动索引，现行索引以迁移文件为准：
+下面是 `0001` 的原样；之后的迁移除 `0004`、`0005` 加列、`0006` 加表外只动索引，现行索引以迁移文件为准：
 - `0002`：三张审计表各加 `created_at` 索引（保留期删除，§9.3）；`device_user` 换成 `device_user_seen(user_id, last_seen_at)`。
 - `0003`：`audit_conn_session` 换成 `audit_conn_session_dev(session_id, device_id, conn_type)`（备注更新，§9.3）；`audit_conn_dev` 换成部分索引 `audit_conn_open(device_id, conn_id) where closed_at is null`（认证成功和 close 上报找未关闭的记录，§9.3）；加部分索引 `device_owned_seen(last_seen_at, user_id, id) where user_id is not null`（设备表淘汰）；`token_user` 换成 `token_user_device(user_id, device_id)`。
 - `0004`（第三期）：`alter table peer add column pk_pinned_at integer`，锁定时间（unix 秒），NULL 表示未锁定。放 `peer` 不放 `device`，因为 `device` 行会被淘汰。笔记 02 预留的 `token.device_verified` 没加（第三期没人读写，等签名登录设计时再加）。
 - `0005`（第三期）：`conn_attempt` 加 `route_a_ms real`、`route_b_ms real`：选中中继两段的延迟（毫秒，未乘权重），实测还是估计看 `route_reason`（§8）。`route_reason` 的取值因此多了 `rtt`、`rtt_a`、`rtt_b`（§7）。每行多约 16 字节，§8 的行大小估算不变。
+- `0006`（第三期 05，P-A）：新表 `ice_result`，自研 ICE 的结果，一行一次 ICE（控制端补报的 RESULT，或会话"放弃"），不认证、只作统计，和 `conn_attempt` 分开记、不按 IP 硬合并。不存 session（每次随机、对统计没用；"只认第一条"由会话表挡住）；和 `conn_attempt` 按 `a_ip + b_id + at` 对照。写入、上限和修剪见 §8。
+
+  ```sql
+  create table ice_result (
+    id          integer primary key autoincrement,
+    at          integer not null,   -- unix ms，S 记录的时刻
+    a_ip        text not null,      -- try_into_v4(A 信令连接地址).ip()
+    b_id        text not null,      -- OFFER 里的目标 ID
+    outcome     text not null,      -- connected|no_answer|bad_answer|no_pair|kcp_failed|secure_failed|abandoned|unknown
+    elapsed_ms  integer,            -- RESULT.elapsed_ms；abandoned 为 NULL
+    local_kind  text,               -- connected 才有：host|srflx|prflx
+    remote_kind text,
+    family      integer,            -- 4|6，connected 才有
+    local_net   text                -- ethernet|wlan|other，connected 才有
+  );
+  create index if not exists idx_ice_at on ice_result(at);
+  ```
 
 ```sql
 -- hbbs 原表，原样保留（见笔记 02 §2.4）
@@ -295,7 +316,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 
 改动都按"只加挂钩、不重写流程"做，行为和原版保持一致，除非下面明确要求。
 1. **KeyExchange v1**：21116/TCP 每条连接 accept 后、有 `sk` 时先发 `KeyExchange`（v1：签名的临时公钥 + `signed_params`），读第一帧：是 `KeyExchange` 且 `keys.len()==2` 就建立加密，之后收发都加解密；第一帧不是 `KeyExchange` 就按明文 `RendezvousMessage` 处理。写半边存进 `tcp_punch` 时要带上加密器（`Sink` 改型）。完整步骤和客户端测试里的服务端替身见笔记 02 §6.2。21118（WebSocket）**不做** KeyExchange、服务端也不先发：客户端 `use_ws()` 时 `secure_tcp`/`secure_tcp_required` 都直接跳过（客户端 `src/common.rs` `secure_tcp_impl`），`Sink::Ws` 不带加密器。`sk` 为 None（`-k` 传的是公钥）时，启动时打一条 error 日志："没有私钥，无法做 KeyExchange，登录过的客户端会连接失败；请用 `-k -` 或 `-k <base64 私钥>`"。
-2. **IPv6 信令转发**：按笔记 02 §6.5 的表补 `socket_addr_v6`（以及 `PunchHole` 的 `force_relay`、`PunchHoleResponse` 的 `upnp_port`）。不转发 `udp_port` 和 WebRTC 字段。hbbs 强制中继（`ALWAYS_USE_RELAY` 或 mask 异或）时清空转发的 v6 地址并置 `force_relay`（笔记 02 §6.4）。
+2. **IPv6 信令转发**：按笔记 02 §6.5 的表补 `socket_addr_v6`（以及 `PunchHole` 的 `force_relay`、`PunchHoleResponse` 的 `upnp_port`）。不转发 `udp_port` 和 WebRTC 字段；直连另走 ICE 的独立信令（第 10 条）。hbbs 强制中继（`ALWAYS_USE_RELAY` 或 mask 异或）时清空转发的 v6 地址并置 `force_relay`（笔记 02 §6.4）。
 3. **路由挂钩**：`handle_punch_hole_request` 里调 `router.select(&RouteQuery{a_ip, b_ip, a_id, b_id, a_token, conn_type}).await`，`a_id` 是 `PunchHoleRequest.leapgate_from_id`（第三期，字段号 1000，发起方自报的设备 ID，不认证；超过 253 字节当空串），只用来查 A 的第二级测量（§7）；选中中继两段的延迟随结果记录写进 `conn_attempt`（§8）。`RelayResponse` 分支和控制台 `tg` 也改调 router（`RelayResponse` 的 `a_id`、`b_id` 都传空串）。新增控制台命令 `gu`：让路由模块立即执行一次 GeoIP 下载/重新加载并回显结果（§14 `geo update` 用）。`io_loop` 的中继定时器分支、`Data::RelayServers` 删掉，健康检查挪进 router（笔记 02 §3.5）。控制台 `rs` 无参数时打印 `router.status_text()`。
 4. **结果记录挂钩**：H1~H5 五处调用 `tracker`（笔记 02 §4.4），只取字段、不阻塞（tracker 内部用通道异步落库）。
 5. 修掉控制台 `aur` 把中继列表清空的那一行（笔记 02 §3.4）。
@@ -317,6 +338,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
    - `io_loop` 里的 5 分钟定时器（和 `handle_udp` 串行，不会插进 `RegisterPk` 的查找和 `update_pk` 之间）：`IP_BLOCKER` 清空天窗口到期的集合，删掉分钟窗口已过且集合为空的条目；`IP_CHANGES` 删掉 360 秒前开始的记录；`PeerMap` 删掉 `last_reg_time` 超过 24 小时的条目。被淘汰的设备回来时，下一次 `RegisterPeer`（只查内存）会被要求重新 `RegisterPk`，`RegisterPk` 再从库里加载条目、照常校验 uuid，受每来源每分钟约 30 次的限额；淘汰时间取 24 小时，是为了让过夜离线的设备不走这一轮（审查 C-3：一个出口后面的上百台机器早上一起回来，要分几分钟才能全部在线）。只存在内存里的 `socket_addr`、`last_reg_time`、`reg_pk`（6 秒内的注册计数）对闲置一天的设备都没有意义，在线判断本来就要求 `last_reg_time` 在 30 秒内。TCP 侧的 `get` 从库里加载条目时只在内存里没有时才插入，不覆盖已有条目（审查 C-25）。
    - 日志不打 uuid/pk 原文，只打 id、来源 IP 和长度。未认证、每个包都能触发的日志（info 及以上）一律用 hbb_common `throttled_log!`，每分钟最多各打一条：uuid 不匹配、ip/pk 不匹配、许可证不符的 `PunchHoleRequest`、`RegisterPeer` 的 "IP change"、`update_pk` 的几行，以及会合模块查库、写库失败（审查 A-5、C-1/C-7/C-8/C-17）。攻击者给的 id 先截到 253 字节（按字符边界），再用 `{:?}` 打（转义换行和控制字符，免得一个 id 伪造出整行日志，审查 D-2/D-21）：TCP 打洞请求的 id 不校验长度，最长一帧。以后在这类路径上加日志照此办理。
    - 查库、写库仍在 `io_loop` 里做：有了上面的上限，写库次数有界；每次最多等会合池的 200 毫秒取连接加 200 毫秒写锁（§4.1）。会合池只有 `io_loop` 用，取连接不随 API 或连接任务的负载变长；写锁和所有写者共用（包括 §4.1 的 checkpoint），最多等 200 毫秒。
+   - STUN（第三期 05，第 11 条）也在 `io_loop` 里处理：不查库、除发送外不 await，但会被这里的写库停顿拖慢（每次最多约 0.4 秒）；FORWARD 走 UDP 发送队列，同样要等 `io_loop`。客户端那边 Binding 有两次重发、OFFER 有一次重发兜住。
 8. 会合端口的资源上限（审查 A-2/A-3/A-4；常量写死，不做配置）：
    - 帧长：21116/TCP 单帧和 21118/WebSocket 单条消息、单帧最多 16 KB（最大的合法消息是带 WebRTC offer 的 `PunchHoleRequest`：新客户端不带候选，约 1 KB；老客户端带全部候选，几 KB）。21115 单帧最多 128 KB：`OnlineRequest` 客户端不分批，界面把当前标签页的全部 id 一次发出（`peers_view.dart` `_queryOnlines` → `client.rs` `query_online_states_`）；地址簿每本最多 5000 台，即使每个 id 16 个字符也只有约 90 KB。超过帧上限的连接直接断开。
    - `OnlineRequest.peers` 超过 16384 条（128 KB 按每个 id 至少 6 字节加 2 字节标签和长度能放下的条数）的整条丢弃，不回包。
@@ -324,7 +346,35 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
    - 并发连接：21116、21118 各最多 2048 条，21115 最多 256 条；每个端口上每个来源（IPv4 地址 / IPv6 /64）最多 32 条，回环来源只计入总数（同机反代承载所有 WSS 客户端）。超限的连接在 accept 后直接关闭，21116 上不发 KeyExchange、不做签名；每分钟最多打一条 warn。
    - 最坏情况下的缓冲（审查 C-2/C-15/C-27，按 Linux 实测修正）：21116 每条约 26 KB（`Framed` 写缓冲 8 KB + 读缓冲涨到 16 KB 一帧 + 任务），合计约 53 MB；21118 握手完成前每条最多 8 KB + 4 KB 读块，握手后每条约 4 KB 读缓冲 + 16 KB 帧 + 最多 16 KB 正在拼接的分片消息，合计约 74 MB；21115 每条约 136 KB，合计约 35 MB；三者合计约 160 MB。攻击结束后 glibc 不会把峰值 RSS 还给系统，选部署机时按峰值留余量。另有 `PUNCH_REQS`（默认最多 10 万条，约 21~45 MB），只记录带对 key、目标在线的打洞请求，不算在上面。
    - 发往 UDP 的消息（转发给 B 的 `PunchHole`、`RequestRelay` 等）进一个最多 4096 条的有界队列，连接任务不等、队列满了就丢弃（每分钟最多一条 warn），`io_loop` 卡住时内存不随攻击带宽增长。`RequestRelay` 不校验任何东西就转给 B，所以：每条连接最多 12 条，超过就断开（客户端每次尝试一条，最多 3 次）；转发时只带客户端会设的字段（`id`、`uuid`、`relay_server`、`secure`、`conn_type`、`token`、`switch_code`，加服务端填的 `socket_addr`），`uuid`、`token`、`switch_code` 截到 64 字节、`relay_server` 截到 253 字节，不带 `licence_key`；`PunchHoleRequest` 转发的 `socket_addr_v6` 超过 18 字节（`AddrMangle` 编码的 IPv6 地址长度）就清空（审查 C-13）。
+   - 自研 ICE（第三期 05，第 10、11 条）用到的资源都由已有上限或下面的常数兜住，不另设配置：
+
+     | 东西 | 上限 | 兜在哪 |
+     |---|---|---|
+     | ICE 会话表 | 每来源（规范化后的 `source_key`）8 条，含已应答、留到 A 关连接的；全表不另设上限：一条连接最多登记一个，21116 并发连接最多 2048 条 | `Sessions::register`，满了 `REJECT{BUSY}` |
+     | 每次 ICE 的信令 TCP | A 一条（活到 RESULT 或被竞速取消，正常 1~3 秒，最长约 16 秒；A 不关时 30 秒空闲读超时）、B 一条（发一条消息就关；B 为 ICE 同时开的最多 8 条） | 计入上面每来源 32 条并发 |
+     | 转给 B 的 FORWARD | 和其它 UDP 下发共用 4096 条有界队列，满了丢；每条连接的 OFFER 最多转发 2 次（第一次加一次重发，`ICE_OFFER_SENDS`） | `send_udp` |
+     | STUN 令牌桶 | 每秒 1000、突发 1000，全局；被灌满时那一刻所有人都拿不到映射地址和证明，只剩 host 候选 | `RendezvousServer.stun` |
+     | 反射地址证明密钥 | 进程启动时随机、只在内存；重启后旧证明全部失效 | `ice_stun::PROOF_KEY` |
+     | 会话条目的清理 | 被拒的当场删；其余随 A 的连接结束删，不设过期 | `drop_for_reject`、连接结束时 `close` |
+     | `ice_result` 行 | 每来源 60 行/分钟、全局 120 行/分钟（和 `conn_attempt` 同样取值、单独计数）；90 天保留 + 20 万行封顶 | 复用 `conn_tracker` 的限额写法、写库队列和每小时修剪（§8） |
+
+     `LookupBudget` 泛化成带速率和突发的通用令牌桶后有两份，各自取值：`lookups`（`RegisterPk` 查库，每秒 200、突发 1000，第 7 条）和 `stun`（上表）。两份都只在跑 `io_loop` 的那个实例上用，连接任务的克隆不碰。
 9. **局域网多候选地址**（第三期，leapgate-cardo `375e2a3`）：`handle_local_addr` 把 `LocalAddr.leapgate_local_addrs`（字段号 1000，`repeated bytes`，Leapgate 被控端报的物理网卡局域网地址，`AddrMangle` 编码）原样放进发给控制端的 `PunchHoleResponse{is_local}` 的同名字段。只做限长，不解码、不打日志：超过 18 字节（`AddrMangle` 能编出的最长值，IPv6 地址 16 字节加 2 字节端口；IPv4 最多 11 字节）的丢掉，剩下的取前 8 个（Leapgate 客户端最多报 8 个）。原版客户端不发这个字段，响应和原来一样。用途和客户端两侧怎么用见 `client/LEAPGATE.md` §3。
+10. **自研 ICE 的信令**（第三期实施契约 05 §2.3~§2.7、§3.3、§3.4；`ice_signal.rs`，`rendezvous_server.rs` 的 `handle_ice`）。A 是控制端，B 是被控端。消息挂在 `RendezvousMessage.leapgate_ice`（oneof 1000），`ver` 必须是 1。
+    - **只在完成了 KeyExchange 的 21116 TCP 上收**（`handle_tcp` 新传 `encrypted`）：WebSocket（21118）和明文连接上收到任何 `LeapgateIce` 都不回包、直接断开；21116/UDP 上收到的丢掉；FORWARD 变体只由 S 发，收到就断开。
+    - **OFFER**（A 新开的信令连接上的第一条）按顺序检查，第一条不过的决定 `REJECT` 原因，用这条连接自己的 sink 当场回、然后断开：① 格式（`session` 16 字节；`id` 非空、不超过 253 字节、不含 0x00；`licence_key` 照打洞的写法；ufrag 4~32、pwd 22~64 个 ice-char；候选、证明各不超过 16 条，候选都能解码）→ `BAD`；② B 在线（只查内存，`last_reg_time` 30 秒内）→ `OFFLINE`；③ 不强制中继（`ice_signal::forced_relay`，和打洞同一个函数）→ `RELAY`；④ B 支持 ICE（`leapgate_hb` 180 秒内、版本不低于 0.3.1、`pinned`、S 有私钥、B 的公钥能转成 X25519）→ `UNSUPPORTED`；⑤ 名额（A 的来源先 `to_canonical` 再取 `source_key`，表里不满 8 条；session 已在表里按 ① 的 `BAD`，同一次加锁里判）→ `BUSY`。`BAD` 打限频日志，其余不打。
+    - **候选过滤**：OFFER 用 A 的证明、ANSWER 用 B 的证明，同一个 `ice_signal::filter`：私网 IPv4、ULA 保留；公网 IPv4 必须有一条能打开、地址和端口都相等的证明；全局 IPv6 没证明的只留前 2 个；回环、链路本地、组播、`100.64/10`、`198.18/15`、`fdfe:dcba:9876::/48`、`::ffff:0:0/96` 等去掉；同地址只留第一条。证明只在 S 核对、不转发。过滤后为空也照常转发。
+    - **FORWARD**（S → B，只走 UDP，发往 B 最近一次注册的地址）：`{session, 过滤后的 A 的参数}` 序列化后用 sealed box 加密给 B 锁定的设备公钥（Ed25519 转 X25519，转不了回 `UNSUPPORTED`，绝不退回明文），再用会合私钥对 `"leapgate-ice-offer-v1\0" ‖ B 的 ID ‖ 0x00 ‖ ts（8 字节大端）‖ sealed` 签名；外层只有 `ts`、`sealed`、`sig`，链路上看不到 session、A 的地址和口令。新域前缀和会合私钥签的其他四种东西互不为前缀，`msg` 解析不成 `IdPk`（测试钉住）。
+    - **会话表**（进程级 static `ICE_SESSIONS`，std `Mutex`，锁里不 await，sink 先取出、出锁再发）：OFFER 全过才登记，持有 A 的 sink、缓存的 FORWARD、B 的 ID、A 的规范化地址；判重、判名额、插入在一次加锁里，只在成功时取走 sink；这条连接 `return true` 保住。一条连接最多登记一个 session，之后同一连接上相同 session 的 OFFER 是重发：按登记时的 B 的 ID 重读 B 的地址，原样再发缓存的同一份 FORWARD（B 按 FORWARD 去重），每条连接最多发 2 次，其余忽略。
+    - **ANSWER**（B 新开的加密连接，发一条就断开）：session 在表里且未应答才处理，否则忽略；参数和证明按 OFFER 的规则检查和过滤，不合规给 A 发 `REJECT{BAD}`、删掉条目；`get_pk`（只查内存）为空给 A 发 `REJECT{UNSUPPORTED}`、删掉条目；都过了才标"已应答"、取出 A 的 sink，给 A 发过滤后的参数加 S 签过的 B 的 `IdPk`。不按来源 IP 校验 ANSWER（B 的 TCP 和 UDP 可能走不同出口），凭的是只在密文里出现的 session。B 的 **REJECT**：session 在表里且未应答就原样转给 A、删掉条目。
+    - **条目和 A 的信令连接同寿**：被拒的当场整条删除、不记统计；其余留到 A 的连接结束（A 发完 RESULT 或收到 REJECT 后自己关、被竞速丢掉、出错、30 秒空闲读超时），在 `handle_listener_inner` 结尾删除。没有过期、没有全表上限（第 8 条）。
+    - **RESULT**（P-A，A 在同一连接上补报，不认证、只作统计）：只认这条连接自己登记的 session、只认第一条，记一行 `ice_result`（§8）；`ver` 不对、session 不对、第二条一律忽略、连接保住。登记过、没被拒、连接结束时还没收到 RESULT 的，记一行 `abandoned`（被竞速取消或 A 异常退出）。
+11. **STUN 和反射地址证明**（第三期实施契约 05 §2.8、§2.9.3、§3.2、§3.4.3；`ice_stun.rs`）。
+    - `handle_udp` 在 `parse_from_bytes` 之前分流：长度不少于 20、首字节 0x00 或 0x01、偏移 4~8 是 magic cookie `21 12 A4 42` 的交给 `handle_stun`。protobuf 消息的首字节是字段标签，不会是 0x00/0x01（不能照搬客户端"最高两位为 0"：`RegisterPeer` 是 0x32）。
+    - 只回 Binding 请求：前两字节 `00 01`、`20 + 长度字段 == 数据报长度`、长度字段是 4 的倍数、**整报不短于 100 字节**（客户端用 PADDING 凑够），不看属性内容。STUN 手写最小编解码，不引入 `stun_codec`。
+    - 回包是 Binding 成功响应：原样带回事务号，XOR-MAPPED-ADDRESS（规范化后的来源，`try_into_v4`）→ `LEAPGATE-PROOF`（0xC1E9）→ FINGERPRINT（`crc32fast`），IPv4 来源 72 字节、IPv6 来源 96 字节，**放大比严格小于 1**（含 IP/UDP 头 0.78 和 0.97）。所以 leapgate-server 不是通用 STUN 服务器，上游的 `ice-servers` 不能指向它。回包发往原始来源地址，只走 `FramedSocket::Direct`；发送失败 `allow_err!` 记下，不用 `?`（`handle_udp` 返回错误会让 `io_loop` 重建整个 21116/UDP socket）。
+    - 令牌桶每秒 1000、突发 1000，全局（`RendezvousServer.stun`），不计入 `IP_BLOCKER`；耗尽时丢包，每分钟最多一条 warn。
+    - 证明：版本(1) ‖ ts（u32 大端）‖ 地址族(1) ‖ 地址(4|16) ‖ 端口（u16 大端）‖ `crypto_auth`（HMAC-SHA512-256）的前 16 字节，共 28 或 40 字节。密钥是进程启动时随机生成的模块 static，不落盘；有效期 30 秒（`ts ≤ now` 且 `ts ≥ now − 30`）。`open` 先判长度和地址族字节，再常数时间比较 MAC（`sodiumoxide::utils::memcmp`，截短的 MAC 不能用 `auth::verify`），再判版本和时间、解码地址（端口非 0、地址非未指定）。证明说明"S 30 秒内亲眼看到这个 UDP 地址，而且对方收到了回包"，所以公网 IPv4 候选必须带它（第 10 条），防有人让 B 往第三方地址发检查。
 
 ## 7. 路由（`src/router/`）
 
@@ -373,6 +423,10 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 - H5 没匹配到打洞记录：写一行 `signal='relay_only'`：`started_at`、`relay_req_at` 取收到的时刻；`a_ip`/`a_port` 取 A:p3；`via` 照实；`b_id = rf.id`；`conn_type`、`a_nat_type`、`a_force_relay`、`a_has_v6`、`server_forced_relay` 填 0；`a_user` 照常反查。有 `relay_resp_at` 记 `relay_unmatched`，没有记 `relay_failed`。
 - 防滥用（这些请求都不认证；常量写死，不做配置）：许可证不符（`LICENSE_MISMATCH`）的请求不记录，所以不会出现 `signal='fail_license'`；`b_id`、中继地址和 `a_device_id`（来自令牌行，登录时已限长，§11）截到 253 字节，版本号、令牌、uuid 截到 64 字节；同一来源每分钟最多新建 60 条记录（IPv4 按单个地址算，IPv6 按 /64 前缀算：一台主机至少分到一个 /64），所有来源合计每分钟最多新建 120 条，超出的丢弃并计数（被丢弃的不占两种额度）；写库队列最多 1 万条，满了丢弃并计数，这几种丢弃每分钟最多打一条 warn 日志；队列里的定稿记录成批（每批最多 1000 条）在一个事务里写入；每小时删除一次 `started_at` 早于 90 天的行，并且只保留最新的 20 万行。上限估算（实测，SQLite 4 KB 页）：最坏的一行（文本列都到截断上限，且带有效令牌、`a_user`/`a_device_id` 非空）记录约 1.6 KB，一页只放得下两行，加上 `idx_ca_b` 索引里 `b_id` 的副本，磁盘上约 2.4 KB；两次修剪之间最多新增 120 × 60 = 7200 行（另加修剪时还没定稿的几分钟记录），所以持续被灌时表最多约 20.7 万行、约 0.5 GB，删掉的页会被复用，文件停在这个大小；不带有效令牌的请求单行约 1.4 KB，约 0.29 GB。90 天删除和修剪共用一个每小时的定时器：前者是 `idx_ca_started` 上的范围删除，多数时候什么都删不到，不值得单开定时器。审计表的保留期（§9.3）也在这个定时器里做（服务启动时先跑一次），每张审计表开删前先停 20 毫秒，和批与批之间一样让出写锁，各表删了多少行合成一条日志，什么都没删时不打；`device` 表和审计表的行数上限在插入时守住（§9.3），不在这个定时器里。
 - 统计查询（给命令行）：按时间范围算中继回落率 = count(outcome IN (`relay`,`relay_or_v6`)) / count(outcome IN (`relay`,`relay_or_v6`,`direct_lan`,`direct_tcp`,`direct_tcp_or_v6`))；`rejected`、`no_reply`、`relay_failed`、`relay_unmatched` 不进分子分母，只在分项计数里列出。另列 `relay_offered` 非空、`b_relay` 非空且两者不相等的次数（被控端本地写死了中继）。
+- **ICE 的结果另记 `ice_result`**（第三期 05，P-A，迁移 0006，§6 第 10 条）。ICE 和上游路径并行，ICE 胜出时上游那次打洞请求在 `conn_attempt` 里照样按上游信令记成 `relay`、`direct_tcp`、`direct_lan`、`no_reply` 之一，所以**单看 `conn_attempt` 的中继回落率会偏高**，ICE 的实际直连看 `ice_result` 的 `connected`；两张表按"A 的公网 IP + B 的 ID + 时间"对照，不按 IP 硬合并。
+  - 一行一次 ICE：A 的 RESULT（`outcome` 用契约 05 §2.13 的小写名字 `connected`、`no_answer`、`bad_answer`、`no_pair`、`kcp_failed`、`secure_failed`；0 值或不认识的数字记 `unknown`），或会话放弃时的 `abandoned`。`elapsed_ms` 取 RESULT 的值（`abandoned` 为 NULL）；`local_kind`、`remote_kind`（`host`/`srflx`/`prflx`）、`family`、`local_net`（`ethernet`/`wlan`/`other`）只在 `connected` 时记，枚举里没有的数字记 NULL。`at` 是 S 记录的时刻，`a_ip` 是规范化后的 A 信令连接地址。
+  - 写入复用上面的通道：挂钩 `on_ice_result` 只锁内存、不 await，行进 `TrackerState.ice_results`，5 秒的收尾任务和到期的 `conn_attempt` 记录一起取走、进同一个写库队列（元素是两类），同一个事务里插入。RESULT 不认证，所以有和 `conn_attempt` 同样取值、单独计数的上限：每来源每分钟 60 行、全局每分钟 120 行，超出丢弃计数，和 `conn_attempt` 的丢弃写在同一条限频 warn 里。每小时的修剪也删 `at` 早于 90 天的行、只留最新 20 万行；最坏一行约 350 字节（`b_id` 最长 253 字节），加 `idx_ice_at` 约 80 MB【推测，没实测】。
+  - `abandoned` 里混着"被竞速取消"和"控制端异常退出"两种；控制端可以乱报 RESULT，只影响统计，不参与任何决策。
 
 ## 9. HTTP API 通则
 
@@ -464,7 +518,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 5. 有设备行，且库里 sysinfo 为空或 `base64(sha256(原文)) != sysinfo_hash` → 响应带 `need_sysinfo: true`；没能建行时不带这个键。
 6. `strategy::effective`，`rev != strategy_rev` 时带 `strategy: {rev, options}`（全部生效选项，值一律字符串，空串表示删键）。
 7. `routing_rev` 不等于路由模块当前的列表版本时带 `routing: {rev, probe_interval_secs: 300, relays: [前 32 台原串]}`（§7 第二级；没有配置中继时 `relays` 为 `[]`，客户端停止测速）；相等时不带。
-8. 签名回 200：`{"api": 1, "features": [], "time": <服务器 unix 秒>, …}`。`features` 是常量数组，本期为空（04 块加 `"udp-punch"`；02 块不加特性项，客户端看响应里有没有 `routing`）。查库失败一律 503。
+8. 签名回 200：`{"api": 1, "features": [], "time": <服务器 unix 秒>, …}`。`features` 是常量数组，05 块合入后为 `["ice"]`（自研 ICE，常量，没有会合私钥时照样宣告；02 块不加特性项，客户端看响应里有没有 `routing`）。查库失败一律 503。
 
 哈希只算在 sysinfo 这个 JSON 值的原始字节上；服务端原样存那段字节，比对时当场算，不加列。兼容路径存的是整个兼容请求体，哈希必然不同，所以设备从兼容路径切到 Leapgate 路径后会重传一次 sysinfo。
 
@@ -568,7 +622,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 - `device pin-relay <device> <host|none>`
 - `relay status`（控制台 `rs`；第三期末尾多一行 `measurements: <N> devices, <M> fresh`，§7 第二级）、`route test <ipA> <ipB> [--a <device>] [--b <device>]`（控制台 `tg <ipA> <ipB> <idA|-> <idB|->`，`-` 表示没有；ID 为空、是 `-` 或含空白时报错）。带 ID 时用这两台设备的第二级测量，每台可达中继后面标出两段用的是实测（`rtt 23ms` / `down`）还是估计（`est 21.3ms`，没有位置为 `est ?`），被实测 `down` 去掉的标 `no cost (measured down)`，这一行里用估计的那一端显示 `-`（没参加计算，没有值）；不带 ID 时输出和第一级一样。
 - `geo lookup <ip>`（直接读本地 mmdb：国家、经纬度、ASN、运营商组）、`geo update`（走控制台 `gu`，由服务进程执行下载、校验和热切换并回显结果；连不上控制台即服务没在运行时，才在命令行进程里直接下载，不做目录清理）
-- `stats [--days N]`：中继回落率和各结果计数（§8）
+- `stats [--days N]`：中继回落率和各结果计数（§8）；第三期 05 起另列一张 `ICE OUTCOME | COUNT` 表（`ice_result` 按 `at` 取同一时间范围），并注明"ICE 胜出的连接在上面仍按上游信令记成 relay/direct_tcp，上面的回落率会偏高，ICE 的实际直连看这里的 `connected`"。不加 `relay status` 的会话数一行，也不加别的命令：ICE 没有需要运维改的运行时状态
 - `import rustdesk-api <db 路径> [--dry-run]`（§15）
 - 名字校验：用户名、组名、簿名不能为空；用户名最长 128 字节（登录接口拒绝更长的名字）；共享簿名唯一且不能是 `My address book` 或 `Legacy address book`。
 - 命令行不新建数据库：`DB_URL` 指向的库文件不存在时报错退出（提示到服务的工作目录下运行或设置 `DB_URL`；只有文件确实不存在才这样报，库文件存在但访问不了时（例如权限不足）如实报出路径和原因），写操作在输出末尾打印所用数据库的绝对路径。在错误目录下运行不会悄悄写进一个服务看不到的新库。
@@ -599,11 +653,17 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 - 会合测试：在回环地址上起真实监听，模拟客户端做 KeyExchange（v0 和 v1 都测）后发 `PunchHoleRequest`，断言 v6 地址被转发、强制中继时被清空、选中的中继符合路由规则（可参照客户端 `src/common.rs` 里的 `rendezvous_stub` 测试写法）。
 - 第三期 01 块（Leapgate 上报路径）的测试：签名向量和客户端共用一组常量（请求头和响应签名逐字节一致）；验签链每种拒绝原因一条（`bad_auth` 不签名不带 `time`，其余 401 带签名和 `time`）；时间窗用固定 now 测 ±60 接受、±61 拒绝；防重放（乱序 30 秒、64 条后 `floor` 抬升、4096 台时淘汰最久未见）；锁定（首个合法请求后库和内存都锁定、从库重新加载的条目也是锁定、公钥已换时条件更新 0 行请求仍成功、库层守卫挡住旧快照换公钥、只换 IP 照常、行已删回 `SERVER_ERROR`）；会合层（锁定后换公钥回 `UUID_MISMATCH`、换 IP OK、不经控制台改库后注册以库为准、锁定条目的重载计入查库预算、已删行的换 IP 注册回 `SERVER_ERROR`）；防降级（锁定后兼容心跳 `{}`、sysinfo 403、审计不入库、登录照样绑定）；Leapgate 心跳（`need_sysinfo`、sysinfo 逐字节存、哈希、按 rev 下发策略、`client_type` 切换、响应签名可验、坏请求体、`leapgate_hb`）；Leapgate 审计（nonce 两路共用、写库失败 503 且 nonce 不登记、体里 `id` 被忽略、`note` 不走备注分支）；中间件（413/405 的 Leapgate 格式、超时和 panic 回 503、未知路径 404）；命令行（`device key` 输出、`device key reset` 改库加 `kl` 重载、回复校验、连不上控制台时报错）；迁移 0004 在第一期的库上执行。
 - 第三期 02 块（路由第二级）的测试：`cost::score` 的整端替换（两端、单端、测量没覆盖全部候选退回估计、`down` 去掉候选、全部 `down` 忽略、先 A 后 B、两端都没位置但一端有实测仍有代价、选中那台的两段）；测量表（版本不符、`age_s > 900`、不认识的原串、毫秒越界、形状不对都不影响别的条目，15 分钟按测量时刻过期，满 1 万条先删过期再删最老）；列表版本（同一列表同一值、`rs` 换列表变、空列表非 0、超过 32 台只算前 32）；`select` 用两端测量、固定中继仍优先、换列表后旧测量不用；Leapgate 心跳（`routing_rev` 相同不带 `routing`、不同带，坏 `probes` 照常 200，测量记在验签得到的 ID 下，之后被丢弃的 `probes` 不删它、不带 `probes` 的心跳当场删掉它）；打洞请求带 `leapgate_from_id` 时 `conn_attempt` 记 `rtt` 和两段、超长按空串；控制台 `tg` 和命令行 `route test` 带不带 ID；迁移 0005 在第一期的库上执行。关键断言做过变异验证。
+- 第三期 05 块（自研 ICE）的测试（契约 05 §6.1）。和客户端共用的向量（候选 c1、c2 §2.6；证明 §2.8；Binding 请求和 IPv4 响应 §2.9.3；FORWARD 的 `inner`/`sealed`/`msg`/`sig` §2.5）按十六进制原样写进测试，逐字节相等：
+  - `ice_stun`：证明 `seal`/`open` 往返（IPv4、IPv6），改任一字节、过期、未来时间、长度 0/27/29/41 都打不开，两条向量逐字节；Binding 请求的识别（短于 100、不是请求、magic 不对、长度不是 4 的倍数都不认）；IPv4 响应向量逐字节，RFC 5769 §2.2、§2.3 自检 XOR-MAPPED-ADDRESS 和 FINGERPRINT；编码器实际生成的 IPv4、IPv6 响应都严格短于门槛。
+  - `ice_signal`：候选往返和各种不合规；`filter` 两种模式（公网 IPv4 证明、全局 IPv6 只留前 2 个、各丢弃类和相邻段、同地址去重）；FORWARD 按向量逐字节算出 `sig`、用 B 的种子解出 `inner`、`IdPk::parse_from_bytes(&msg)` 失败、小阶点公钥返回 `None`；`forced_relay`；心跳新鲜度、版本和锁定；会话表（局部的 `Sessions<u32>`：8 条后 `Busy` 且 sink 留在调用方、`Duplicate` 不覆盖、两个 `::ffff:` 映射的 IPv4 来源互不占名额、重发只一次、应答后忽略、`close` 的三种结果和计数复原）。
+  - 会合集成（Harness，带 Key 的 `listener_as`、`online_ice`）：OFFER 转成 FORWARD（会合公钥验签、B 的私钥解密）；没做 KeyExchange 或 WebSocket 上发 OFFER 被断开；`OFFLINE`、`RELAY`、`UNSUPPORTED`（没锁定、心跳过期、版本 3009、小阶点）、`BUSY`（同一来源第 9 个）、`BAD`（Key 不对、15 字节 session、17 条候选）各一条；重发同字节、发往 B 的新地址、第三条忽略；ANSWER 带签过的 `IdPk` 到 A，A 不发 RESULT 就关 → 一行 `abandoned`；ANSWER 不合规、`get_pk` 为空 → A 收到 REJECT、A 关连接后没有 `abandoned`；B 的 REJECT 原样到 A；RESULT 只记第一条（版本不对、session 不对、第二条都忽略），之后关连接不再记 `abandoned`；STUN 回包、证明能打开、门槛和令牌桶、`::ffff:` 来源还原。
+  - `conn_tracker`：RESULT 转成固定文字（`connected` 才记选中对的字段，不认识的数字记 `unknown`/NULL）；ICE 的两个上限单独计数、和 `conn_attempt` 互不占用；`ice_result` 的写入、90 天删除、20 万行修剪和 `stats` 计数。迁移 0006 在跑过 0001~0005、带数据的库上执行；`_sqlx_migrations` 条数等于 `migrations/` 的文件数（`migrates_existing_hbbs_database`）。
+  - 变异验证：REJECT 各分支、公网 IPv4 证明、FORWARD 的签名和加密，以及 RESULT 的三条忽略规则、`abandoned` 的判定、ICE 上限单独计数，各改掉被测的那一行，测试都失败。
 - 第一期验收（部署后由维护者用原版客户端做）：登录、地址簿、设备列表、审计正常；被控端本地写死的中继能被远程清掉；中继按双方位置选择；控制端勾选 IPv6 后两端都有 IPv6 时能直连。
 
 ## 17. 工程约定
 
 - 如非必要，勿增实体：不加兜底代码、没人要的配置项、防御性检查；校验只针对会变的东西（用户输入、外部数据、下载的库文件）。
 - 新依赖选发布满两周的版本；能用已有依赖就不加新的。
-- 提交信息用中文，直接 `git commit`（签名身份已自动配置）；每个模块做完再提交，不 push，由主会话统一推送。
+- 提交信息用英文（总仓库 AGENTS.md 2026-10-24：四个公开仓库一律英文），直接 `git commit`（签名身份已自动配置）；每个模块做完再提交，不 push，由主会话统一推送。
 - 工作区保持 LF（本仓库设了 `core.eol=lf`）。

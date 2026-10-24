@@ -3,11 +3,14 @@
 //! The rendezvous hooks H1~H5 call the `on_*` methods; they only touch memory (a std mutex never held
 //! across an await). A sweeper finalizes due attempts every 5 seconds and hands them to a separate
 //! writer task, which resolves `token` → `a_user`/`a_device_id` and inserts into `conn_attempt`.
+//! The ICE results (contract 05 §3.7) take the same way into `ice_result`, due at once.
 //! All times are unix ms.
 
+use crate::ice_signal;
 use crate::peer::MAX_PEER_ID_LEN;
 use hbb_common::{
     log,
+    rendezvous_proto::{leapgate_ice_result, LeapgateIceResult},
     tokio::{self, sync::mpsc},
     try_into_v4, ResultType,
 };
@@ -62,7 +65,11 @@ const TOTAL_ROWS_PER_MIN: u32 = 120;
 /// 2.4 KB ≈ 0.5 GB; freed pages are reused, so the file stays there. Without a valid token (no
 /// `a_user`, `a_device_id`) a row takes about 1.4 KB: ≈ 0.29 GB.
 const MAX_ROWS: i64 = 200_000;
-/// Finalized attempts waiting for the writer; when full, new ones are dropped and counted.
+/// The same for `ice_result` (contract 05 §3.7), whose rows have their own per-source and total
+/// budgets of the sizes above. A worst-case row is about 350 bytes (`b_id` up to 253 bytes: B is
+/// any registered id) plus its `idx_ice_at` entry: 200,000 rows ≈ 80 MB (estimated, not measured).
+const MAX_ICE_ROWS: i64 = 200_000;
+/// Rows waiting for the writer (both tables); when full, new ones are dropped and counted.
 const WRITE_QUEUE: usize = 10_000;
 /// At most this many rows per insert transaction.
 const WRITE_BATCH: usize = 1_000;
@@ -184,6 +191,56 @@ pub struct RelayRequest {
     pub found_in_memory: bool,
 }
 
+/// One `ice_result` row (contract 05 §3.7, P-A): A's RESULT on its ICE signaling connection, or
+/// `abandoned` when that connection ended without one. Unauthenticated, statistics only.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IceResult {
+    pub at: i64,
+    /// Normalized, as the session table keeps it.
+    pub a_ip: IpAddr,
+    /// The OFFER's B: at most `MAX_PEER_ID_LEN`, checked there.
+    pub b_id: String,
+    pub outcome: &'static str,
+    pub elapsed_ms: Option<i64>,
+    /// The selected pair, `connected` only.
+    pub local_kind: Option<&'static str>,
+    pub remote_kind: Option<&'static str>,
+    pub family: Option<i64>,
+    pub local_net: Option<&'static str>,
+}
+
+impl IceResult {
+    /// A's RESULT, in the names of §2.13; the pair's fields are kept with `connected` only.
+    pub fn from(r: &LeapgateIceResult, a_ip: IpAddr, b_id: String) -> Self {
+        let connected = r.outcome.enum_value() == Ok(leapgate_ice_result::Outcome::CONNECTED);
+        Self {
+            at: now_ms(),
+            a_ip,
+            b_id,
+            outcome: ice_signal::outcome_name(r.outcome),
+            elapsed_ms: Some(i64::from(r.elapsed_ms)),
+            local_kind: ice_signal::kind_name(r.local_kind).filter(|_| connected),
+            remote_kind: ice_signal::kind_name(r.remote_kind).filter(|_| connected),
+            family: connected.then_some(i64::from(r.family)),
+            local_net: ice_signal::net_name(r.local_net).filter(|_| connected),
+        }
+    }
+
+    pub fn abandoned(a_ip: IpAddr, b_id: String) -> Self {
+        Self {
+            at: now_ms(),
+            a_ip,
+            b_id,
+            outcome: ice_signal::ABANDONED,
+            elapsed_ms: None,
+            local_kind: None,
+            remote_kind: None,
+            family: None,
+            local_net: None,
+        }
+    }
+}
+
 /// Relay fallback statistics over a time range (for `leapgate-server stats`).
 #[derive(Debug, Clone, Default)]
 pub struct Stats {
@@ -193,6 +250,8 @@ pub struct Stats {
     pub relay_rate: Option<f64>,
     /// Attempts where `b_relay ≠ relay_offered` (B has a relay hard-coded locally).
     pub b_relay_mismatch: i64,
+    /// Count per `ice_result.outcome` (contract 05 §3.8).
+    pub ice_outcomes: Vec<(String, i64)>,
 }
 
 /// `conn_attempt.reply`.
@@ -317,6 +376,13 @@ struct Finalized {
     finalized_at: i64,
 }
 
+/// What the writer inserts: a `conn_attempt` row or an `ice_result` row.
+#[derive(Debug)]
+enum Row {
+    Attempt(Finalized),
+    Ice(IceResult),
+}
+
 #[derive(Default)]
 struct TrackerState {
     next_id: u64,
@@ -335,6 +401,13 @@ struct TrackerState {
     rate_dropped: u64,
     /// New rows refused by the total limit, taken by the sweeper.
     total_dropped: u64,
+    /// `ice_result` rows waiting for the sweeper, under budgets of their own of the same sizes
+    /// (`IP_ROWS_PER_MIN`, `TOTAL_ROWS_PER_MIN`) and with their own drop counts.
+    ice_results: Vec<IceResult>,
+    ice_rows_per_ip: HashMap<IpAddr, (i64, u32)>,
+    ice_rows_total: (i64, u32),
+    ice_rate_dropped: u64,
+    ice_total_dropped: u64,
 }
 
 /// What `IP_ROWS_PER_MIN` counts per: an IPv4 address, or the /64 of an IPv6 address (any host
@@ -366,22 +439,45 @@ pub(crate) fn clip(s: &mut String, max: usize) {
     }
 }
 
+/// Takes one new row from `ip` at `now` unless its source is over `IP_ROWS_PER_MIN` or all sources
+/// together are over `TOTAL_ROWS_PER_MIN`, counting a refusal in `rate_dropped` or `total_dropped`.
+/// A dropped row counts against neither limit.
+fn take_row(
+    per_ip: &mut HashMap<IpAddr, (i64, u32)>,
+    total: &mut (i64, u32),
+    rate_dropped: &mut u64,
+    total_dropped: &mut u64,
+    ip: IpAddr,
+    now: i64,
+) -> bool {
+    let source = per_ip.entry(source_key(ip)).or_insert((now, 0));
+    if !has_room(source, now, IP_ROWS_PER_MIN) {
+        *rate_dropped += 1;
+        return false;
+    }
+    if !has_room(total, now, TOTAL_ROWS_PER_MIN) {
+        *total_dropped += 1;
+        return false;
+    }
+    source.1 += 1;
+    total.1 += 1;
+    true
+}
+
 impl TrackerState {
-    /// Adds a new attempt (started now) unless its source is over `IP_ROWS_PER_MIN` or all sources
-    /// together are over `TOTAL_ROWS_PER_MIN`. A dropped row counts against neither limit.
+    /// Adds a new attempt (started now) unless `take_row` refuses it.
     fn add(&mut self, attempt: Attempt) {
         let now = attempt.started_at;
-        let source = self.rows_per_ip.entry(source_key(attempt.a_addr.ip())).or_insert((now, 0));
-        if !has_room(source, now, IP_ROWS_PER_MIN) {
-            self.rate_dropped += 1;
+        if !take_row(
+            &mut self.rows_per_ip,
+            &mut self.rows_total,
+            &mut self.rate_dropped,
+            &mut self.total_dropped,
+            attempt.a_addr.ip(),
+            now,
+        ) {
             return;
         }
-        if !has_room(&mut self.rows_total, now, TOTAL_ROWS_PER_MIN) {
-            self.total_dropped += 1;
-            return;
-        }
-        source.1 += 1;
-        self.rows_total.1 += 1;
         self.next_id += 1;
         let id = self.next_id;
         self.by_pair
@@ -577,9 +673,25 @@ impl TrackerState {
         });
     }
 
-    /// Removes and returns the attempts due at `now`.
+    /// Keeps an `ice_result` row for the sweeper unless `take_row` refuses it (on the ICE budgets).
+    fn ice_result(&mut self, r: IceResult) {
+        if take_row(
+            &mut self.ice_rows_per_ip,
+            &mut self.ice_rows_total,
+            &mut self.ice_rate_dropped,
+            &mut self.ice_total_dropped,
+            r.a_ip,
+            r.at,
+        ) {
+            self.ice_results.push(r);
+        }
+    }
+
+    /// Removes and returns the attempts due at `now` (the `ice_result` rows are due at once and
+    /// taken with them, `take_due`).
     fn sweep(&mut self, now: i64) -> Vec<Finalized> {
         self.rows_per_ip.retain(|_, (start, _)| now - *start < IP_WINDOW_MS);
+        self.ice_rows_per_ip.retain(|_, (start, _)| now - *start < IP_WINDOW_MS);
         let due: Vec<u64> = self
             .attempts
             .iter()
@@ -594,6 +706,13 @@ impl TrackerState {
                 attempt,
             })
             .collect()
+    }
+
+    /// Everything for the writer at `now`: the attempts due, then all `ice_result` rows.
+    fn take_due(&mut self, now: i64) -> Vec<Row> {
+        let mut rows: Vec<Row> = self.sweep(now).into_iter().map(Row::Attempt).collect();
+        rows.extend(std::mem::take(&mut self.ice_results).into_iter().map(Row::Ice));
+        rows
     }
 
     fn remove(&mut self, id: u64) -> Option<Attempt> {
@@ -626,17 +745,42 @@ pub(crate) fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
-/// Inserts finalized attempts in one transaction, resolving their tokens first.
-async fn write(db: &SqlitePool, batch: &[Finalized]) -> ResultType<()> {
+/// Inserts rows of both tables in one transaction, resolving the attempts' tokens first.
+async fn write(db: &SqlitePool, batch: &[Row]) -> ResultType<()> {
     let mut owners = Vec::with_capacity(batch.len());
-    for f in batch {
-        owners.push(crate::auth::token_owner(db, &f.attempt.token).await);
+    for row in batch {
+        owners.push(match row {
+            Row::Attempt(f) => crate::auth::token_owner(db, &f.attempt.token).await,
+            Row::Ice(_) => None,
+        });
     }
     let mut tx = db.begin().await?;
-    for (f, owner) in batch.iter().zip(owners) {
-        insert_row(&mut *tx, f, owner).await?;
+    for (row, owner) in batch.iter().zip(owners) {
+        match row {
+            Row::Attempt(f) => insert_row(&mut *tx, f, owner).await?,
+            Row::Ice(r) => insert_ice(&mut *tx, r).await?,
+        }
     }
     tx.commit().await?;
+    Ok(())
+}
+
+async fn insert_ice(conn: &mut sqlx::SqliteConnection, r: &IceResult) -> ResultType<()> {
+    sqlx::query(
+        "insert into ice_result(at, a_ip, b_id, outcome, elapsed_ms, local_kind, remote_kind, family, local_net)
+         values(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(r.at)
+    .bind(r.a_ip.to_string())
+    .bind(&r.b_id)
+    .bind(r.outcome)
+    .bind(r.elapsed_ms)
+    .bind(r.local_kind)
+    .bind(r.remote_kind)
+    .bind(r.family)
+    .bind(r.local_net)
+    .execute(conn)
+    .await?;
     Ok(())
 }
 
@@ -703,39 +847,60 @@ async fn insert_row(
     Ok(())
 }
 
-/// Hands finalized attempts to the writer without waiting; returns how many were dropped (queue full).
-fn enqueue(tx: &mpsc::Sender<Finalized>, done: Vec<Finalized>) -> u64 {
-    done.into_iter().map(|f| tx.try_send(f)).filter(|r| r.is_err()).count() as u64
+/// Hands rows to the writer without waiting; returns how many were dropped (queue full).
+fn enqueue(tx: &mpsc::Sender<Row>, rows: Vec<Row>) -> u64 {
+    rows.into_iter().map(|r| tx.try_send(r)).filter(|r| r.is_err()).count() as u64
 }
 
-/// Deletes the rows started before `now - RETENTION_MS`, then all but the newest `MAX_ROWS`;
+/// A table the hourly purge keeps: its name, its time column (unix ms) and its row limit.
+struct Kept {
+    table: &'static str,
+    at: &'static str,
+    max_rows: i64,
+}
+
+const CONN_ATTEMPT: Kept = Kept {
+    table: "conn_attempt",
+    at: "started_at",
+    max_rows: MAX_ROWS,
+};
+const ICE_RESULT: Kept = Kept {
+    table: "ice_result",
+    at: "at",
+    max_rows: MAX_ICE_ROWS,
+};
+
+/// Deletes the rows of `t` from before `now - RETENTION_MS`, then all but the newest `max_rows`;
 /// returns how many.
-async fn purge(db: &SqlitePool, now: i64) -> ResultType<u64> {
-    let old = sqlx::query("delete from conn_attempt where started_at < ?")
+async fn purge(db: &SqlitePool, t: &Kept, now: i64) -> ResultType<u64> {
+    let old = sqlx::query(&format!("delete from {} where {} < ?", t.table, t.at))
         .bind(now - RETENTION_MS)
         .execute(db)
         .await?;
-    Ok(old.rows_affected() + trim(db, MAX_ROWS).await?)
+    Ok(old.rows_affected() + trim(db, t.table, t.max_rows).await?)
 }
 
 /// Keeps the newest `keep` rows (by id); returns how many were deleted.
-async fn trim(db: &SqlitePool, keep: i64) -> ResultType<u64> {
-    let res = sqlx::query(
-        "delete from conn_attempt where id < (select id from conn_attempt order by id desc limit 1 offset ?)",
-    )
+async fn trim(db: &SqlitePool, table: &str, keep: i64) -> ResultType<u64> {
+    let res = sqlx::query(&format!(
+        "delete from {table} where id < (select id from {table} order by id desc limit 1 offset ?)"
+    ))
     .bind(keep - 1)
     .execute(db)
     .await?;
     Ok(res.rows_affected())
 }
 
-/// The hourly cleanup: `conn_attempt` (`purge`) and the audit tables' retention (`audit::purge`).
-/// The device table and the audit tables' row limits are kept on insert instead (`device::make_room`,
-/// `audit::make_room`). Logs one line with what each deleted (nothing when nothing was deleted and
-/// nothing failed).
+/// The hourly cleanup: `conn_attempt` and `ice_result` (`purge`) and the audit tables' retention
+/// (`audit::purge`). The device table and the audit tables' row limits are kept on insert instead
+/// (`device::make_room`, `audit::make_room`). Logs one line with what each deleted (nothing when
+/// nothing was deleted and nothing failed).
 async fn hourly_purge(db: &SqlitePool, now: i64) {
     use crate::api::audit;
-    let mut steps = vec![("conn_attempt", purge(db, now).await)];
+    let mut steps = vec![("conn_attempt", purge(db, &CONN_ATTEMPT, now).await)];
+    // Lets other writers take the write lock between two tables, as between two batches.
+    tokio::time::sleep(audit::PURGE_PAUSE).await;
+    steps.push(("ice_result", purge(db, &ICE_RESULT, now).await));
     for table in audit::TABLES {
         // Lets other writers take the write lock between two tables, as between two batches.
         tokio::time::sleep(audit::PURGE_PAUSE).await;
@@ -793,42 +958,55 @@ impl ConnTracker {
         self.state.lock().unwrap().request_relay(req, now_ms());
     }
 
+    /// The ICE hooks (contract 05 §3.4): A's RESULT, or an abandoned session.
+    pub fn on_ice_result(&self, r: IceResult) {
+        self.state.lock().unwrap().ice_result(r);
+    }
+
     /// Tests elsewhere: finalizes every record now (as if all windows had passed) and writes it.
     #[cfg(test)]
     pub(crate) async fn flush(&self) {
-        let done = self.state.lock().unwrap().sweep(now_ms() + 24 * 3600 * 1000);
-        write(&self.db, &done).await.unwrap();
+        let rows = self.state.lock().unwrap().take_due(now_ms() + 24 * 3600 * 1000);
+        write(&self.db, &rows).await.unwrap();
     }
 
     /// The 5-second finalizer, the database writer and the hourly purge, spawned on the server's runtime.
     pub fn spawn_tasks(self: &Arc<Self>) {
-        let (tx, mut rx) = mpsc::channel::<Finalized>(WRITE_QUEUE);
+        let (tx, mut rx) = mpsc::channel::<Row>(WRITE_QUEUE);
         let this = self.clone();
         tokio::spawn(async move {
             let mut timer = tokio::time::interval(SWEEP_INTERVAL);
-            // Dropped since the last log line: over the per-source limit, over the total limit, and
-            // with the write queue full.
-            let (mut limited, mut over_total, mut full) = (0u64, 0u64, 0u64);
+            // Dropped since the last log line: over the per-source limit and over the total limit
+            // (`conn_attempt`, then `ice_result`), and with the write queue full (either).
+            let mut dropped = [0u64; 5];
             let mut logged: Option<Instant> = None;
             loop {
                 timer.tick().await;
-                let (done, n, t) = {
+                let (rows, counts) = {
                     let mut s = this.state.lock().unwrap();
-                    let done = s.sweep(now_ms());
-                    (done, std::mem::take(&mut s.rate_dropped), std::mem::take(&mut s.total_dropped))
+                    let rows = s.take_due(now_ms());
+                    let counts = [
+                        std::mem::take(&mut s.rate_dropped),
+                        std::mem::take(&mut s.total_dropped),
+                        std::mem::take(&mut s.ice_rate_dropped),
+                        std::mem::take(&mut s.ice_total_dropped),
+                    ];
+                    (rows, counts)
                 };
-                limited += n;
-                over_total += t;
-                full += enqueue(&tx, done);
-                if (limited > 0 || over_total > 0 || full > 0)
-                    && logged.map_or(true, |t| t.elapsed() >= DROP_LOG_INTERVAL)
-                {
+                for (d, n) in dropped.iter_mut().zip(counts) {
+                    *d += n;
+                }
+                dropped[4] += enqueue(&tx, rows);
+                if dropped.iter().any(|&n| n > 0) && logged.map_or(true, |t| t.elapsed() >= DROP_LOG_INTERVAL) {
+                    let [limited, over_total, ice_limited, ice_over_total, full] = dropped;
                     log::warn!(
                         "conn_attempt: dropped {limited} records over {IP_ROWS_PER_MIN} per source per minute, \
                          {over_total} over {TOTAL_ROWS_PER_MIN} per minute in total \
-                         and {full} with the write queue full"
+                         and {full} with the write queue full (ice_result included); \
+                         ice_result: dropped {ice_limited} over the same per-source limit, \
+                         {ice_over_total} over the same total"
                     );
-                    (limited, over_total, full, logged) = (0, 0, 0, Some(Instant::now()));
+                    (dropped, logged) = ([0; 5], Some(Instant::now()));
                 }
             }
         });
@@ -837,7 +1015,7 @@ impl ConnTracker {
             let mut batch = Vec::with_capacity(WRITE_BATCH);
             while rx.recv_many(&mut batch, WRITE_BATCH).await > 0 {
                 if let Err(e) = write(&db, &batch).await {
-                    log::error!("conn_attempt insert of {} rows: {e}", batch.len());
+                    log::error!("conn_attempt/ice_result insert of {} rows: {e}", batch.len());
                 }
                 batch.clear();
             }
@@ -852,7 +1030,8 @@ impl ConnTracker {
         });
     }
 
-    /// Statistics of attempts started in `[since_ms, until_ms)` (unix ms). Reads the database only.
+    /// Statistics of attempts started, and ICE results recorded, in `[since_ms, until_ms)` (unix
+    /// ms). Reads the database only.
     pub async fn stats(db: &SqlitePool, since_ms: i64, until_ms: i64) -> ResultType<Stats> {
         let outcomes: Vec<(String, i64)> = sqlx::query_as(
             "select outcome, count(*) from conn_attempt where started_at >= ? and started_at < ?
@@ -879,10 +1058,19 @@ impl ConnTracker {
         .bind(until_ms)
         .fetch_one(db)
         .await?;
+        let ice_outcomes: Vec<(String, i64)> = sqlx::query_as(
+            "select outcome, count(*) from ice_result where at >= ? and at < ?
+             group by outcome order by outcome",
+        )
+        .bind(since_ms)
+        .bind(until_ms)
+        .fetch_all(db)
+        .await?;
         Ok(Stats {
             relay_rate: (total > 0).then(|| relayed as f64 / total as f64),
             outcomes,
             b_relay_mismatch,
+            ice_outcomes,
         })
     }
 }
@@ -1259,7 +1447,7 @@ mod tests {
             s.punch_request(req, T0);
         }
         let (tx, mut rx) = mpsc::channel(2);
-        assert_eq!(enqueue(&tx, s.sweep(T0 + 60_000)), 1);
+        assert_eq!(enqueue(&tx, s.take_due(T0 + 60_000)), 1);
         assert!(rx.try_recv().is_ok() && rx.try_recv().is_ok() && rx.try_recv().is_err());
     }
 
@@ -1496,7 +1684,7 @@ mod tests {
     }
 
     async fn insert(db: &SqlitePool, s: &mut TrackerState, now: i64) {
-        write(db, &s.sweep(now)).await.unwrap();
+        write(db, &s.take_due(now)).await.unwrap();
     }
 
     #[tokio::test]
@@ -1511,13 +1699,13 @@ mod tests {
             s.punch_request(req, t);
             insert(&db, &mut s, t + PAIR_MERGE_MS).await;
         }
-        assert_eq!(purge(&db, now).await.unwrap(), 1);
+        assert_eq!(purge(&db, &CONN_ATTEMPT, now).await.unwrap(), 1);
         let left: Vec<String> = sqlx::query_scalar("select b_id from conn_attempt order by b_id")
             .fetch_all(&db)
             .await
             .unwrap();
         assert_eq!(left, ["id-1", "id-2"]);
-        assert_eq!(purge(&db, now).await.unwrap(), 0);
+        assert_eq!(purge(&db, &CONN_ATTEMPT, now).await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -1531,8 +1719,8 @@ mod tests {
             s.punch_request(req, t);
             insert(&db, &mut s, t + PAIR_MERGE_MS).await;
         }
-        assert_eq!(trim(&db, 10).await.unwrap(), 0);
-        assert_eq!(trim(&db, 2).await.unwrap(), 3);
+        assert_eq!(trim(&db, "conn_attempt", 10).await.unwrap(), 0);
+        assert_eq!(trim(&db, "conn_attempt", 2).await.unwrap(), 3);
         let left: Vec<String> = sqlx::query_scalar("select b_id from conn_attempt order by id")
             .fetch_all(&db)
             .await
@@ -1729,5 +1917,145 @@ mod tests {
         let first = ConnTracker::stats(&db, T0 + 10_000, T0 + 20_000).await.unwrap();
         assert_eq!(first.outcomes, [("direct_tcp".to_owned(), 1)]);
         assert_eq!(first.relay_rate, Some(0.0));
+    }
+
+    // ---- ice_result (contract 05 §3.7) ----
+
+    use hbb_common::protobuf::EnumOrUnknown;
+    use leapgate_ice_result::{Kind, Net, Outcome};
+
+    fn result_msg(outcome: Outcome) -> LeapgateIceResult {
+        LeapgateIceResult {
+            outcome: outcome.into(),
+            elapsed_ms: 812,
+            local_kind: Kind::HOST.into(),
+            remote_kind: Kind::PRFLX.into(),
+            family: 6,
+            local_net: Net::WLAN.into(),
+            ..Default::default()
+        }
+    }
+
+    /// `IceResult` at `at` from `ip`.
+    fn ice_at(outcome: Outcome, ip: &str, at: i64) -> IceResult {
+        let mut r = IceResult::from(&result_msg(outcome), ip.parse().unwrap(), "B1".to_owned());
+        r.at = at;
+        r
+    }
+
+    type Pair = (Option<&'static str>, Option<&'static str>, Option<i64>, Option<&'static str>);
+
+    fn pair(r: &IceResult) -> Pair {
+        (r.local_kind, r.remote_kind, r.family, r.local_net)
+    }
+
+    #[test]
+    fn ice_results_in_the_fixed_names() {
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        for (o, name) in [
+            (Outcome::CONNECTED, "connected"),
+            (Outcome::NO_ANSWER, "no_answer"),
+            (Outcome::BAD_ANSWER, "bad_answer"),
+            (Outcome::NO_PAIR, "no_pair"),
+            (Outcome::KCP_FAILED, "kcp_failed"),
+            (Outcome::SECURE_FAILED, "secure_failed"),
+            (Outcome::UNKNOWN, "unknown"),
+        ] {
+            let r = IceResult::from(&result_msg(o), ip, "B1".to_owned());
+            assert_eq!((r.outcome, r.elapsed_ms), (name, Some(812)));
+            // The pair only with connected.
+            let expect: Pair = match o {
+                Outcome::CONNECTED => (Some("host"), Some("prflx"), Some(6), Some("wlan")),
+                _ => (None, None, None, None),
+            };
+            assert_eq!(pair(&r), expect, "{name}");
+        }
+        let mut m = result_msg(Outcome::CONNECTED);
+        m.local_kind = Kind::SRFLX.into();
+        m.local_net = Net::ETHERNET.into();
+        m.remote_kind = EnumOrUnknown::from_i32(9);
+        let r = IceResult::from(&m, ip, "B1".to_owned());
+        assert_eq!(pair(&r), (Some("srflx"), None, Some(6), Some("ethernet")));
+        m.local_net = Net::OTHER.into();
+        assert_eq!(IceResult::from(&m, ip, "B1".to_owned()).local_net, Some("other"));
+        m.outcome = EnumOrUnknown::from_i32(99);
+        let r = IceResult::from(&m, ip, "B1".to_owned());
+        assert_eq!((r.outcome, pair(&r)), ("unknown", (None, None, None, None)));
+        let r = IceResult::abandoned(ip, "B1".to_owned());
+        assert_eq!((r.outcome, r.elapsed_ms, pair(&r)), ("abandoned", None, (None, None, None, None)));
+    }
+
+    #[test]
+    fn ice_rows_are_limited_on_their_own_budgets() {
+        let mut s = TrackerState::default();
+        // A full conn_attempt budget does not touch the ICE one, nor the other way round.
+        for i in 0..60u32 {
+            new_row(&mut s, a1(), i, T0);
+        }
+        for _ in 0..61 {
+            s.ice_result(ice_at(Outcome::CONNECTED, "1.2.3.4", T0));
+        }
+        assert_eq!((s.ice_results.len(), s.ice_rate_dropped, s.ice_total_dropped), (60, 1, 0));
+        assert_eq!((s.attempts.len(), s.rate_dropped, s.total_dropped), (60, 0, 0));
+        // One /64 is one source; the total stops at 120.
+        for i in 0..70u16 {
+            s.ice_result(ice_at(Outcome::NO_PAIR, &format!("2001:db8:1:2::{i:x}"), T0 + 1));
+        }
+        assert_eq!((s.ice_results.len(), s.ice_rate_dropped), (120, 11));
+        s.ice_result(ice_at(Outcome::NO_PAIR, "9.9.9.9", T0 + 2));
+        assert_eq!((s.ice_results.len(), s.ice_total_dropped), (120, 1));
+        // Taken with the attempts due; the sweep forgets the sources whose minute is over.
+        let rows = s.take_due(T0 + 60_000);
+        assert_eq!(rows.iter().filter(|r| matches!(r, Row::Ice(_))).count(), 120);
+        assert!(s.ice_results.is_empty());
+        assert!(!s.ice_rows_per_ip.contains_key(&a1().ip()), "{:?}", s.ice_rows_per_ip);
+        s.ice_result(ice_at(Outcome::NO_PAIR, "1.2.3.4", T0 + 60_000));
+        assert_eq!(s.ice_results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ice_results_are_written_purged_and_counted() {
+        let (_dir, db) = crate::testutil::pool().await;
+        let now = T0 + RETENTION_MS + 50_000;
+        let mut s = TrackerState::default();
+        // Recorded 90 days + 1 ms before `now`, exactly 90 days before, and recently (three of them).
+        s.ice_result(ice_at(Outcome::NO_ANSWER, "1.2.3.4", now - RETENTION_MS - 1));
+        s.ice_result(ice_at(Outcome::CONNECTED, "2001:db8::1", now - RETENTION_MS));
+        let mut abandoned = IceResult::abandoned("1.2.3.4".parse().unwrap(), "B2".to_owned());
+        abandoned.at = now - 2_000;
+        s.ice_result(abandoned);
+        s.ice_result(ice_at(Outcome::CONNECTED, "1.2.3.4", now - 1_000));
+        s.ice_result(ice_at(Outcome::NO_PAIR, "1.2.3.4", now - 1_000));
+        insert(&db, &mut s, now).await;
+
+        type Stored = (String, String, String, Option<i64>, Option<String>, Option<String>, Option<i64>, Option<String>);
+        let rows: Vec<Stored> = sqlx::query_as(
+            "select a_ip, b_id, outcome, elapsed_ms, local_kind, remote_kind, family, local_net
+             from ice_result where at >= ? order by id",
+        )
+        .bind(now - RETENTION_MS)
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        let o = |x: &str| x.to_owned();
+        let expect: [Stored; 2] = [
+            (o("2001:db8::1"), o("B1"), o("connected"), Some(812), Some(o("host")), Some(o("prflx")), Some(6), Some(o("wlan"))),
+            (o("1.2.3.4"), o("B2"), o("abandoned"), None, None, None, None, None),
+        ];
+        assert_eq!(rows[..2], expect);
+
+        let st = ConnTracker::stats(&db, now - 2_000, now).await.unwrap();
+        let count = |v: &[(&str, i64)]| v.iter().map(|(o, n)| (o.to_string(), *n)).collect::<Vec<_>>();
+        assert_eq!(st.ice_outcomes, count(&[("abandoned", 1), ("connected", 1), ("no_pair", 1)]));
+        assert!(st.outcomes.is_empty(), "conn_attempt untouched");
+
+        assert_eq!(purge(&db, &ICE_RESULT, now).await.unwrap(), 1);
+        assert_eq!(purge(&db, &ICE_RESULT, now).await.unwrap(), 0);
+        assert_eq!(trim(&db, "ice_result", 2).await.unwrap(), 2);
+        let left: Vec<String> = sqlx::query_scalar("select outcome from ice_result order by id")
+            .fetch_all(&db)
+            .await
+            .unwrap();
+        assert_eq!(left, ["connected", "no_pair"]);
     }
 }

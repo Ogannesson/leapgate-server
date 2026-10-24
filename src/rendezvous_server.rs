@@ -3,7 +3,8 @@ use crate::conn_limit::ConnLimiter;
 use crate::ice_signal::{self, Reason};
 use crate::ice_stun;
 use crate::conn_tracker::{
-    clip, source_key, PunchRequest, RelayRequest, RelayResponseInfo, Reply, ReplyKind, Signal,
+    clip, source_key, IceResult, PunchRequest, RelayRequest, RelayResponseInfo, Reply, ReplyKind,
+    Signal,
 };
 use crate::peer::*;
 use crate::router::RouteQuery;
@@ -1112,10 +1113,14 @@ impl RendezvousServer {
                 false
             }
             // A's RESULT for its own session, the first only; statistics, recorded in `ice_result`
-            // (§3.7).
-            Some(leapgate_ice::Union::Result(r)) if m.ver == ice_signal::ICE_VER => {
-                if let Some(session) = ice.filter(|s| r.session[..] == s[..]) {
-                    ICE_SESSIONS.lock().unwrap().mark_result(&session);
+            // (§3.7). Any other is ignored, the connection kept: A closes it once it has sent one.
+            Some(leapgate_ice::Union::Result(r)) => {
+                let own = ice.filter(|s| m.ver == ice_signal::ICE_VER && r.session[..] == s[..]);
+                if let Some(session) = own {
+                    let first = ICE_SESSIONS.lock().unwrap().mark_result(&session);
+                    if let Some((a_ip, b_id)) = first {
+                        self.state.tracker.on_ice_result(IceResult::from(&r, a_ip, b_id));
+                    }
                 }
                 true
             }
@@ -2040,7 +2045,10 @@ impl RendezvousServer {
         // The session lives as long as A's signaling connection (contract 05 §2.3); one without a
         // RESULT is abandoned, recorded in `ice_result` (§3.7).
         if let Some(session) = ice_session {
-            ICE_SESSIONS.lock().unwrap().close(&session);
+            let closed = ICE_SESSIONS.lock().unwrap().close(&session);
+            if let Some((a_ip, b_id, true)) = closed {
+                self.state.tracker.on_ice_result(IceResult::abandoned(a_ip, b_id));
+            }
         }
         log::debug!("Tcp connection from {:?} closed", addr);
         Ok(())
@@ -3690,9 +3698,30 @@ mod tests {
             ice_closed(&mut b).await;
         }
         assert!(a.next_timeout(300).await.is_none(), "nothing more for A");
-        // Still in the table, answered, without a RESULT: what A's close records as abandoned.
-        let closed = ICE_SESSIONS.lock().unwrap().close(&session_key(&s));
-        assert_eq!(closed, Some(("198.51.100.36".parse().unwrap(), "B1".to_owned(), true)));
+        // Answered, then A closes without a RESULT: abandoned (§3.7).
+        drop(a);
+        let rows = ice_rows(&h, 1).await;
+        assert_eq!(rows, [("198.51.100.36".to_owned(), "B1".to_owned(), "abandoned".to_owned(), None, None)]);
+    }
+
+    type IceRow = (String, String, String, Option<i64>, Option<String>);
+
+    /// `ice_result` once it has `n` rows or 3 seconds passed (A's close is handled on its connection
+    /// task): A's address, B's id, the outcome, `elapsed_ms`, `local_kind`.
+    async fn ice_rows(h: &Harness, n: usize) -> Vec<IceRow> {
+        let t = Instant::now();
+        loop {
+            h.rs.state.tracker.flush().await;
+            let rows: Vec<IceRow> =
+                sqlx::query_as("select a_ip, b_id, outcome, elapsed_ms, local_kind from ice_result order by id")
+                    .fetch_all(&h.rs.state.db)
+                    .await
+                    .unwrap();
+            if rows.len() >= n || t.elapsed() > Duration::from_secs(3) {
+                return rows;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// §2.3 ④: a malformed ANSWER, or one for a B no longer in memory (no pk to sign), rejects A's
@@ -3711,6 +3740,7 @@ mod tests {
         assert_eq!((r.session[..] == s[..], r.reason.enum_value().unwrap()), (true, Reason::BAD));
         assert!(ICE_SESSIONS.lock().unwrap().close(&session_key(&s)).is_none(), "removed");
         ice_closed(&mut b).await;
+        drop(a);
 
         let (mut a, s) = ice_registered(&mut h, "198.51.100.38:5000").await;
         h.rs.pm.remove("B1").await;
@@ -3721,6 +3751,47 @@ mod tests {
         };
         assert_eq!((r.session[..] == s[..], r.reason.enum_value().unwrap()), (true, Reason::UNSUPPORTED));
         assert!(ICE_SESSIONS.lock().unwrap().close(&session_key(&s)).is_none(), "removed");
+        // A closes: a rejected session is not counted as abandoned.
+        drop(a);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(ice_rows(&h, 0).await.is_empty());
+    }
+
+    /// §2.3 ⑦, §3.7 (P-A): A's first RESULT for its own session is recorded; one for another
+    /// session, one of another version and a second one are ignored, the connection kept; after a
+    /// RESULT, A's close records nothing more.
+    #[hbb_common::tokio::test]
+    async fn ice_result_is_recorded_once() {
+        use leapgate_ice_result::Outcome;
+        let mut h = harness(true, None).await;
+        let (mut a, s) = ice_registered(&mut h, "198.51.100.40:5000").await;
+        let result = |session: &[u8], outcome: Outcome| {
+            ice_msg(leapgate_ice::Union::Result(LeapgateIceResult {
+                session: Bytes::copy_from_slice(session),
+                outcome: outcome.into(),
+                elapsed_ms: 1234,
+                local_kind: leapgate_ice_result::Kind::SRFLX.into(),
+                family: 4,
+                ..Default::default()
+            }))
+        };
+        let mut v2 = result(&s, Outcome::NO_PAIR);
+        v2.mut_leapgate_ice().ver = 2;
+        for m in [v2, result(&ice_session(), Outcome::NO_PAIR), result(&s, Outcome::CONNECTED), result(&s, Outcome::NO_PAIR)] {
+            a.send(&m).await.unwrap();
+        }
+        assert!(a.next_timeout(300).await.is_none(), "nothing for A");
+        drop(a);
+        // The connection task ends: the session is gone, and nothing more is recorded.
+        let t = Instant::now();
+        while ICE_SESSIONS.lock().unwrap().peek_unanswered(&session_key(&s)).is_some() {
+            assert!(t.elapsed() < Duration::from_secs(3), "A's close not handled");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let rows = ice_rows(&h, 1).await;
+        let row = ("198.51.100.40".to_owned(), "B1".to_owned(), "connected".to_owned(), Some(1234), Some("srflx".to_owned()));
+        assert_eq!(rows, [row]);
     }
 
     /// §2.3 ⑤: B's REJECT goes to A as it came, and the session is removed.
