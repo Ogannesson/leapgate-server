@@ -1,5 +1,6 @@
 use crate::common::*;
 use crate::conn_limit::ConnLimiter;
+use crate::ice_signal::{self, Reason};
 use crate::ice_stun;
 use crate::conn_tracker::{
     clip, source_key, PunchRequest, RelayRequest, RelayResponseInfo, Reply, ReplyKind, Signal,
@@ -253,6 +254,11 @@ const MAX_MANGLED_ADDR: usize = 18;
 /// (`client/LEAPGATE.md` §3.3).
 const MAX_LAN_CANDIDATES: usize = 8;
 static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
+/// ICE sessions of A's signaling connections (contract 05 §3.3.2): registered in A's connection
+/// task, answered from B's, so shared; a std mutex, never held across an `await` (the bare `Mutex`
+/// of this file is tokio's).
+static ICE_SESSIONS: once_cell::sync::Lazy<std::sync::Mutex<ice_signal::Sessions<Sink>>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(ice_signal::Sessions::new()));
 
 // Store punch hole requests. Up to `MAX_PUNCH_REQUESTS` (default 100,000: ~21 MB with 9-digit
 // ids, ~45 MB with 253-byte ones), not counted in the port buffers above; only requests with the
@@ -873,6 +879,10 @@ impl RendezvousServer {
         key: &str,
         ws: bool,
         relay_requests: &mut usize,
+        // The connection completed the KeyExchange.
+        encrypted: bool,
+        // The ICE session this connection registered.
+        ice: &mut Option<[u8; 16]>,
     ) -> bool {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             match msg_in.union {
@@ -1003,10 +1013,170 @@ impl RendezvousServer {
                     });
                     Self::send_to_sink(sink, msg_out).await;
                 }
+                Some(rendezvous_message::Union::LeapgateIce(m)) => {
+                    return self.handle_ice(m, sink, addr, key, ws, encrypted, ice).await;
+                }
                 _ => {}
             }
         }
         false
+    }
+
+    /// `LeapgateIce` (contract 05 §2.3, §3.4.2), on 21116 after the KeyExchange only: anywhere else
+    /// the connection is closed without a reply. Returns whether to keep the connection.
+    async fn handle_ice(
+        &mut self,
+        m: LeapgateIce,
+        sink: &mut Option<Sink>,
+        addr: SocketAddr,
+        key: &str,
+        ws: bool,
+        encrypted: bool,
+        ice: &mut Option<[u8; 16]>,
+    ) -> bool {
+        if !encrypted || ws {
+            return false;
+        }
+        match m.union {
+            // A's OFFER, or its resend on the same connection: the same FORWARD to where B is now.
+            Some(leapgate_ice::Union::Offer(o)) => {
+                if let Some(registered) = *ice {
+                    if o.session[..] == registered {
+                        let resend = ICE_SESSIONS.lock().unwrap().resend(&registered);
+                        if let Some((forward, b_id)) = resend {
+                            if let Some(peer) = self.pm.get_in_memory(&b_id).await {
+                                let to = peer.read().await.socket_addr;
+                                self.send_udp(forward, to);
+                            }
+                        }
+                    }
+                    return true;
+                }
+                let session = o.session.clone();
+                let Err(reason) = self.ice_offer(m.ver, o, sink, addr, key, ice).await else {
+                    return true;
+                };
+                if reason == Reason::BAD {
+                    // Every frame may be one: throttled, no address.
+                    throttled_log!(
+                        Duration::from_secs(60),
+                        warn,
+                        "leapgate ice: OFFER refused: malformed, wrong key or a session in use"
+                    );
+                }
+                Self::send_to_sink(sink, ice_signal::reject(session, reason.into())).await;
+                false
+            }
+            // B's ANSWER: B's filtered candidates and B's signed IdPk to A; looked at before the
+            // session is marked answered, so a refused one is removed, not left to be abandoned.
+            Some(leapgate_ice::Union::Answer(a)) => {
+                let Ok(session) = <[u8; 16]>::try_from(&a.session[..]) else {
+                    return false;
+                };
+                let b_id = ICE_SESSIONS.lock().unwrap().peek_unanswered(&session);
+                let Some(b_id) = b_id else {
+                    return false;
+                };
+                let reply = match ice_signal::check_answer(m.ver, &a, crate::common::now()) {
+                    Err(_) => Err(Reason::BAD),
+                    Ok(params) => {
+                        // Memory only; any non-empty version is signed.
+                        let pk = self.get_pk("ice", b_id).await;
+                        if pk.is_empty() {
+                            Err(Reason::UNSUPPORTED)
+                        } else {
+                            Ok(ice_signal::answer(a.session.clone(), params, pk))
+                        }
+                    }
+                };
+                let (sink, msg) = match reply {
+                    Ok(msg) => (ICE_SESSIONS.lock().unwrap().take_sink_for_answer(&session), msg),
+                    Err(reason) => (
+                        ICE_SESSIONS.lock().unwrap().drop_for_reject(&session),
+                        ice_signal::reject(a.session, reason.into()),
+                    ),
+                };
+                if sink.is_some() {
+                    Self::send_to_sink(&mut { sink }, msg).await;
+                }
+                false
+            }
+            // B's REJECT, passed on to A as it came.
+            Some(leapgate_ice::Union::Reject(r)) if m.ver == ice_signal::ICE_VER => {
+                if let Ok(session) = <[u8; 16]>::try_from(&r.session[..]) {
+                    let sink = ICE_SESSIONS.lock().unwrap().drop_for_reject(&session);
+                    if sink.is_some() {
+                        Self::send_to_sink(&mut { sink }, ice_signal::reject(r.session, r.reason)).await;
+                    }
+                }
+                false
+            }
+            // A's RESULT for its own session, the first only; statistics, recorded in `ice_result`
+            // (§3.7).
+            Some(leapgate_ice::Union::Result(r)) if m.ver == ice_signal::ICE_VER => {
+                if let Some(session) = ice.filter(|s| r.session[..] == s[..]) {
+                    ICE_SESSIONS.lock().unwrap().mark_result(&session);
+                }
+                true
+            }
+            // A FORWARD goes to B only, over UDP.
+            _ => false,
+        }
+    }
+
+    /// §2.4 steps 1~5 for a new OFFER on this connection: on success the session is registered
+    /// (holding A's sink) and the FORWARD queued for B; otherwise the reason to reject with, the
+    /// sink still here.
+    async fn ice_offer(
+        &mut self,
+        ver: u32,
+        o: LeapgateIceOffer,
+        sink: &mut Option<Sink>,
+        addr: SocketAddr,
+        key: &str,
+        ice: &mut Option<[u8; 16]>,
+    ) -> Result<(), Reason> {
+        let (session, params) =
+            ice_signal::check_offer(ver, &o, key, crate::common::now()).map_err(|_| Reason::BAD)?;
+        // Memory only: an online peer is in memory (`update_addr` makes no entry for one that is
+        // not), and connection tasks stay off the database.
+        let peer = self.pm.get_in_memory(&o.id).await.ok_or(Reason::OFFLINE)?;
+        let (peer_addr, elapsed, pk, supports) = {
+            let r = peer.read().await;
+            (
+                r.socket_addr,
+                r.last_reg_time.elapsed().as_millis() as i64,
+                r.pk.clone(),
+                ice_signal::b_supports_ice(r.pinned, r.leapgate_hb.as_ref()),
+            )
+        };
+        if elapsed >= REG_TIMEOUT {
+            return Err(Reason::OFFLINE);
+        }
+        if ice_signal::forced_relay(
+            ALWAYS_USE_RELAY.load(Ordering::SeqCst),
+            self.is_lan(addr),
+            self.is_lan(peer_addr),
+        ) {
+            return Err(Reason::RELAY);
+        }
+        let forward = match &self.state.sk {
+            Some(sk) if supports => {
+                ice_signal::forward(sk, &o.id, &pk, &session, params, crate::common::now())
+            }
+            _ => None,
+        }
+        .ok_or(Reason::UNSUPPORTED)?;
+        let registered =
+            ICE_SESSIONS.lock().unwrap().register(session, sink, forward.clone(), o.id, addr.ip());
+        match registered {
+            Ok(()) => {}
+            Err(ice_signal::Refused::Duplicate) => return Err(Reason::BAD),
+            Err(ice_signal::Refused::Busy) => return Err(Reason::BUSY),
+        }
+        *ice = Some(session);
+        self.send_udp(forward, peer_addr);
+        Ok(())
     }
 
     #[inline]
@@ -1270,7 +1440,8 @@ impl RendezvousServer {
                 })
                 .await;
             let mut relay_server = route.relay;
-            let forced_relay = ALWAYS_USE_RELAY.load(Ordering::SeqCst) || (peer_is_lan ^ is_lan);
+            let forced_relay =
+                ice_signal::forced_relay(ALWAYS_USE_RELAY.load(Ordering::SeqCst), is_lan, peer_is_lan);
             if forced_relay {
                 if peer_is_lan {
                     // https://github.com/rustdesk/rustdesk-server/issues/24
@@ -1753,6 +1924,7 @@ impl RendezvousServer {
     ) -> ResultType<()> {
         let mut sink;
         let mut relay_requests = 0;
+        let mut ice_session: Option<[u8; 16]> = None;
         if ws {
             use tokio_tungstenite::tungstenite::{
                 handshake::server::{Request, Response},
@@ -1783,8 +1955,18 @@ impl RendezvousServer {
             sink = Some(Sink::Ws(a));
             while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
                 if let tungstenite::Message::Binary(bytes) = msg {
+                    // 21118 never encrypts.
                     if !self
-                        .handle_tcp(&bytes, &mut sink, addr, key, ws, &mut relay_requests)
+                        .handle_tcp(
+                            &bytes,
+                            &mut sink,
+                            addr,
+                            key,
+                            ws,
+                            &mut relay_requests,
+                            false,
+                            &mut ice_session,
+                        )
                         .await
                     {
                         break;
@@ -1836,7 +2018,16 @@ impl RendezvousServer {
                     }
                 }
                 if !self
-                    .handle_tcp(&bytes, &mut sink, addr, key, ws, &mut relay_requests)
+                    .handle_tcp(
+                        &bytes,
+                        &mut sink,
+                        addr,
+                        key,
+                        ws,
+                        &mut relay_requests,
+                        dec.is_some(),
+                        &mut ice_session,
+                    )
                     .await
                 {
                     break;
@@ -1845,6 +2036,11 @@ impl RendezvousServer {
         }
         if sink.is_none() {
             self.tcp_punch.lock().await.remove(&try_into_v4(addr));
+        }
+        // The session lives as long as A's signaling connection (contract 05 §2.3); one without a
+        // RESULT is abandoned, recorded in `ice_result` (§3.7).
+        if let Some(session) = ice_session {
+            ICE_SESSIONS.lock().unwrap().close(&session);
         }
         log::debug!("Tcp connection from {:?} closed", addr);
         Ok(())
@@ -2209,7 +2405,12 @@ mod tests {
     impl Harness {
         /// A connection to 21116/TCP, after the key exchange unless `Plain`.
         async fn connect(&self, client: Client) -> FramedStream {
-            let stream = TcpStream::connect(self.addr).await.unwrap();
+            self.connect_at(self.addr, client).await
+        }
+
+        /// `connect` to a listener of its own (`listener_as`).
+        async fn connect_at(&self, addr: SocketAddr, client: Client) -> FramedStream {
+            let stream = TcpStream::connect(addr).await.unwrap();
             let local = stream.local_addr().unwrap();
             let mut conn = FramedStream::from(stream, local);
             if client != Client::Plain {
@@ -3099,17 +3300,448 @@ mod tests {
     }
 
     /// A listener handing every connection to `handle_listener` as if from `from` (`None`: the real
-    /// peer, loopback).
-    async fn listener_as(h: &Harness, from: Option<SocketAddr>, ws: bool) -> SocketAddr {
+    /// peer, loopback), with licence key `key`.
+    async fn listener_as(h: &Harness, from: Option<SocketAddr>, ws: bool, key: &str) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let rs = h.rs.clone();
+        let key = key.to_owned();
         tokio::spawn(async move {
             while let Ok((stream, peer)) = listener.accept().await {
-                rs.handle_listener(stream, from.unwrap_or(peer), "", ws).await;
+                rs.handle_listener(stream, from.unwrap_or(peer), &key, ws).await;
             }
         });
         addr
+    }
+
+    // ---- ICE signaling (contract 05 §6.1). The session table is one for the process and tests run
+    // in parallel: sessions are random, and every test's A comes from a source of its own. ----
+
+    /// B's device key: contract 01's seed, as in the shared vectors (§2.5).
+    fn device_keys() -> (sign::PublicKey, sign::SecretKey) {
+        sign::keypair_from_seed(&sign::Seed([7; 32]))
+    }
+
+    impl Harness {
+        /// B online and able to do ICE: its key pinned, a fresh heartbeat from Leapgate 0.3.1.
+        async fn online_ice(&self, id: &str, addr: &str, pk: &[u8]) {
+            self.online(id, addr).await;
+            let peer = self.rs.pm.get_or(id).await;
+            let mut w = peer.write().await;
+            w.pk = Bytes::copy_from_slice(pk);
+            w.pinned = true;
+            w.leapgate_hb = Some(LeapgateHb {
+                at: Instant::now(),
+                leapgate_ver: 3010,
+            });
+        }
+    }
+
+    fn ice_session() -> Vec<u8> {
+        sodiumoxide::randombytes::randombytes(16)
+    }
+
+    /// A host candidate.
+    fn ice_cand(addr: &str) -> Bytes {
+        ice_signal::encode(&ice_signal::Candidate {
+            kind: 0,
+            local_pref: 0xFFFF,
+            addr: addr.parse().unwrap(),
+        })
+        .into()
+    }
+
+    fn ice_params(cands: &[&str]) -> LeapgateIceParams {
+        LeapgateIceParams {
+            ufrag: "AAAAAAAA".to_owned(),
+            pwd: "a".repeat(24),
+            candidates: cands.iter().map(|c| ice_cand(c)).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn ice_msg(m: leapgate_ice::Union) -> RendezvousMessage {
+        let mut msg = RendezvousMessage::new();
+        msg.set_leapgate_ice(LeapgateIce {
+            ver: 1,
+            union: Some(m),
+            ..Default::default()
+        });
+        msg
+    }
+
+    fn ice_offer(session: &[u8], id: &str, key: &str, params: LeapgateIceParams) -> RendezvousMessage {
+        ice_msg(leapgate_ice::Union::Offer(LeapgateIceOffer {
+            session: Bytes::copy_from_slice(session),
+            id: id.to_owned(),
+            licence_key: key.to_owned(),
+            params: MessageField::some(params),
+            ..Default::default()
+        }))
+    }
+
+    fn ice_answer(session: &[u8], params: LeapgateIceParams) -> RendezvousMessage {
+        ice_msg(leapgate_ice::Union::Answer(LeapgateIceAnswer {
+            session: Bytes::copy_from_slice(session),
+            params: MessageField::some(params),
+            ..Default::default()
+        }))
+    }
+
+    async fn recv_ice(conn: &mut FramedStream) -> leapgate_ice::Union {
+        let Some(rendezvous_message::Union::LeapgateIce(m)) = recv(conn).await.union else {
+            panic!("expected LeapgateIce");
+        };
+        assert_eq!(m.ver, 1);
+        m.union.unwrap()
+    }
+
+    /// The connection is closed by the server (at once, not after the read timeout).
+    async fn ice_closed(conn: &mut FramedStream) {
+        let t = Instant::now();
+        assert!(conn.next_timeout(3000).await.is_none(), "a message instead of the close");
+        assert!(t.elapsed() < Duration::from_millis(2500), "still open");
+    }
+
+    /// Nothing is sent to B within `ms`.
+    async fn nothing_to_b(h: &mut Harness, ms: u64) {
+        assert!(timeout(ms, h.rx.recv()).await.is_err(), "sent to B");
+    }
+
+    /// A FORWARD checked against S's key over B's id and opened with B's device key (§2.5).
+    fn open_forward(h: &Harness, msg: RendezvousMessage, b_id: &str) -> LeapgateIceSealed {
+        let Some(rendezvous_message::Union::LeapgateIce(m)) = msg.union else {
+            panic!("expected LeapgateIce");
+        };
+        assert_eq!(m.ver, 1);
+        let Some(leapgate_ice::Union::Forward(f)) = m.union else {
+            panic!("expected forward");
+        };
+        assert!(f.ts.abs_diff(crate::common::now()) <= 2);
+        let mut signed = b"leapgate-ice-offer-v1\0".to_vec();
+        signed.extend_from_slice(b_id.as_bytes());
+        signed.push(0);
+        signed.extend_from_slice(&f.ts.to_be_bytes());
+        signed.extend_from_slice(&f.sealed);
+        let sig = sign::Signature::from_bytes(&f.sig).unwrap();
+        assert!(sign::verify_detached(&sig, &signed, &h.server_pk), "signature");
+        let (pk, sk) = device_keys();
+        let inner = sodiumoxide::crypto::sealedbox::open(
+            &f.sealed,
+            &sign::to_curve25519_pk(&pk).unwrap(),
+            &sign::to_curve25519_sk(&sk).unwrap(),
+        )
+        .unwrap();
+        LeapgateIceSealed::parse_from_bytes(&inner).unwrap()
+    }
+
+    /// A registered OFFER: B gets the FORWARD (encrypted and signed, A's candidates filtered with
+    /// A's proofs) and A's connection stays for the answer.
+    #[hbb_common::tokio::test]
+    async fn ice_offer_is_forwarded_sealed_and_signed() {
+        let mut h = harness(true, None).await;
+        h.online_ice("B1", "8.8.8.8:5000", &device_keys().0 .0).await;
+        let port = listener_as(&h, Some("198.51.100.31:5000".parse().unwrap()), false, "").await;
+        let mut a = h.connect_at(port, Client::V1).await;
+        let s = ice_session();
+        let cands = [
+            "192.168.1.10:50000",
+            "203.0.113.7:40000",
+            "203.0.113.8:40000",
+            "198.18.0.1:40000",
+            "[2001:db8::1]:40000",
+        ];
+        let mut offer = ice_offer(&s, "B1", "", ice_params(&cands));
+        let proof = ice_stun::seal("203.0.113.7:40000".parse().unwrap(), crate::common::now());
+        offer.mut_leapgate_ice().mut_offer().proofs = vec![proof.into()];
+        a.send(&offer).await.unwrap();
+        let (msg, to) = h.to_b().await;
+        assert_eq!(to, "8.8.8.8:5000".parse().unwrap());
+        let sealed = open_forward(&h, msg, "B1");
+        assert_eq!(sealed.session[..], s[..]);
+        // The public IPv4 without a proof and the TUN address are gone; nothing but the
+        // parameters crosses (no id, key or proofs).
+        let expected = ice_params(&[cands[0], cands[1], cands[4]]);
+        assert_eq!(*sealed.params, expected);
+        drop(a);
+    }
+
+    /// §2.4 step 0: on a connection without the KeyExchange (plain 21116, or 21118) an ICE message
+    /// is not answered and the connection is closed.
+    #[hbb_common::tokio::test]
+    async fn ice_needs_the_key_exchange() {
+        use tungstenite::Message;
+        let mut h = harness(true, None).await;
+        h.online_ice("B1", "8.8.8.8:5000", &device_keys().0 .0).await;
+        let offer = ice_offer(&ice_session(), "B1", "", ice_params(&["192.168.1.10:50000"]));
+        let mut a = h.connect(Client::Plain).await;
+        a.send(&offer).await.unwrap();
+        // The server's KeyExchange offer, then the close.
+        let first = RendezvousMessage::parse_from_bytes(&a.next_timeout(3000).await.unwrap().unwrap()).unwrap();
+        assert!(matches!(first.union, Some(rendezvous_message::Union::KeyExchange(_))));
+        ice_closed(&mut a).await;
+
+        let port = listener_as(&h, None, true, "").await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{port}/")).await.unwrap();
+        ws.send(Message::Binary(offer.write_to_bytes().unwrap().into())).await.unwrap();
+        loop {
+            match timeout(3000, ws.next()).await.expect("the connection is still open") {
+                Some(Ok(Message::Binary(b))) => panic!("answered on 21118: {b:?}"),
+                Some(Ok(_)) => continue,
+                None | Some(Err(_)) => break,
+            }
+        }
+        nothing_to_b(&mut h, 300).await;
+    }
+
+    /// One OFFER on a new connection; the reason of the REJECT that comes back on it, which then
+    /// closes.
+    async fn ice_rejected(h: &Harness, port: SocketAddr, offer: RendezvousMessage) -> Reason {
+        let mut a = h.connect_at(port, Client::V1).await;
+        a.send(&offer).await.unwrap();
+        let leapgate_ice::Union::Reject(r) = recv_ice(&mut a).await else {
+            panic!("expected reject");
+        };
+        let Some(rendezvous_message::Union::LeapgateIce(m)) = offer.union else { unreachable!() };
+        let Some(leapgate_ice::Union::Offer(o)) = m.union else { unreachable!() };
+        assert_eq!(r.session, o.session);
+        ice_closed(&mut a).await;
+        r.reason.enum_value().unwrap()
+    }
+
+    /// §2.4 steps 1, 2 and 4, one branch each: nothing goes to B.
+    #[hbb_common::tokio::test]
+    async fn ice_offer_rejections() {
+        let mut h = harness(true, None).await;
+        let port = listener_as(&h, Some("198.51.100.32:5000".parse().unwrap()), false, "k").await;
+        let pk = device_keys().0 .0;
+        for id in ["B-old", "B-unpinned", "B-stale", "B-version", "B-point", "B1"] {
+            h.online_ice(id, "8.8.8.8:5000", &pk).await;
+        }
+        let peer = |id: &'static str| {
+            let pm = h.rs.pm.clone();
+            async move { pm.get_in_memory(id).await.unwrap() }
+        };
+        peer("B-old").await.write().await.last_reg_time = Instant::now() - Duration::from_millis(REG_TIMEOUT as u64 + 1000);
+        peer("B-unpinned").await.write().await.pinned = false;
+        peer("B-stale").await.write().await.leapgate_hb.as_mut().unwrap().at = Instant::now() - Duration::from_secs(181);
+        peer("B-version").await.write().await.leapgate_hb.as_mut().unwrap().leapgate_ver = 3009;
+        // The small-order identity point: no X25519 key to encrypt to.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        peer("B-point").await.write().await.pk = Bytes::copy_from_slice(&identity);
+
+        let p = || ice_params(&["192.168.1.10:50000"]);
+        let offer = |id: &str| ice_offer(&ice_session(), id, "k", p());
+        for (id, reason) in [
+            ("nobody", Reason::OFFLINE),
+            ("B-old", Reason::OFFLINE),
+            ("B-unpinned", Reason::UNSUPPORTED),
+            ("B-stale", Reason::UNSUPPORTED),
+            ("B-version", Reason::UNSUPPORTED),
+            ("B-point", Reason::UNSUPPORTED),
+        ] {
+            assert_eq!(ice_rejected(&h, port, offer(id)).await, reason, "{id}");
+        }
+        let seventeen: Vec<String> = (1..=17).map(|i| format!("192.168.1.{i}:1")).collect();
+        let seventeen: Vec<&str> = seventeen.iter().map(|s| s.as_str()).collect();
+        for (what, msg) in [
+            ("key", ice_offer(&ice_session(), "B1", "x", p())),
+            ("session", ice_offer(&ice_session()[..15], "B1", "k", p())),
+            ("candidates", ice_offer(&ice_session(), "B1", "k", ice_params(&seventeen))),
+        ] {
+            assert_eq!(ice_rejected(&h, port, msg).await, Reason::BAD, "{what}");
+        }
+        nothing_to_b(&mut h, 300).await;
+        // The same B, all well: forwarded.
+        let mut a = h.connect_at(port, Client::V1).await;
+        a.send(&offer("B1")).await.unwrap();
+        assert_eq!(h.to_b().await.1, "8.8.8.8:5000".parse().unwrap());
+    }
+
+    /// §2.4 step 3: one side inside the LAN mask, the other not: ICE cannot get round the relay.
+    #[hbb_common::tokio::test]
+    async fn ice_offer_rejected_on_forced_relay() {
+        // A (loopback) inside the mask, B outside.
+        let mut h = harness(true, Some("127.0.0.0/8".parse().unwrap())).await;
+        h.online_ice("B1", "8.8.8.8:5000", &device_keys().0 .0).await;
+        let offer = ice_offer(&ice_session(), "B1", "", ice_params(&["192.168.1.10:50000"]));
+        assert_eq!(ice_rejected(&h, h.addr, offer).await, Reason::RELAY);
+        nothing_to_b(&mut h, 300).await;
+    }
+
+    /// §2.4 step 5: a source holds 8 sessions; the 9th is BUSY, and a closed connection frees its
+    /// place. A session in use on another connection is BAD and leaves that one alone.
+    #[hbb_common::tokio::test]
+    async fn ice_sessions_per_source() {
+        let mut h = harness(true, None).await;
+        h.online_ice("B1", "8.8.8.8:5000", &device_keys().0 .0).await;
+        let port = listener_as(&h, Some("198.51.100.33:5000".parse().unwrap()), false, "").await;
+        let other = listener_as(&h, Some("198.51.100.34:5000".parse().unwrap()), false, "").await;
+        let p = || ice_params(&["192.168.1.10:50000"]);
+        let mut held = Vec::new();
+        for _ in 0..8 {
+            let s = ice_session();
+            let mut a = h.connect_at(port, Client::V1).await;
+            a.send(&ice_offer(&s, "B1", "", p())).await.unwrap();
+            h.to_b().await;
+            held.push((a, s));
+        }
+        let busy = ice_offer(&ice_session(), "B1", "", p());
+        assert_eq!(ice_rejected(&h, port, busy).await, Reason::BUSY);
+        let in_use = ice_offer(&held[0].1, "B1", "", p());
+        assert_eq!(ice_rejected(&h, other, in_use).await, Reason::BAD);
+        assert_eq!(ICE_SESSIONS.lock().unwrap().peek_unanswered(&held[0].1[..].try_into().unwrap()).as_deref(), Some("B1"));
+        nothing_to_b(&mut h, 300).await;
+
+        drop(held.pop());
+        let t = Instant::now();
+        loop {
+            let mut a = h.connect_at(port, Client::V1).await;
+            a.send(&ice_offer(&ice_session(), "B1", "", p())).await.unwrap();
+            match recv_or_forward(&mut h, &mut a).await {
+                None => break,
+                Some(reason) => assert_eq!(reason, Reason::BUSY),
+            }
+            assert!(t.elapsed() < Duration::from_secs(3), "the closed connection's place is still taken");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// After an OFFER: `None` when B got a FORWARD, or the reason A was rejected with.
+    async fn recv_or_forward(h: &mut Harness, a: &mut FramedStream) -> Option<Reason> {
+        tokio::select! {
+            m = h.rx.recv() => {
+                m.unwrap();
+                None
+            }
+            m = recv_ice(a) => {
+                let leapgate_ice::Union::Reject(r) = m else { panic!("expected reject") };
+                Some(r.reason.enum_value().unwrap())
+            }
+        }
+    }
+
+    /// §2.3 ②: the same OFFER again on the connection sends the cached FORWARD, byte for byte, to
+    /// B's current address; once only. Another session on the connection is ignored.
+    #[hbb_common::tokio::test]
+    async fn ice_offer_resend() {
+        let mut h = harness(true, None).await;
+        let pk = device_keys().0 .0;
+        h.online_ice("B1", "8.8.8.8:5000", &pk).await;
+        let port = listener_as(&h, Some("198.51.100.35:5000".parse().unwrap()), false, "").await;
+        let mut a = h.connect_at(port, Client::V1).await;
+        let offer = ice_offer(&ice_session(), "B1", "", ice_params(&["192.168.1.10:50000"]));
+        a.send(&offer).await.unwrap();
+        let (first, to) = h.to_b().await;
+        assert_eq!(to, "8.8.8.8:5000".parse().unwrap());
+        // B registers again from elsewhere.
+        h.online("B1", "8.8.4.4:6000").await;
+        a.send(&ice_offer(&ice_session(), "B1", "", ice_params(&["192.168.1.11:50000"]))).await.unwrap();
+        a.send(&offer).await.unwrap();
+        let (second, to) = h.to_b().await;
+        assert_eq!(to, "8.8.4.4:6000".parse().unwrap());
+        assert_eq!(second.write_to_bytes().unwrap(), first.write_to_bytes().unwrap());
+        a.send(&offer).await.unwrap();
+        nothing_to_b(&mut h, 300).await;
+        assert!(a.next_timeout(300).await.is_none(), "nothing for A either");
+    }
+
+    /// One registered session from a source of the test's own: A's connection and the session.
+    async fn ice_registered(h: &mut Harness, from: &str) -> (FramedStream, Vec<u8>) {
+        h.online_ice("B1", "8.8.8.8:5000", &device_keys().0 .0).await;
+        let port = listener_as(h, Some(from.parse().unwrap()), false, "").await;
+        let mut a = h.connect_at(port, Client::V1).await;
+        let s = ice_session();
+        a.send(&ice_offer(&s, "B1", "", ice_params(&["192.168.1.10:50000"]))).await.unwrap();
+        h.to_b().await;
+        (a, s)
+    }
+
+    fn session_key(s: &[u8]) -> [u8; 16] {
+        s.try_into().unwrap()
+    }
+
+    /// §2.3 ④: B's ANSWER, on a connection of B's own, reaches A with B's candidates filtered by
+    /// B's proofs and B's `IdPk` signed by S; B's connection is closed. The session stays,
+    /// answered, until A's connection ends; a second ANSWER and one for an unknown session are
+    /// ignored.
+    #[hbb_common::tokio::test]
+    async fn ice_answer_reaches_a_with_the_signed_pk() {
+        let mut h = harness(true, None).await;
+        let (mut a, s) = ice_registered(&mut h, "198.51.100.36:5000").await;
+        let cands = ["10.0.0.2:1", "203.0.113.9:2", "[fd00::5]:3"];
+        let mut b = h.connect(Client::V1).await;
+        b.send(&ice_answer(&s, ice_params(&cands))).await.unwrap();
+        let leapgate_ice::Union::Answer(ans) = recv_ice(&mut a).await else {
+            panic!("expected answer");
+        };
+        assert_eq!(ans.session[..], s[..]);
+        assert_eq!(*ans.params, ice_params(&[cands[0], cands[2]]));
+        assert!(ans.proofs.is_empty());
+        let signed = sign::verify(&ans.pk, &h.server_pk).expect("signed by S");
+        let id_pk = IdPk::parse_from_bytes(&signed).unwrap();
+        assert_eq!((id_pk.id.as_str(), &id_pk.pk[..]), ("B1", &device_keys().0 .0[..]));
+        ice_closed(&mut b).await;
+
+        for session in [s.clone(), ice_session()] {
+            let mut b = h.connect(Client::V1).await;
+            b.send(&ice_answer(&session, ice_params(&cands))).await.unwrap();
+            ice_closed(&mut b).await;
+        }
+        assert!(a.next_timeout(300).await.is_none(), "nothing more for A");
+        // Still in the table, answered, without a RESULT: what A's close records as abandoned.
+        let closed = ICE_SESSIONS.lock().unwrap().close(&session_key(&s));
+        assert_eq!(closed, Some(("198.51.100.36".parse().unwrap(), "B1".to_owned(), true)));
+    }
+
+    /// §2.3 ④: a malformed ANSWER, or one for a B no longer in memory (no pk to sign), rejects A's
+    /// session and removes it.
+    #[hbb_common::tokio::test]
+    async fn ice_answer_refused() {
+        let mut h = harness(true, None).await;
+        let (mut a, s) = ice_registered(&mut h, "198.51.100.37:5000").await;
+        let mut bad = ice_params(&["10.0.0.2:1"]);
+        bad.candidates.push(Bytes::from_static(&[0; 9]));
+        let mut b = h.connect(Client::V1).await;
+        b.send(&ice_answer(&s, bad)).await.unwrap();
+        let leapgate_ice::Union::Reject(r) = recv_ice(&mut a).await else {
+            panic!("expected reject");
+        };
+        assert_eq!((r.session[..] == s[..], r.reason.enum_value().unwrap()), (true, Reason::BAD));
+        assert!(ICE_SESSIONS.lock().unwrap().close(&session_key(&s)).is_none(), "removed");
+        ice_closed(&mut b).await;
+
+        let (mut a, s) = ice_registered(&mut h, "198.51.100.38:5000").await;
+        h.rs.pm.remove("B1").await;
+        let mut b = h.connect(Client::V1).await;
+        b.send(&ice_answer(&s, ice_params(&["10.0.0.2:1"]))).await.unwrap();
+        let leapgate_ice::Union::Reject(r) = recv_ice(&mut a).await else {
+            panic!("expected reject");
+        };
+        assert_eq!((r.session[..] == s[..], r.reason.enum_value().unwrap()), (true, Reason::UNSUPPORTED));
+        assert!(ICE_SESSIONS.lock().unwrap().close(&session_key(&s)).is_none(), "removed");
+    }
+
+    /// §2.3 ⑤: B's REJECT goes to A as it came, and the session is removed.
+    #[hbb_common::tokio::test]
+    async fn ice_reject_from_b_reaches_a() {
+        let mut h = harness(true, None).await;
+        let (mut a, s) = ice_registered(&mut h, "198.51.100.39:5000").await;
+        let mut b = h.connect(Client::V1).await;
+        b.send(&ice_msg(leapgate_ice::Union::Reject(LeapgateIceReject {
+            session: Bytes::copy_from_slice(&s),
+            reason: Reason::UNSUPPORTED.into(),
+            ..Default::default()
+        })))
+        .await
+        .unwrap();
+        let leapgate_ice::Union::Reject(r) = recv_ice(&mut a).await else {
+            panic!("expected reject");
+        };
+        assert_eq!((r.session[..] == s[..], r.reason.enum_value().unwrap()), (true, Reason::UNSUPPORTED));
+        ice_closed(&mut b).await;
+        assert!(ICE_SESSIONS.lock().unwrap().close(&session_key(&s)).is_none(), "removed");
     }
 
     /// Review C-28/C-2: 21118 reads a message of `MAX_FRAME` bytes and closes the connection on a
@@ -3119,7 +3751,7 @@ mod tests {
     async fn ws_message_and_handshake_limits() {
         use tungstenite::Message;
         let h = harness(true, None).await;
-        let port = listener_as(&h, None, true).await;
+        let port = listener_as(&h, None, true, "").await;
         let mut msg = punch_request("nobody");
         let mut n = MAX_FRAME - 200;
         let bytes = loop {
@@ -3207,7 +3839,7 @@ mod tests {
     async fn per_source_limit_at_the_listeners() {
         let h = harness(true, None).await;
         for ws in [false, true] {
-            let port = listener_as(&h, Some("198.51.100.9:5000".parse().unwrap()), ws).await;
+            let port = listener_as(&h, Some("198.51.100.9:5000".parse().unwrap()), ws, "").await;
             let mut held = Vec::new();
             for _ in 0..MAX_CONNS_PER_SOURCE {
                 let mut s = TcpStream::connect(port).await.unwrap();

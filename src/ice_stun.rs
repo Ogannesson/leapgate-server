@@ -98,7 +98,6 @@ pub fn seal(addr: SocketAddr, now: u64) -> Vec<u8> {
 
 /// The address in a proof this process issued within `PROOF_TTL_SECS` and whose MAC matches;
 /// `None` for anything else.
-#[allow(dead_code)] // read by the OFFER/ANSWER checks (contract 05 §3.3), in the next commit
 pub fn open(proof: &[u8], now: u64) -> Option<SocketAddr> {
     open_with(&PROOF_KEY, proof, now)
 }

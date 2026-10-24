@@ -12,6 +12,7 @@ mod config;
 mod conn_limit;
 mod conn_tracker;
 mod crypto;
+mod ice_signal;
 mod ice_stun;
 mod import;
 mod kx;
