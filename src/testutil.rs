@@ -192,3 +192,12 @@ pub(crate) async fn send(
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     (status, ct, body)
 }
+
+/// Bytes of a hex string, for vectors shared with the client's tests.
+pub(crate) fn unhex(s: &str) -> Vec<u8> {
+    assert_eq!(s.len() % 2, 0, "{s}");
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
+}

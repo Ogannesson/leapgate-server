@@ -1,5 +1,6 @@
 use crate::common::*;
 use crate::conn_limit::ConnLimiter;
+use crate::ice_stun;
 use crate::conn_tracker::{
     clip, source_key, PunchRequest, RelayRequest, RelayResponseInfo, Reply, ReplyKind, Signal,
 };
@@ -109,20 +110,34 @@ const PEER_IDLE_EVICT: Duration = Duration::from_secs(24 * 3600);
 /// every device misses: 1,000 come back at once, more within seconds.
 const LOOKUPS_PER_SEC: f64 = 200.0;
 const LOOKUP_BURST: f64 = 1000.0;
+/// STUN Binding answers from all sources together (contract 05 §2.11): at most ~148 KB/s reflected
+/// (IPv6 with headers), each answer smaller than its request. When it is used up, nobody gets a
+/// mapped address or a proof for that moment and ICE is left with host candidates (§9 item 11).
+const STUN_PER_SEC: f64 = 1000.0;
+const STUN_BURST: f64 = 1000.0;
 
-/// A token bucket of `LOOKUPS_PER_SEC`, holding at most `LOOKUP_BURST`.
+/// A token bucket of `rate` a second, holding at most `burst`.
 #[derive(Clone)]
 struct LookupBudget {
     tokens: f64,
     at: Instant,
+    rate: f64,
+    burst: f64,
 }
 
 impl LookupBudget {
-    fn new() -> Self {
+    fn with(rate: f64, burst: f64) -> Self {
         Self {
-            tokens: LOOKUP_BURST,
+            tokens: burst,
             at: Instant::now(),
+            rate,
+            burst,
         }
+    }
+
+    /// The `RegisterPk` lookup budget.
+    fn new() -> Self {
+        Self::with(LOOKUPS_PER_SEC, LOOKUP_BURST)
     }
 
     fn take(&mut self) -> bool {
@@ -130,8 +145,8 @@ impl LookupBudget {
     }
 
     fn take_at(&mut self, now: Instant) -> bool {
-        let earned = now.saturating_duration_since(self.at).as_secs_f64() * LOOKUPS_PER_SEC;
-        self.tokens = (self.tokens + earned).min(LOOKUP_BURST);
+        let earned = now.saturating_duration_since(self.at).as_secs_f64() * self.rate;
+        self.tokens = (self.tokens + earned).min(self.burst);
         self.at = now;
         if self.tokens < 1.0 {
             return false;
@@ -291,6 +306,8 @@ pub struct RendezvousServer {
     new_ids: (Instant, u32),
     /// `LOOKUPS_PER_SEC`, a plain field for the same reason.
     lookups: LookupBudget,
+    /// `STUN_PER_SEC`: STUN is answered in `io_loop` only, too.
+    stun: LookupBudget,
 }
 
 enum LoopFailure {
@@ -361,6 +378,7 @@ impl RendezvousServer {
             conns: Default::default(),
             new_ids: (Instant::now(), 0),
             lookups: LookupBudget::new(),
+            stun: LookupBudget::with(STUN_PER_SEC, STUN_BURST),
         };
         log::info!("mask: {:?}", rs.inner.mask);
         log::info!("local-ip: {:?}", rs.inner.local_ip);
@@ -559,6 +577,12 @@ impl RendezvousServer {
         socket: &mut FramedSocket,
         key: &str,
     ) -> ResultType<()> {
+        // STUN before protobuf (contract 05 §2.9.2): a protobuf message starts with a field tag,
+        // never 0x00 or 0x01; the top-two-bits rule of STUN would also take `RegisterPeer` (0x32).
+        if bytes.len() >= 20 && (bytes[0] == 0x00 || bytes[0] == 0x01) && bytes[4..8] == ice_stun::STUN_MAGIC {
+            self.handle_stun(bytes, addr, socket).await;
+            return Ok(());
+        }
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             match msg_in.union {
                 Some(rendezvous_message::Union::RegisterPeer(rp)) => {
@@ -811,6 +835,33 @@ impl RendezvousServer {
             }
         }
         Ok(())
+    }
+
+    /// A STUN message on 21116/UDP (contract 05 §2.9.3, §3.4.3): a Binding request of at least
+    /// 100 bytes gets the source's address and a proof of it, within `STUN_PER_SEC`; anything else
+    /// is dropped. No lookup and nothing awaited but the send. A failed send is only logged: an
+    /// error out of `handle_udp` would make `io_loop` rebuild the whole socket.
+    async fn handle_stun(&mut self, bytes: &[u8], addr: SocketAddr, socket: &mut FramedSocket) {
+        let Some(txid) = ice_stun::parse_binding_request(bytes) else {
+            return;
+        };
+        if !self.stun.take() {
+            throttled_log!(
+                Duration::from_secs(60),
+                warn,
+                "leapgate ice: over {} STUN Binding requests a second, dropped some",
+                STUN_PER_SEC
+            );
+            return;
+        }
+        // A dual-stack socket reports IPv4 sources as `::ffff:a.b.c.d`; the answer and the proof
+        // carry the IPv4 address, the datagram goes back to `addr` as received.
+        let src = try_into_v4(addr);
+        let proof = ice_stun::seal(src, crate::common::now());
+        let resp = ice_stun::binding_response(&txid, src, &proof);
+        if let FramedSocket::Direct(f) = socket {
+            allow_err!(f.send((Bytes::from(resp), addr)).await);
+        }
     }
 
     #[inline]
@@ -2136,6 +2187,7 @@ mod tests {
             conns,
             new_ids: (Instant::now(), 0),
             lookups: LookupBudget::new(),
+            stun: LookupBudget::with(STUN_PER_SEC, STUN_BURST),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2969,6 +3021,81 @@ mod tests {
         assert_eq!((0..2000).filter(|_| b.take_at(t0)).count(), LOOKUP_BURST as usize);
         let t1 = t0 + Duration::from_millis(100);
         assert_eq!((0..2000).filter(|_| b.take_at(t1)).count(), (LOOKUPS_PER_SEC / 10.0) as usize);
+    }
+
+    /// Contract 05 §3.2.1: STUN has a bucket of its own, a burst of 1,000 and then 1,000 a second
+    /// (the lookup budget keeps its values, above).
+    #[test]
+    fn stun_budget_is_a_bucket_of_its_own() {
+        let mut b = LookupBudget::with(STUN_PER_SEC, STUN_BURST);
+        let t0 = b.at;
+        assert_eq!((0..3000).filter(|_| b.take_at(t0)).count(), 1000);
+        let t1 = t0 + Duration::from_millis(100);
+        assert_eq!((0..3000).filter(|_| b.take_at(t1)).count(), 100);
+    }
+
+    /// The client's Binding request (contract 05 §2.9.3, the shared vector) at `len` bytes: the
+    /// length field follows, PADDING makes up the rest.
+    fn stun_request(len: usize) -> BytesMut {
+        let mut r = crate::testutil::unhex("000100502112a4420102030400060708090a0b0c0026004c");
+        r[2..4].copy_from_slice(&((len - 20) as u16).to_be_bytes());
+        r[22..24].copy_from_slice(&((len - 24) as u16).to_be_bytes());
+        r.resize(len, 0);
+        BytesMut::from(&r[..])
+    }
+
+    /// The mapped address (an IPv4 one) and the proof of the answer to `stun_request`.
+    async fn stun_reply(client: &mut FramedSocket) -> Option<(SocketAddr, Vec<u8>)> {
+        let (b, _) = client.next_timeout(500).await?.unwrap();
+        assert_eq!(b[..4], [0x01, 0x01, 0x00, (b.len() - 20) as u8]);
+        assert_eq!(b[4..20], crate::testutil::unhex("2112a4420102030400060708090a0b0c")[..]);
+        assert_eq!(b[20..26], [0x00u8, 0x20, 0x00, 0x08, 0x00, 0x01]);
+        let port = u16::from_be_bytes([b[26], b[27]]) ^ 0x2112;
+        let ip: [u8; 4] = std::array::from_fn(|i| b[28 + i] ^ ice_stun::STUN_MAGIC[i]);
+        assert_eq!(b[32..36], [0xc1u8, 0xe9, 0x00, 28]);
+        Some((SocketAddr::new(Ipv4Addr::from(ip).into(), port), b[36..64].to_vec()))
+    }
+
+    /// Contract 05 §6.1: Binding requests of 100 bytes and more are answered with the source's
+    /// address and a proof that opens to it; shorter ones, a wrong cookie and an empty bucket get
+    /// nothing.
+    #[hbb_common::tokio::test]
+    async fn stun_binding_requests_are_answered_with_a_proof() {
+        let mut h = harness(true, None).await;
+        let mut server = FramedSocket::new("127.0.0.1:0").await.unwrap();
+        let mut client = FramedSocket::new("127.30.0.1:0").await.unwrap();
+        let from = client.local_addr().unwrap();
+        h.rs.handle_udp(&stun_request(100), from, &mut server, "").await.unwrap();
+        let (mapped, proof) = stun_reply(&mut client).await.unwrap();
+        assert_eq!(mapped, from);
+        assert_eq!(ice_stun::open(&proof, crate::common::now()), Some(from));
+
+        h.rs.handle_udp(&stun_request(96), from, &mut server, "").await.unwrap();
+        assert_eq!(stun_reply(&mut client).await, None, "under 100 bytes");
+        let mut bad = stun_request(100);
+        bad[7] ^= 1;
+        h.rs.handle_udp(&bad, from, &mut server, "").await.unwrap();
+        assert_eq!(stun_reply(&mut client).await, None, "cookie");
+        // Empty, and stamped a second ahead: nothing is earned however long this thread pauses.
+        h.rs.stun.tokens = 0.0;
+        h.rs.stun.at = Instant::now() + Duration::from_secs(1);
+        h.rs.handle_udp(&stun_request(100), from, &mut server, "").await.unwrap();
+        assert_eq!(stun_reply(&mut client).await, None, "bucket");
+    }
+
+    /// Contract 05 §2.8, §3.4.3: on a dual-stack socket an IPv4 source arrives as `::ffff:a.b.c.d`;
+    /// the answer goes back to it there and carries (and proves) the plain IPv4 address.
+    #[hbb_common::tokio::test]
+    async fn stun_maps_v4_mapped_sources_back_to_ipv4() {
+        let mut h = harness(true, None).await;
+        let mut server = FramedSocket::new("[::]:0").await.unwrap();
+        let mut client = FramedSocket::new("127.30.0.2:0").await.unwrap();
+        let v4 = client.local_addr().unwrap();
+        let from: SocketAddr = format!("[::ffff:{}]:{}", v4.ip(), v4.port()).parse().unwrap();
+        h.rs.handle_udp(&stun_request(100), from, &mut server, "").await.unwrap();
+        let (mapped, proof) = stun_reply(&mut client).await.unwrap();
+        assert_eq!(mapped, v4);
+        assert_eq!(ice_stun::open(&proof, crate::common::now()), Some(v4));
     }
 
     /// A listener handing every connection to `handle_listener` as if from `from` (`None`: the real
