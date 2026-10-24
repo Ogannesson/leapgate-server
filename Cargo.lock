@@ -2104,6 +2104,46 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "830d08ce1d1d941e6b30645f1a0eb5643013d835ce3779a5fc208261dbe10f55"
 
 [[package]]
+name = "leapgate-server"
+version = "1.1.17"
+dependencies = [
+ "argon2",
+ "async-speed-limit",
+ "async-trait",
+ "axum",
+ "base64 0.13.0",
+ "bcrypt",
+ "chrono",
+ "clap 2.34.0",
+ "dns-lookup",
+ "flate2",
+ "flexi_logger 0.22.3",
+ "hbb_common",
+ "hyper 1.12.0",
+ "hyper-util",
+ "ipnetwork 0.20.0",
+ "lazy_static",
+ "local-ip-address",
+ "maxminddb",
+ "md-5",
+ "once_cell",
+ "reqwest",
+ "rust-ini",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "sha2",
+ "sodiumoxide",
+ "sqlx",
+ "tempfile",
+ "tokio-tungstenite",
+ "toml 0.7.8",
+ "tower",
+ "tungstenite",
+ "uuid",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2731,46 +2771,6 @@ dependencies = [
  "cpufeatures",
  "opaque-debug",
  "universal-hash",
-]
-
-[[package]]
-name = "leapgate-server"
-version = "1.1.17"
-dependencies = [
- "argon2",
- "async-speed-limit",
- "async-trait",
- "axum",
- "base64 0.13.0",
- "bcrypt",
- "chrono",
- "clap 2.34.0",
- "dns-lookup",
- "flate2",
- "flexi_logger 0.22.3",
- "hbb_common",
- "hyper 1.12.0",
- "hyper-util",
- "ipnetwork 0.20.0",
- "lazy_static",
- "local-ip-address",
- "maxminddb",
- "md-5",
- "once_cell",
- "reqwest",
- "rust-ini",
- "serde",
- "serde_derive",
- "serde_json",
- "sha2",
- "sodiumoxide",
- "sqlx",
- "tempfile",
- "tokio-tungstenite",
- "toml 0.7.8",
- "tower",
- "tungstenite",
- "uuid",
 ]
 
 [[package]]
