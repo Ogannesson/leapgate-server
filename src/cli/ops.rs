@@ -377,6 +377,16 @@ async fn stats(db: &SqlitePool, days: i64) -> ResultType<String> {
         .map(|(outcome, n)| vec![outcome, n.to_string()])
         .collect();
     out += &table(&["OUTCOME", "COUNT"], &rows);
+    // Contract 05 §3.8: the self-built ICE's own results.
+    out += &format!("\nICE results recorded in the last {days} day(s):\n");
+    let rows: Vec<Vec<String>> = s
+        .ice_outcomes
+        .into_iter()
+        .map(|(outcome, n)| vec![outcome, n.to_string()])
+        .collect();
+    out += &table(&["ICE OUTCOME", "COUNT"], &rows);
+    out += "Connections ICE won are still counted above as relay/direct_tcp, by the upstream signaling, \
+            so the relay fallback rate above reads high; ICE's actual direct connections are its 'connected' here.\n";
     Ok(out)
 }
 
@@ -675,5 +685,25 @@ mod tests {
         for bad in [&["stats", "--days", "0"][..], &["stats", "--days", "x"], &["stats", "extra"]] {
             assert!(cli(&ctx, bad, "").await.is_err(), "{bad:?}");
         }
+    }
+
+    /// Contract 05 §3.8: the ICE results are counted in a table of their own, with the caveat.
+    #[tokio::test]
+    async fn stats_counts_ice_results() {
+        let (_dir, ctx) = ctx(NO_CONSOLE).await;
+        let now = crate::common::now() as i64 * 1000;
+        for (outcome, at) in [("connected", now - 1_000), ("connected", now - 2_000), ("abandoned", now - 3_000), ("no_pair", 0)] {
+            sqlx::query("insert into ice_result(at, a_ip, b_id, outcome) values(?, '1.2.3.4', 'B1', ?)")
+                .bind(at)
+                .bind(outcome)
+                .execute(&ctx.db)
+                .await
+                .unwrap();
+        }
+        let out = cli(&ctx, &["stats", "--days", "1"], "").await.unwrap();
+        let (_, ice) = out.split_once("ICE OUTCOME").unwrap_or_else(|| panic!("{out}"));
+        let lines: Vec<&str> = ice.lines().collect();
+        assert_eq!(lines[1..3], ["abandoned    1", "connected    2"], "{out}");
+        assert!(lines[3].contains("relay fallback rate above reads high"), "{out}");
     }
 }

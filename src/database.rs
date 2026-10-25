@@ -330,6 +330,44 @@ mod tests {
         assert_eq!(row, ("geo".to_owned(), None, None));
     }
 
+    // Migration 0006 (phase 3 contract 05, P-A) on a database at 0005 with connection records: the
+    // `ice_result` table is added, `conn_attempt` kept.
+    #[tokio::test]
+    async fn migration_0006_on_a_0005_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite3");
+        let url = path.to_str().unwrap();
+        {
+            let opt = sqlx::sqlite::SqliteConnectOptions::new().filename(url).create_if_missing(true);
+            let pool = sqlx::SqlitePool::connect_with(opt).await.unwrap();
+            let mut at_0005 = sqlx::migrate!("./migrations");
+            at_0005.migrations = at_0005.migrations.iter().filter(|m| m.version < 6).cloned().collect::<Vec<_>>().into();
+            at_0005.run(&pool).await.unwrap();
+            sqlx::query(
+                "insert into conn_attempt(started_at, a_ip, a_port, via, b_id, conn_type, a_nat_type, a_force_relay,
+                   a_has_v6, signal, server_forced_relay, route_reason, route_a_ms)
+                 values(1, '1.2.3.4', 1, 'tcp', '123456', 0, 0, 0, 0, 'punch_hole', 0, 'rtt_a', 12.5)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+        }
+        let pool = super::open(url, true).await.unwrap();
+        let row: (String, Option<f64>) =
+            sqlx::query_as("select route_reason, route_a_ms from conn_attempt").fetch_one(&pool).await.unwrap();
+        assert_eq!(row, ("rtt_a".to_owned(), Some(12.5)));
+        sqlx::query("insert into ice_result(at, a_ip, b_id, outcome) values(1, '1.2.3.4', '123456', 'abandoned')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let index: i64 = sqlx::query_scalar("select count(*) from sqlite_master where type = 'index' and name = 'idx_ice_at'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(index, 1);
+    }
+
     // Review D-11: both pools cut the WAL back on restart and leave checkpoints to
     // `spawn_checkpoints`, whose `checkpoint` truncates it to zero bytes without losing what it held.
     #[tokio::test]

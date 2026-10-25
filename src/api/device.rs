@@ -457,9 +457,9 @@ pub(crate) async fn touch(
     }
 }
 
-/// Features of this server the Leapgate client may use (response `features`); block 04 adds
-/// `"udp-punch"`.
-const LEAPGATE_FEATURES: &[&str] = &[];
+/// Features of this server the Leapgate client may use (response `features`); block 05 (self-built
+/// ICE) adds `"ice"`, announced with or without the rendezvous private key (contract 05 §2.12).
+const LEAPGATE_FEATURES: &[&str] = &["ice"];
 
 /// `POST /api/leapgate/v1/heartbeat` body (contract 01 §2.3, 02 §2.2); absent keys are absent values.
 /// The id comes from the signature (`SignedBody`). `conns` is not used.
@@ -1360,7 +1360,7 @@ mod tests {
         };
 
         let rr = t.state.router.routing().0;
-        // No row yet: sysinfo wanted, every option pushed; signed, `features` empty, `time` now.
+        // No row yet: sysinfo wanted, every option pushed; signed, `features` ICE, `time` now.
         let r = hb(leapgate_body(0, rr, None, Some("")).0).await;
         assert_eq!(r.status, StatusCode::OK);
         assert_eq!(r.headers["content-type"], "application/json; charset=utf-8");
@@ -1369,7 +1369,7 @@ mod tests {
         let rev = v["strategy"]["rev"].as_i64().unwrap();
         assert_eq!(rev, crate::strategy::effective(db, "leapgate1").await.unwrap().0);
         assert_eq!(v["strategy"]["options"], json!({"relay-server": ""}));
-        assert_eq!((&v["api"], &v["features"], &v["need_sysinfo"]), (&json!(1), &json!([]), &json!(true)));
+        assert_eq!((&v["api"], &v["features"], &v["need_sysinfo"]), (&json!(1), &json!(["ice"]), &json!(true)));
         assert!((v["time"].as_i64().unwrap() - crate::common::now() as i64).abs() <= 2);
         assert_eq!(device_row(db, "leapgate1").await, (String::new(), String::new(), "leapgate".into(), 1005010));
 

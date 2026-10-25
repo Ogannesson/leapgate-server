@@ -100,14 +100,13 @@ pub(crate) struct Peer {
     /// database, which alone decides (`Database::update_pk`); this one only saves a write bound to fail.
     pub(crate) pinned: bool,
     /// The last signed Leapgate heartbeat (`api::device::leapgate_heartbeat`), memory only: gone with the
-    /// entry, written again by the next heartbeat. Read by the UDP punch work (phase 3 block 04).
-    #[allow(dead_code)]
+    /// entry, written again by the next heartbeat. Read by ICE to tell whether the controlled side
+    /// supports it (`ice_signal::b_supports_ice`, LEAPGATE.md §6 item 10).
     pub(crate) leapgate_hb: Option<LeapgateHb>,
 }
 
 /// A signed Leapgate heartbeat: when, and the Leapgate version it reported (`get_version_number` of the
 /// client's `libs/leapgate` version, 0 when unreadable).
-#[allow(dead_code)]
 pub(crate) struct LeapgateHb {
     pub at: Instant,
     pub leapgate_ver: u32,

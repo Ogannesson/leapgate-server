@@ -55,6 +55,8 @@ maxminddb = { version = "0.32.0", features = ["mmap"] }
 # Same major as hbb_common's, so no second copy is built.
 toml = "0.7"
 flate2 = "1"
+# STUN FINGERPRINT (src/ice_stun.rs); already in the tree through flate2.
+crc32fast = "1"
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 # https://github.com/rustdesk/rustdesk-server-pro/issues/189, using native-tls for better tls support
