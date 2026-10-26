@@ -933,7 +933,8 @@ impl RendezvousServer {
                             relay_server: rf.relay_server,
                             secure: rf.secure,
                             conn_type: rf.conn_type,
-                            token: rf.token,
+                            // Not the token: it is A's API login and no client reads it on B's
+                            // side (phase 4 decision A3); the tracker above keeps it for the log.
                             switch_code: rf.switch_code,
                             ..Default::default()
                         });
@@ -3895,7 +3896,8 @@ mod tests {
     }
 
     /// Review C-13: a connection's `RequestRelay`s are forwarded with their strings cut and without
-    /// the licence key, up to `MAX_RELAY_REQUESTS`; the next one closes the connection.
+    /// the licence key or A's token (phase 4 decision A3), up to `MAX_RELAY_REQUESTS`; the next one
+    /// closes the connection.
     #[hbb_common::tokio::test]
     async fn relay_requests_cut_and_capped() {
         let mut h = harness(false, None).await;
@@ -3923,10 +3925,10 @@ mod tests {
                 panic!("#{i}: expected RequestRelay");
             };
             assert_eq!(
-                (rr.uuid.len(), rr.token.len(), rr.switch_code.len(), rr.relay_server.len()),
-                (MAX_RELAY_TEXT, MAX_RELAY_TEXT, MAX_RELAY_TEXT, MAX_PEER_ID_LEN)
+                (rr.uuid.len(), rr.switch_code.len(), rr.relay_server.len()),
+                (MAX_RELAY_TEXT, MAX_RELAY_TEXT, MAX_PEER_ID_LEN)
             );
-            assert!(rr.licence_key.is_empty() && rr.secure);
+            assert!(rr.token.is_empty() && rr.licence_key.is_empty() && rr.secure);
             assert_eq!(AddrMangle::decode(&rr.socket_addr), local);
         }
         let mut buf = [0u8; 1];
