@@ -3343,6 +3343,7 @@ mod tests {
             w.leapgate_hb = Some(LeapgateHb {
                 at: Instant::now(),
                 leapgate_ver: 3010,
+                exit: false,
             });
         }
     }

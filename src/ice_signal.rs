@@ -15,7 +15,6 @@ use sodiumoxide::crypto::{sealedbox, sign};
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    time::Duration,
 };
 
 pub(crate) use leapgate_ice_reject::Reason;
@@ -34,8 +33,6 @@ const UFRAG_LEN: std::ops::RangeInclusive<usize> = 4..=32;
 const PWD_LEN: std::ops::RangeInclusive<usize> = 22..=64;
 /// `get_version_number("0.3.1")`: the first `libs/leapgate` with ICE (§2.12).
 const ICE_MIN_LEAPGATE_VER: u32 = 3010;
-/// A signed heartbeat this recent: one is due every 15 seconds, backing off to 60 on failures.
-const ICE_HB_FRESH: Duration = Duration::from_secs(180);
 /// Sessions in the table per source (`source_key`), answered ones included (§2.4 step 5).
 const ICE_SESSIONS_PER_SOURCE: u8 = 8;
 /// FORWARDs per session: the first and one resend (§2.3 ②).
@@ -217,7 +214,8 @@ pub fn check_answer(ver: u32, a: &LeapgateIceAnswer, now: u64) -> Result<Leapgat
 /// §2.4 step 4 as far as the peer entry tells: a fresh signed heartbeat from a Leapgate with ICE,
 /// and a pinned key to encrypt to (an unpinned one may be anybody's who registered B's id first).
 pub fn b_supports_ice(pinned: bool, hb: Option<&LeapgateHb>) -> bool {
-    pinned && hb.is_some_and(|hb| hb.at.elapsed() < ICE_HB_FRESH && hb.leapgate_ver >= ICE_MIN_LEAPGATE_VER)
+    pinned
+        && hb.is_some_and(|hb| hb.at.elapsed() < crate::peer::LEAPGATE_HB_FRESH && hb.leapgate_ver >= ICE_MIN_LEAPGATE_VER)
 }
 
 /// The punch path's forced relay (`ALWAYS_USE_RELAY`, or one side inside the LAN mask and the other
@@ -472,7 +470,7 @@ impl<S> Sessions<S> {
 mod tests {
     use super::*;
     use crate::testutil::unhex;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     // The vectors the client's tests share (contract 05 §2.5, §2.6), byte for byte.
     const C1: &str = "00ffff04c0a8010ac350";
@@ -734,6 +732,7 @@ mod tests {
         let hb = |age: u64, ver: u32| LeapgateHb {
             at: Instant::now().checked_sub(Duration::from_secs(age)).unwrap(),
             leapgate_ver: ver,
+            exit: false,
         };
         assert!(b_supports_ice(true, Some(&hb(0, ICE_MIN_LEAPGATE_VER))));
         assert!(b_supports_ice(true, Some(&hb(170, 4000))));

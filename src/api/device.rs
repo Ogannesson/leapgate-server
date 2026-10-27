@@ -459,7 +459,8 @@ pub(crate) async fn touch(
 
 /// Features of this server the Leapgate client may use (response `features`); block 05 (self-built
 /// ICE) adds `"ice"`, announced with or without the rendezvous private key (contract 05 §2.12).
-const LEAPGATE_FEATURES: &[&str] = &["ice"];
+/// `"exit"` (phase 4): this server has the exit directory `/api/leapgate/user/v1/exits`.
+const LEAPGATE_FEATURES: &[&str] = &["ice", "exit"];
 
 /// `POST /api/leapgate/v1/heartbeat` body (contract 01 §2.3, 02 §2.2); absent keys are absent values.
 /// The id comes from the signature (`SignedBody`). `conns` is not used.
@@ -485,6 +486,9 @@ struct LeapgateHeartbeatReq {
     /// The client's latest round of relay measurements; any JSON here, a bad one only drops the
     /// round (`Router::record_probes`), never the heartbeat.
     probes: Option<serde_json::Value>,
+    /// Phase 4: the device accepts exit logins now (`LeapgateHb::exit`); absent = false.
+    #[serde(default)]
+    exit: bool,
 }
 
 #[derive(Serialize)]
@@ -546,6 +550,7 @@ pub(crate) async fn leapgate_heartbeat(State(state): State<AppState>, signed: Si
     signed.peer.write().await.leapgate_hb = Some(LeapgateHb {
         at: Instant::now(),
         leapgate_ver,
+        exit: req.exit,
     });
     // Under the verified id: nobody can report measurements for another device.
     match &req.probes {
@@ -1369,7 +1374,7 @@ mod tests {
         let rev = v["strategy"]["rev"].as_i64().unwrap();
         assert_eq!(rev, crate::strategy::effective(db, "leapgate1").await.unwrap().0);
         assert_eq!(v["strategy"]["options"], json!({"relay-server": ""}));
-        assert_eq!((&v["api"], &v["features"], &v["need_sysinfo"]), (&json!(1), &json!(["ice"]), &json!(true)));
+        assert_eq!((&v["api"], &v["features"], &v["need_sysinfo"]), (&json!(1), &json!(["ice", "exit"]), &json!(true)));
         assert!((v["time"].as_i64().unwrap() - crate::common::now() as i64).abs() <= 2);
         assert_eq!(device_row(db, "leapgate1").await, (String::new(), String::new(), "leapgate".into(), 1005010));
 
@@ -1459,6 +1464,36 @@ mod tests {
         // An unreadable version is 0.
         dev.post(&t.app, "heartbeat", json!({"leapgate": "x", "ver": 2}).to_string().as_bytes()).await;
         assert_eq!(peer.read().await.leapgate_hb.as_ref().unwrap().leapgate_ver, 0);
+    }
+
+    /// Phase 4 contract 01 §2.1: `exit` absent is false; each heartbeat replaces the record; a
+    /// non-boolean one is a 400 that leaves the record alone.
+    #[tokio::test]
+    async fn leapgate_heartbeat_exit() {
+        let t = testutil::app().await;
+        let dev = testutil::leapgate_device(&t.state, "leapgate5", UUID).await;
+        let exit = || async {
+            let p = t.state.pm.get_in_memory("leapgate5").await.unwrap();
+            let p = p.read().await;
+            p.leapgate_hb.as_ref().unwrap().exit
+        };
+        for (body, want) in [
+            (json!({"ver": 1}), false),
+            (json!({"ver": 2, "exit": true}), true),
+            (json!({"ver": 3, "exit": false}), false),
+            (json!({"ver": 4, "exit": true}), true),
+            (json!({"ver": 5}), false),
+            (json!({"ver": 6, "exit": true}), true),
+        ] {
+            let r = dev.post(&t.app, "heartbeat", body.to_string().as_bytes()).await;
+            assert_eq!(r.status, StatusCode::OK, "{body}");
+            assert_eq!(exit().await, want, "{body}");
+        }
+        for bad in [json!({"ver": 7, "exit": "yes"}), json!({"ver": 8, "exit": 1}), json!({"ver": 9, "exit": null})] {
+            let r = dev.post(&t.app, "heartbeat", bad.to_string().as_bytes()).await;
+            assert_eq!((r.status, &r.json()["error"]), (StatusCode::BAD_REQUEST, &json!("bad_request")), "{bad}");
+            assert!(exit().await, "{bad}");
+        }
     }
 
     /// Contract 02 §3.4: `routing` when the client's `routing_rev` is not the server's; `probes` are

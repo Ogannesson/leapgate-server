@@ -15,7 +15,7 @@ use serde_derive::Serialize;
 use std::time::Duration;
 
 /// Same as hbbs' `REG_TIMEOUT`: online = registered within the last 30 seconds (note 02 §2.5).
-const ONLINE_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const ONLINE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Ids of the users a non-admin sees; binds the current user's id twice.
 const VISIBLE_USERS: &str = "select ? union select m2.user_id from group_member m1
