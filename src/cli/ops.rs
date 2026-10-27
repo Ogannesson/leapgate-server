@@ -58,6 +58,12 @@ pub(super) async fn exec(ctx: &Ctx, cmd: &str, mut args: Args) -> ResultType<Str
                 format!("{device} uses relay {pin} as the controlled side from its next connection\n")
             })
         }
+        ("device", "owner") => {
+            let device = args.next("device id")?;
+            let user = args.next("user name or none")?;
+            args.finish()?;
+            device_owner(db, &device, &user).await
+        }
         ("device", "key") => {
             let first = args.next("device id or reset")?;
             if first != "reset" {
@@ -266,6 +272,48 @@ async fn key_reset(ctx: &Ctx, id: &str, forget: bool) -> ResultType<String> {
         "{done}The database is changed, but the server did not reload it ({failure}).\n\
          If leapgate-server is running, restart it for this to take effect."
     )
+}
+
+/// `device owner <id> <user|none>` (phase 4 A1, D14): writes `device.user_id`, which the group panel,
+/// `device list`, logout, the late binding and the exit directory all read. Never creates the row
+/// (that would get around the device table's limit). Setting an owner also adds a `device_policy`
+/// row with the defaults if there is none: the eviction (`EVICTABLE`) keeps rows that have one.
+async fn device_owner(db: &SqlitePool, device: &str, user: &str) -> ResultType<String> {
+    let uid = match user {
+        "none" => None,
+        name => Some(super::manage::user_id(db, name).await?),
+    };
+    let mut tx = db.begin_with(crate::api::device::BEGIN_WRITE).await?;
+    let n = sqlx::query("update device set user_id = ?2 where id = ?1")
+        .bind(device)
+        .bind(uid)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if n == 0 {
+        bail!("{device} has no device row (it has not reported to this server, or its row was evicted)");
+    }
+    if uid.is_some() {
+        sqlx::query("insert into device_policy(device_id) values(?1) on conflict(device_id) do nothing")
+            .bind(device)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    if uid.is_none() {
+        return Ok(format!(
+            "{device} has no owner now; a login on it, or a login token left on it (late binding), may bind it again\n"
+        ));
+    }
+    let mut out = format!("{device} is now owned by {user}\n");
+    let pinned: Option<bool> = sqlx::query_scalar("select pk_pinned_at is not null from peer where id = ?")
+        .bind(device)
+        .fetch_optional(db)
+        .await?;
+    if pinned != Some(true) {
+        out += &format!("{device} has no pinned key yet: the next login on it replaces the owner\n");
+    }
+    Ok(out)
 }
 
 fn parse_ip(s: &str) -> ResultType<IpAddr> {
@@ -667,6 +715,106 @@ mod tests {
             assert!(err.contains("restart it") && err.contains(&format!("{reply:?}")), "{err}");
             assert_eq!(pinned_at(&ctx4.db, "dev006").await, Some(None));
         }
+    }
+
+    /// Phase 4 A1, D14: `device owner` writes the owner everything else reads, and keeps the row from
+    /// eviction.
+    #[tokio::test]
+    async fn device_owner() {
+        use crate::testutil::{self, send};
+        use axum::http::StatusCode;
+        use serde_json::{json, Value};
+        let t = testutil::app().await;
+        let ctx = super::super::tests::ctx_with(t.state.db.clone(), t.dir.path());
+        let db = &t.state.db;
+        let uuid = base64::encode(b"machine-1");
+        let (amy, _) = testutil::create_user(db, "amy", "pw", false).await;
+        let (bob, bob_t) = testutil::create_user(db, "bob", "pw", false).await;
+        let owner = || async {
+            sqlx::query_scalar::<_, Option<i64>>("select user_id from device where id = 'd1'").fetch_one(db).await.unwrap()
+        };
+        let policy = || async {
+            sqlx::query_as::<_, (String, i64)>("select relay_pin, strategy_epoch from device_policy where device_id = 'd1'")
+                .fetch_optional(db)
+                .await
+                .unwrap()
+        };
+        peer(db, "d1", b"machine-1", &[1; 32], None).await;
+
+        // No device row, or no such user: an error, nothing written.
+        let err = cli(&ctx, &["device", "owner", "d1", "amy"], "").await.unwrap_err().to_string();
+        assert!(err.contains("d1 has no device row (it has not reported to this server, or its row was evicted)"), "{err}");
+        assert_eq!(policy().await, None);
+        sqlx::query("insert into device(id, uuid, first_seen_at, last_seen_at) values('d1', ?, 0, 0)")
+            .bind(&uuid)
+            .execute(db)
+            .await
+            .unwrap();
+        assert!(cli(&ctx, &["device", "owner", "d1", "nobody"], "").await.is_err());
+        assert!(cli(&ctx, &["device", "owner", "d1"], "").await.is_err());
+        assert_eq!((owner().await, policy().await), (None, None));
+
+        // Not pinned: set, with the default policy row (the strategy rev unchanged) and the hint.
+        let rev0 = rev(db, "d1").await;
+        let out = cli(&ctx, &["device", "owner", "d1", "amy"], "").await.unwrap();
+        assert_eq!(out, "d1 is now owned by amy\nd1 has no pinned key yet: the next login on it replaces the owner\n");
+        assert_eq!((owner().await, policy().await), (Some(amy), Some((String::new(), 0))));
+        assert_eq!(rev(db, "d1").await, rev0);
+
+        // Pinned, with a policy row of its own: the row is left as it is.
+        sqlx::query("update peer set pk_pinned_at = 1 where id = 'd1'").execute(db).await.unwrap();
+        cli(&ctx, &["device", "pin-relay", "d1", "r1.example:21117"], "").await.unwrap();
+        cli(&ctx, &["strategy", "repush", "d1"], "").await.unwrap();
+        let rev1 = rev(db, "d1").await;
+        let out = cli(&ctx, &["device", "owner", "d1", "bob"], "").await.unwrap();
+        assert_eq!(out, "d1 is now owned by bob\n");
+        assert_eq!((owner().await, policy().await), (Some(bob), Some(("r1.example:21117".to_owned(), 1))));
+        assert_eq!(rev(db, "d1").await, rev1);
+
+        // Another account's login does not take it over; the group panel and the exit directory
+        // show the new owner.
+        let body = json!({"username": "amy", "password": "pw", "id": "d1", "uuid": uuid, "type": "account"});
+        let (status, _, _) = send(&t.app, "POST", "/api/login", None, &body.to_string()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(owner().await, Some(bob));
+        let (_, _, body) = send(&t.app, "GET", "/api/peers?current=1&pageSize=10", Some(&bob_t), "").await;
+        let peers: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!((&peers["data"][0]["id"], &peers["data"][0]["user_name"]), (&json!("d1"), &json!("bob")), "{peers}");
+        {
+            let p = t.state.pm.get_or("d1").await;
+            let mut w = p.write().await;
+            w.last_reg_time = std::time::Instant::now();
+            w.leapgate_hb = Some(crate::peer::LeapgateHb { at: std::time::Instant::now(), leapgate_ver: 4000, exit: true });
+        }
+        let (_, _, body) = send(&t.app, "GET", "/api/leapgate/user/v1/exits", Some(&bob_t), "").await;
+        let exits: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(exits, json!({"exits": [{"id": "d1", "hostname": "", "owner": "bob", "own": true}]}));
+
+        // none: no owner, the policy row stays.
+        let out = cli(&ctx, &["device", "owner", "d1", "none"], "").await.unwrap();
+        assert_eq!(out, "d1 has no owner now; a login on it, or a login token left on it (late binding), may bind it again\n");
+        assert_eq!((owner().await, policy().await), (None, Some(("r1.example:21117".to_owned(), 1))));
+
+        // A full table does not evict a device given an owner this way (here the oldest row, its
+        // owner without a token on it).
+        sqlx::query("insert into device(id, first_seen_at, last_seen_at) values('d2', 0, 0)").execute(db).await.unwrap();
+        cli(&ctx, &["device", "owner", "d2", "amy"], "").await.unwrap();
+        sqlx::query(
+            "with recursive n(i) as (select 1 union all select i + 1 from n where i < ?)
+             insert into device(id, first_seen_at, last_seen_at) select 'bulk' || i, 0, 1000 + i from n",
+        )
+        .bind(crate::api::device::MAX_DEVICES - 2)
+        .execute(db)
+        .await
+        .unwrap();
+        peer(db, "new1", b"machine-n", &[2; 32], None).await;
+        let hb = json!({"id": "new1", "uuid": base64::encode(b"machine-n"), "ver": 1005010, "modified_at": 0});
+        let (status, _, _) = send(&t.app, "POST", "/api/heartbeat", None, &hb.to_string()).await;
+        assert_eq!(status, StatusCode::OK);
+        let has = |id: &'static str| async move {
+            sqlx::query_scalar::<_, i64>("select count(*) from device where id = ?").bind(id).fetch_one(db).await.unwrap() == 1
+        };
+        assert!(has("new1").await && has("d2").await && !has("bulk1").await);
     }
 
     #[tokio::test]

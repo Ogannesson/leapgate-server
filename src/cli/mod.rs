@@ -41,6 +41,8 @@ const USAGE: &str = "Usage: leapgate-server <command> [options]
   ab grant <book> --user <u>|--group <g> ro|rw|full | ab revoke <book> --user <u>|--group <g>
   device list [--legacy] | device pin-relay <device> <host|none>
   device key <device> | device key reset [--forget] <device>
+  device owner <device> <user|none>
+  exit grant|revoke <device> --user <u>|--group <g> | exit list
   strategy show [<device>] | strategy set <device|'*'> <key> <value>
   strategy unset|forget <device|'*'> <key> | strategy repush <device|'*'>
   relay status | route test <ipA> <ipB> [--a <device>] [--b <device>]
@@ -117,7 +119,7 @@ pub fn run(argv: Vec<String>) -> ResultType<()> {
 fn changes_database(args: &Args) -> bool {
     let mut words = args.pos.iter().map(String::as_str);
     match (words.next(), words.next()) {
-        (Some("user" | "group" | "ab" | "device"), Some("list")) | (Some("strategy"), Some("show")) => false,
+        (Some("user" | "group" | "ab" | "device" | "exit"), Some("list")) | (Some("strategy"), Some("show")) => false,
         (Some("device"), Some("key")) => words.next() == Some("reset"),
         (Some("relay" | "route" | "geo" | "stats"), _) => false,
         (Some("import"), _) => !args.opts.iter().any(|(n, _)| n == "--dry-run"),
@@ -150,7 +152,7 @@ pub(super) struct Ctx {
 pub(super) async fn exec(ctx: &Ctx, mut args: Args, input: &mut dyn BufRead) -> ResultType<String> {
     let cmd = args.next("command")?;
     match cmd.as_str() {
-        "user" | "group" | "ab" => manage::exec(ctx, &cmd, args, input).await,
+        "user" | "group" | "ab" | "exit" => manage::exec(ctx, &cmd, args, input).await,
         "device" | "strategy" | "stats" => ops::exec(ctx, &cmd, args).await,
         "relay" | "route" | "geo" => ops::runtime(ctx.console, &ctx.leapgate_config, &cmd, args).await,
         "import" => {
@@ -427,6 +429,9 @@ pub(super) mod tests {
             &["device", "pin-relay", "123", "none"],
             &["device", "key", "reset", "123456"],
             &["device", "key", "reset", "--forget", "123456"],
+            &["device", "owner", "123", "alice"],
+            &["exit", "grant", "123", "--user", "alice"],
+            &["exit", "revoke", "123", "--group", "ops"],
             &["strategy", "set", "*", "k", "v"],
             &["strategy", "repush", "*"],
             &["import", "rustdesk-api", "x.db"],
@@ -438,6 +443,7 @@ pub(super) mod tests {
             &["group", "list"],
             &["ab", "list"],
             &["device", "list", "--legacy"],
+            &["exit", "list"],
             &["device", "key", "123456"],
             &["strategy", "show", "123"],
             &["relay", "status"],

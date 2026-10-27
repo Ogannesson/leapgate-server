@@ -1,4 +1,5 @@
-//! `user …`, `group …`, `ab …`: accounts, user groups and shared address books (LEAPGATE.md §12, §14).
+//! `user …`, `group …`, `ab …`, `exit …`: accounts, user groups, shared address books and exit
+//! grants (LEAPGATE.md §12, §14).
 
 use super::{check_name, read_password, table, Args, Ctx, RESERVED_BOOK_NAMES, USAGE};
 use hbb_common::{bail, ResultType};
@@ -324,6 +325,60 @@ pub(super) async fn exec(ctx: &Ctx, cmd: &str, mut args: Args, input: &mut dyn B
                 }
             }
         }
+        // Grants only change the exit directory (LEAPGATE.md §12.4), read from the database at each
+        // query: no console needed.
+        ("exit", "grant" | "revoke") => {
+            let device = args.next("device id")?;
+            let target = Target::take(&mut args)?;
+            args.finish()?;
+            let grant = sub == "grant";
+            if grant {
+                // Against typos, and against granting an id before someone else registers it.
+                let registered: bool = sqlx::query_scalar("select exists(select 1 from peer where id = ?)")
+                    .bind(&device)
+                    .fetch_one(db)
+                    .await?;
+                if !registered {
+                    bail!("{device} is not registered with this server");
+                }
+            }
+            let (column, id) = match &target {
+                Target::User(u) => ("user_id", user_id(db, u).await?),
+                Target::Group(g) => ("group_id", group_id(db, g).await?),
+            };
+            let who = target.to_string();
+            if grant {
+                sqlx::query(&format!(
+                    "insert into exit_grant(device_id, {column}) values(?, ?)
+                     on conflict(device_id, {column}) where {column} is not null do nothing"
+                ))
+                .bind(&device)
+                .bind(id)
+                .execute(db)
+                .await?;
+                return Ok(format!(
+                    "{who} may use exit {device}: it shows in their exit directory while it is online with the exit on\n"
+                ));
+            }
+            let n = sqlx::query(&format!("delete from exit_grant where device_id = ? and {column} = ?"))
+                .bind(&device)
+                .bind(id)
+                .execute(db)
+                .await?
+                .rows_affected();
+            Ok(if n == 0 {
+                format!("{who} had no grant on exit {device}\n")
+            } else {
+                format!(
+                    "Revoked {who} on exit {device}. This only changes the exit directory: sessions already open \
+                     stay, and anyone who knows the device's password can still use it\n"
+                )
+            })
+        }
+        ("exit", "list") => {
+            args.finish()?;
+            exit_list(db).await
+        }
         _ => bail!("Unknown command '{cmd} {sub}'\n\n{USAGE}"),
     }
 }
@@ -400,6 +455,39 @@ async fn ab_list(db: &SqlitePool) -> ResultType<String> {
     Ok(table(&["NAME", "KIND", "OWNER", "ENTRIES", "ACCESS", "NOTE"], &rows))
 }
 
+/// One line per granted device: its owner and whom it is granted to, users first.
+async fn exit_list(db: &SqlitePool) -> ResultType<String> {
+    let grants = sqlx::query_as::<_, (String, String, Option<String>, Option<String>)>(
+        "select g.device_id, coalesce(o.name, ''), u.name, gr.name from exit_grant g
+           left join device d on d.id = g.device_id left join user o on o.id = d.user_id
+           left join user u on u.id = g.user_id left join user_group gr on gr.id = g.group_id
+          order by g.device_id, g.group_id is not null, coalesce(u.name, gr.name)",
+    )
+    .fetch_all(db)
+    .await?;
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    for (device, owner, user, group) in grants {
+        let who = match (user, group) {
+            (Some(u), _) => format!("user:{u}"),
+            (None, g) => format!("group:{}", g.unwrap_or_default()),
+        };
+        match rows.last_mut() {
+            Some(row) if row[0] == device => {
+                row[2] += ", ";
+                row[2] += &who;
+            }
+            _ => rows.push(vec![device, owner, who]),
+        }
+    }
+    let mut out = if rows.is_empty() {
+        "(no exit grants)\n".to_owned()
+    } else {
+        table(&["DEVICE", "OWNER", "GRANTED TO"], &rows)
+    };
+    out += "Owners always see their own devices. Whether an exit is online and on is known only to the running server.\n";
+    Ok(out)
+}
+
 /// Shared book names: not empty, not a name the client reserves for the personal book, unique.
 async fn check_book_name(db: &SqlitePool, name: &str) -> ResultType<()> {
     check_name("address book", name)?;
@@ -423,7 +511,7 @@ async fn find_user(db: &SqlitePool, name: &str) -> ResultType<Option<i64>> {
         .await?)
 }
 
-async fn user_id(db: &SqlitePool, name: &str) -> ResultType<i64> {
+pub(super) async fn user_id(db: &SqlitePool, name: &str) -> ResultType<i64> {
     match find_user(db, name).await? {
         Some(id) => Ok(id),
         None => bail!("No user named '{name}'"),
@@ -674,5 +762,70 @@ mod tests {
         cli(&ctx, &["ab", "del", "Crew"], "").await.unwrap();
         assert_eq!(count(db, "select count(*) from ab_peer").await, 0);
         assert_eq!(count(db, "select count(*) from ab_rule").await, 0);
+    }
+
+    #[tokio::test]
+    async fn exit_grants() {
+        let (_dir, ctx) = ctx(NO_CONSOLE).await;
+        let db = &ctx.db;
+        let (alice, _) = crate::testutil::create_user(db, "alice", "pw", false).await;
+        crate::testutil::create_user(db, "bob", "pw", false).await;
+        cli(&ctx, &["group", "add", "ops"], "").await.unwrap();
+        for id in ["d1", "d2"] {
+            crate::database::Database::new(db.clone()).insert_peer(id, b"u", b"pk", "{}").await.unwrap();
+        }
+        sqlx::query("insert into device(id, user_id, first_seen_at, last_seen_at) values('d1', ?, 0, 0)")
+            .bind(alice)
+            .execute(db)
+            .await
+            .unwrap();
+        let list = || cli(&ctx, &["exit", "list"], "");
+        const FOOTER: &str = "Owners always see their own devices. Whether an exit is online and on is known only to the running server.\n";
+        assert_eq!(list().await.unwrap(), format!("(no exit grants)\n{FOOTER}"));
+
+        for bad in [
+            &["exit", "grant", "nosuch", "--user", "bob"][..],
+            &["exit", "grant", "d1", "--user", "nobody"],
+            &["exit", "grant", "d1", "--group", "nogroup"],
+            &["exit", "grant", "d1"],
+            &["exit", "grant", "d1", "--user", "bob", "--group", "ops"],
+            &["exit", "revoke", "d1"],
+            &["exit", "revoke", "d1", "--user", "bob", "--group", "ops"],
+            &["exit", "grant", "d1", "--user", "bob", "extra"],
+        ] {
+            assert!(cli(&ctx, bad, "").await.is_err(), "{bad:?}");
+        }
+        let err = cli(&ctx, &["exit", "grant", "nosuch", "--user", "bob"], "").await.unwrap_err().to_string();
+        assert!(err.contains("nosuch is not registered with this server"), "{err}");
+        assert_eq!(count(db, "select count(*) from exit_grant").await, 0);
+
+        let out = cli(&ctx, &["exit", "grant", "d1", "--user", "bob"], "").await.unwrap();
+        assert_eq!(out, "user:bob may use exit d1: it shows in their exit directory while it is online with the exit on\n");
+        cli(&ctx, &["exit", "grant", "d1", "--user", "bob"], "").await.unwrap();
+        assert_eq!(count(db, "select count(*) from exit_grant").await, 1);
+        cli(&ctx, &["exit", "grant", "d1", "--group", "ops"], "").await.unwrap();
+        cli(&ctx, &["exit", "grant", "d1", "--user", "alice"], "").await.unwrap();
+        cli(&ctx, &["exit", "grant", "d2", "--group", "ops"], "").await.unwrap();
+        assert_eq!(
+            list().await.unwrap(),
+            format!(
+                "DEVICE  OWNER  GRANTED TO\n\
+                 d1      alice  user:alice, user:bob, group:ops\n\
+                 d2             group:ops\n{FOOTER}"
+            )
+        );
+
+        let out = cli(&ctx, &["exit", "revoke", "d1", "--user", "bob"], "").await.unwrap();
+        assert_eq!(
+            out,
+            "Revoked user:bob on exit d1. This only changes the exit directory: sessions already open stay, \
+             and anyone who knows the device's password can still use it\n"
+        );
+        let out = cli(&ctx, &["exit", "revoke", "d1", "--user", "bob"], "").await.unwrap();
+        assert_eq!(out, "user:bob had no grant on exit d1\n");
+        // Revoking needs no registered device.
+        sqlx::query("delete from peer where id = 'd2'").execute(db).await.unwrap();
+        cli(&ctx, &["exit", "revoke", "d2", "--group", "ops"], "").await.unwrap();
+        assert_eq!(count(db, "select count(*) from exit_grant").await, 2);
     }
 }

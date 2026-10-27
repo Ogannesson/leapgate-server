@@ -8,7 +8,7 @@ use leapgate_server::{common::*, *};
 const RMEM: usize = 0;
 /// First arguments that switch to command line management (LEAPGATE.md §14).
 const CLI_COMMANDS: &[&str] = &[
-    "user", "group", "ab", "device", "strategy", "relay", "route", "geo", "stats", "import",
+    "user", "group", "ab", "exit", "device", "strategy", "relay", "route", "geo", "stats", "import",
 ];
 
 fn main() -> ResultType<()> {

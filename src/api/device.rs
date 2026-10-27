@@ -46,7 +46,7 @@ const MAX_SYSINFO_FIELD_LEN: usize = 253;
 /// fields, the id and uuid; measured with 4 KB pages, the primary key index included): 10,000 rows ≈
 /// 0.1 GB. Rows `make_room` may not evict are kept even past this, and reports and logins then
 /// create no rows; imports add rows without this check.
-const MAX_DEVICES: i64 = 10_000;
+pub(crate) const MAX_DEVICES: i64 = 10_000;
 /// Rows one `make_room` deletes at most when the table is past `MAX_DEVICES` (review D-7: deleting
 /// the whole excess in one write transaction held the write lock for seconds, and past the request
 /// timeout it was rolled back and started over by every next new row). 64 rows of 10.5 KB read cold
