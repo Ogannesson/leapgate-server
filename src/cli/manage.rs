@@ -770,7 +770,7 @@ mod tests {
         let db = &ctx.db;
         let (alice, _) = crate::testutil::create_user(db, "alice", "pw", false).await;
         crate::testutil::create_user(db, "bob", "pw", false).await;
-        cli(&ctx, &["group", "add", "ops"], "").await.unwrap();
+        cli(&ctx, &["group", "add", "aaa"], "").await.unwrap();
         for id in ["d1", "d2"] {
             crate::database::Database::new(db.clone()).insert_peer(id, b"u", b"pk", "{}").await.unwrap();
         }
@@ -788,9 +788,9 @@ mod tests {
             &["exit", "grant", "d1", "--user", "nobody"],
             &["exit", "grant", "d1", "--group", "nogroup"],
             &["exit", "grant", "d1"],
-            &["exit", "grant", "d1", "--user", "bob", "--group", "ops"],
+            &["exit", "grant", "d1", "--user", "bob", "--group", "aaa"],
             &["exit", "revoke", "d1"],
-            &["exit", "revoke", "d1", "--user", "bob", "--group", "ops"],
+            &["exit", "revoke", "d1", "--user", "bob", "--group", "aaa"],
             &["exit", "grant", "d1", "--user", "bob", "extra"],
         ] {
             assert!(cli(&ctx, bad, "").await.is_err(), "{bad:?}");
@@ -803,15 +803,15 @@ mod tests {
         assert_eq!(out, "user:bob may use exit d1: it shows in their exit directory while it is online with the exit on\n");
         cli(&ctx, &["exit", "grant", "d1", "--user", "bob"], "").await.unwrap();
         assert_eq!(count(db, "select count(*) from exit_grant").await, 1);
-        cli(&ctx, &["exit", "grant", "d1", "--group", "ops"], "").await.unwrap();
+        cli(&ctx, &["exit", "grant", "d1", "--group", "aaa"], "").await.unwrap();
         cli(&ctx, &["exit", "grant", "d1", "--user", "alice"], "").await.unwrap();
-        cli(&ctx, &["exit", "grant", "d2", "--group", "ops"], "").await.unwrap();
+        cli(&ctx, &["exit", "grant", "d2", "--group", "aaa"], "").await.unwrap();
         assert_eq!(
             list().await.unwrap(),
             format!(
                 "DEVICE  OWNER  GRANTED TO\n\
-                 d1      alice  user:alice, user:bob, group:ops\n\
-                 d2             group:ops\n{FOOTER}"
+                 d1      alice  user:alice, user:bob, group:aaa\n\
+                 d2             group:aaa\n{FOOTER}"
             )
         );
 
@@ -825,7 +825,7 @@ mod tests {
         assert_eq!(out, "user:bob had no grant on exit d1\n");
         // Revoking needs no registered device.
         sqlx::query("delete from peer where id = 'd2'").execute(db).await.unwrap();
-        cli(&ctx, &["exit", "revoke", "d2", "--group", "ops"], "").await.unwrap();
+        cli(&ctx, &["exit", "revoke", "d2", "--group", "aaa"], "").await.unwrap();
         assert_eq!(count(db, "select count(*) from exit_grant").await, 2);
     }
 }
