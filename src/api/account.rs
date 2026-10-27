@@ -358,18 +358,22 @@ pub(crate) async fn login(State(state): State<AppState>, body: Bytes) -> ApiResu
     // user has no token on it left (at most 50 tokens a user; §9.3). A new row is kept to the
     // device table's limit like a report's (`make_room`, review D-7): with no room the login still
     // succeeds, without a row or a binding.
-    // A pinned key does not matter here (phase 3 contract 01 §3.5): the binding is as before.
+    // A device whose key is pinned is bound only while it has no owner (phase 4 A1): another
+    // account's login does not take it over; its owner logs out there first, or the operator uses
+    // `device owner`. Whether it is pinned is read by the statement that writes. An unpinned one
+    // (an original client never pins) is bound to the latest login as before.
     if !req.id.is_empty() && uuid_matches(&state.db, &req.id, Some(&req.uuid)).await? != UuidCheck::Mismatch {
         let mut tx = state.db.begin_with(BEGIN_WRITE).await?;
         if make_room(&mut tx, &req.id).await? {
             sqlx::query(
-                "insert into device(id, uuid, user_id, first_seen_at, last_seen_at) values(?, ?, ?, ?, ?)
-                 on conflict(id) do update set user_id = excluded.user_id",
+                "insert into device(id, uuid, user_id, first_seen_at, last_seen_at) values(?1, ?2, ?3, ?4, ?4)
+                 on conflict(id) do update set user_id = case
+                   when exists(select 1 from peer where id = ?1 and pk_pinned_at is not null)
+                   then coalesce(user_id, excluded.user_id) else excluded.user_id end",
             )
             .bind(&req.id)
             .bind(&req.uuid)
             .bind(uid)
-            .bind(now)
             .bind(now)
             .execute(&mut *tx)
             .await?;

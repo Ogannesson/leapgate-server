@@ -159,9 +159,13 @@ pub(crate) async fn uuid_matches(db: &SqlitePool, id: &str, uuid: Option<&str>) 
 /// uuid. The newest such token (`last_used_at`) of an enabled account gives the owner. As safe as
 /// the login's binding: the token's uuid is the one just checked against hbbs. Reading the token
 /// and writing the owner in one statement keeps a logout from deleting the token in between and
-/// being undone (review C-24).
+/// being undone (review C-24). A device whose key is pinned takes only a token issued before it was
+/// pinned (same second included, phase 4 A1): after pinning, its owner's login binds it directly,
+/// so a later token left to bind it is a login that found it owned, and must not take it over
+/// once the owner logs out.
 const OWNER_FROM_TOKEN: &str = "(select t.user_id from token t join user u on u.id = t.user_id
      where t.device_id = ?1 and t.device_uuid = ?2 and u.status = 1
+       and not exists (select 1 from peer p where p.id = ?1 and p.pk_pinned_at < t.created_at)
      order by t.last_used_at desc limit 1)";
 
 /// The `?1` oldest (`last_seen_at`) rows a report may delete to make room: unowned ones, and owned
@@ -1224,6 +1228,110 @@ mod tests {
         assert_eq!(owner(db, "111").await, None);
         heartbeat(&t.app, json!({"id": "111", "uuid": uuid, "ver": 1005010, "modified_at": 0})).await;
         assert_eq!(owner(db, "111").await, Some(amy));
+    }
+
+    // ---- Phase 4 A1: owners of pinned devices ----
+
+    /// A login binds a pinned device only while it has no owner; the owner's logout frees it.
+    #[tokio::test]
+    async fn login_does_not_take_over_a_pinned_device() {
+        let t = testutil::app().await;
+        let db = &t.state.db;
+        let uuid = b64(UUID);
+        let (amy, _) = testutil::create_user(db, "pl-amy", "pw", false).await;
+        let (bob, _) = testutil::create_user(db, "pl-bob", "pw", false).await;
+        add_peer(db, "111", UUID).await;
+        pin(db, "111").await;
+        let amy_t = login(&t.app, "pl-amy", "111", &uuid).await;
+        assert_eq!(owner(db, "111").await, Some(amy));
+        login(&t.app, "pl-bob", "111", &uuid).await;
+        assert_eq!(owner(db, "111").await, Some(amy));
+        let (status, _, _) = send(&t.app, "POST", "/api/logout", Some(&amy_t), "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(owner(db, "111").await, None);
+        login(&t.app, "pl-bob", "111", &uuid).await;
+        assert_eq!(owner(db, "111").await, Some(bob));
+    }
+
+    /// The late binding of a pinned device takes only a token issued before (or in the same second
+    /// as) the pin, on each statement that writes the row.
+    #[tokio::test]
+    async fn late_binding_of_pinned_devices() {
+        let t = testutil::app().await;
+        let db = &t.state.db;
+        let uuid = b64(UUID);
+        let (bob, _) = testutil::create_user(db, "lp-bob", "pw", false).await;
+        const PINNED_AT: i64 = 1_700_000_000;
+        let token = |id: &'static str, created: i64| {
+            let uuid = uuid.clone();
+            async move {
+                sqlx::query("delete from token where device_id = ?").bind(id).execute(db).await.unwrap();
+                sqlx::query(
+                    "insert into token(token_hash, user_id, device_id, device_uuid, created_at, last_used_at)
+                     values(?, ?, ?, ?, ?, ?)",
+                )
+                .bind(format!("{id}-{created}"))
+                .bind(bob)
+                .bind(id)
+                .bind(uuid)
+                .bind(created)
+                .bind(created)
+                .execute(db)
+                .await
+                .unwrap();
+            }
+        };
+        let reset = |id: &'static str| async move {
+            sqlx::query("delete from device where id = ?").bind(id).execute(db).await.unwrap();
+        };
+        for id in ["upd", "ins", "sys"] {
+            add_peer(db, id, UUID).await;
+            sqlx::query("update peer set pk_pinned_at = ? where id = ?").bind(PINNED_AT).bind(id).execute(db).await.unwrap();
+        }
+        // `touch`'s update: the row is there (written on a changed `ver`).
+        for (created, want) in [(PINNED_AT + 1, None), (PINNED_AT, Some(bob))] {
+            token("upd", created).await;
+            reset("upd").await;
+            sqlx::query("insert into device(id, first_seen_at, last_seen_at) values('upd', 0, 0)").execute(db).await.unwrap();
+            super::touch(db, "upd", &uuid, created, "1.2.3.4", "leapgate").await.unwrap();
+            assert_eq!(owner(db, "upd").await, want, "update, token at {created}");
+        }
+        // `touch`'s insert.
+        for (created, want) in [(PINNED_AT + 1, None), (PINNED_AT, Some(bob))] {
+            token("ins", created).await;
+            reset("ins").await;
+            super::touch(db, "ins", &uuid, 1, "1.2.3.4", "leapgate").await.unwrap();
+            assert_eq!(owner(db, "ins").await, want, "insert, token at {created}");
+        }
+        // `store_sysinfo`.
+        for (created, want) in [(PINNED_AT + 1, None), (PINNED_AT, Some(bob))] {
+            token("sys", created).await;
+            reset("sys").await;
+            assert!(super::store_sysinfo(db, "sys", &uuid, "{}", Default::default(), "leapgate").await.unwrap());
+            assert_eq!(owner(db, "sys").await, want, "sysinfo, token at {created}");
+        }
+        // Unpinned: any token, as before.
+        sqlx::query("update peer set pk_pinned_at = null where id = 'ins'").execute(db).await.unwrap();
+        token("ins", PINNED_AT + 1).await;
+        reset("ins").await;
+        super::touch(db, "ins", &uuid, 1, "1.2.3.4", "leapgate").await.unwrap();
+        assert_eq!(owner(db, "ins").await, Some(bob));
+    }
+
+    /// Logged in before registering: the first signed heartbeat pins the key and binds the owner.
+    #[tokio::test]
+    async fn first_signed_heartbeat_pins_and_binds() {
+        let t = testutil::app().await;
+        let db = &t.state.db;
+        let uuid = b64(UUID);
+        let (amy, _) = testutil::create_user(db, "fs-amy", "pw", false).await;
+        login(&t.app, "fs-amy", "fresh1", &uuid).await;
+        assert_eq!(owner(db, "fresh1").await, None);
+        let dev = testutil::leapgate_device(&t.state, "fresh1", UUID).await;
+        let r = dev.post(&t.app, "heartbeat", json!({"uuid": uuid, "ver": 1}).to_string().as_bytes()).await;
+        assert_eq!(r.status, StatusCode::OK);
+        assert_eq!(count(db, "select count(*) from peer where id = 'fresh1' and pk_pinned_at is not null").await, 1);
+        assert_eq!(owner(db, "fresh1").await, Some(amy));
     }
 
     #[tokio::test]
