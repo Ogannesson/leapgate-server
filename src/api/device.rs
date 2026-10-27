@@ -1224,9 +1224,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(left, ["newer", "sibling"]);
-        // Unbound by the logout; the spared tokens bind the device back on its next written heartbeat.
-        assert_eq!(owner(db, "111").await, None);
-        heartbeat(&t.app, json!({"id": "111", "uuid": uuid, "ver": 1005010, "modified_at": 0})).await;
+        // The spared tokens keep the owner.
         assert_eq!(owner(db, "111").await, Some(amy));
     }
 
@@ -1251,6 +1249,31 @@ mod tests {
         assert_eq!(owner(db, "111").await, None);
         login(&t.app, "pl-bob", "111", &uuid).await;
         assert_eq!(owner(db, "111").await, Some(bob));
+    }
+
+    /// The owner logged in on two system accounts of the same machine: logging out of one keeps the
+    /// device (no late binding brings it back once pinned); logging out of the last frees it.
+    #[tokio::test]
+    async fn pinned_device_stays_with_an_owner_still_logged_in() {
+        let t = testutil::app().await;
+        let db = &t.state.db;
+        let uuid = b64(UUID);
+        let (amy, _) = testutil::create_user(db, "po-amy", "pw", false).await;
+        add_peer(db, "111", UUID).await;
+        pin(db, "111").await;
+        let t1 = login(&t.app, "po-amy", "111", &uuid).await;
+        let t2 = login(&t.app, "po-amy", "111", &uuid).await;
+        sqlx::query("update token set last_used_at = created_at + 50 where token_hash = ?")
+            .bind(crate::auth::token_hash(&t2))
+            .execute(db)
+            .await
+            .unwrap();
+        let (status, _, _) = send(&t.app, "POST", "/api/logout", Some(&t1), "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(owner(db, "111").await, Some(amy));
+        let (status, _, _) = send(&t.app, "POST", "/api/logout", Some(&t2), "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(owner(db, "111").await, None);
     }
 
     /// The late binding of a pinned device takes only a token issued before (or in the same second

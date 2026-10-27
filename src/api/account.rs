@@ -432,11 +432,17 @@ pub(crate) async fn logout(
         .bind(created_at)
         .execute(&state.db)
         .await?;
-        sqlx::query("update device set user_id = null where id = ? and user_id = ?")
-            .bind(device_id)
-            .bind(user.id)
-            .execute(&state.db)
-            .await?;
+        // The owner stays while this user still has a token on the device: one left means the user
+        // is still logged in there (another system account, or a new login during the logout); the
+        // same test as `EVICTABLE`'s.
+        sqlx::query(
+            "update device set user_id = null where id = ?1 and user_id = ?2
+             and not exists (select 1 from token where user_id = ?2 and device_id = ?1)",
+        )
+        .bind(device_id)
+        .bind(user.id)
+        .execute(&state.db)
+        .await?;
     }
     Ok(ok_json(&serde_json::json!({})))
 }
