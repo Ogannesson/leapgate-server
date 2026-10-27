@@ -24,6 +24,11 @@
 - **路由第二级**（第三期实施契约 02 块，§7 第二级）：Leapgate 客户端测到各中继的 TCP 建连耗时，随 Leapgate 心跳上报；选中继时某一端有可用的实测就整端代替估算。
 - **自研 ICE 的信令和 STUN**（第三期实施契约 05，§6 第 10、11 条）：Leapgate 控制端在上游路径之外再跑一条自研 ICE。服务端在加密的 21116 TCP 上转发两端的候选（转给被控端的 OFFER 加密给它锁定的设备公钥、再用会合私钥签名），在 21116/UDP 上回 STUN Binding 并附反射地址证明，控制端补报的结果记进 `ice_result`（§8）。
 
+第四期加了（设计记录在总仓库 `docs/第四期实施契约/01-服务端出口目录.md`）：
+- **出口目录与授权**（§12.4）：Leapgate 被控端在签名心跳里报 `exit`（此刻接受出口登录），只放内存；Leapgate 控制端凭用户令牌取"此刻能用的出口"列表（自己名下的，加命令行授权给本人或所在组的）。目录只是建议，不是关口，连接照旧由被控端的出口开关和上游认证决定。
+- **设备主人加固**（§11）：已锁定公钥的设备，登录不再覆盖已有主人，延迟补绑只认锁定之前签发的令牌；命令行 `device owner` 由运维指定主人。
+- hbbr 仍不改逻辑，只调部署参数（§5 末尾）。
+
 不做（第一期）：OIDC 和第三方登录、邮箱验证码和 TOTP、Web 管理后台、路由第二级（客户端测速；第三期做，见 §7 第二级）、TCP 注册（走代理/WebSocket/禁 UDP 的被控端原版就显示离线，维持现状）、修改 ID（`RegisterPk.old_id`）、`HttpProxyRequest`（API 经 21116 回落）、WebRTC 信令转发、转发 `udp_port`（UDP 打洞）（第三期起直连走自研 ICE，这两项继续不做）、心跳下发 `disconnect`、`audit/conn/active`、`PUT /api/audit`、旧版地址簿 `GET/POST /api/ab`，以及总方案第 4 节列的全部"明确不做"。hbbr（`src/relay_server.rs`）不改逻辑；Leapgate 客户端的测速依赖它对非 `RequestRelay` 首帧静默关闭（§7 第二级）。
 
 ## 2. 代码布局与文件归属
@@ -57,6 +62,8 @@
 | `src/ice_stun.rs` | 第三期：21116/UDP 上的 STUN Binding 解析和响应、FINGERPRINT、反射地址证明（§6 第 11 条） | 第三期 05 |
 | `src/ice_signal.rs` | 第三期：ICE 候选的编码和过滤、会话表、FORWARD 的加密和签名、`forced_relay` 判据、§2.13 的固定文字（§6 第 10 条） | 第三期 05 |
 | `migrations/0006_ice_result.sql` | 第三期：`ice_result` 表（P-A，§4.2、§8） | 第三期 05 |
+| `src/api/exit.rs` | 第四期：出口目录接口 `GET /api/leapgate/user/v1/exits` 和可用判据 `available`（§12.4） | 第四期 01 |
+| `migrations/0007_exit_grant.sql` | 第四期：`exit_grant` 表（§4.2、§12.4） | 第四期 01 |
 | `src/cli/`、`src/import.rs` | 命令行与导入（§14、§15） | 命令行 |
 
 骨架实现的 `Router`（只按配置列表轮询）和 `ConnTracker`（各挂钩方法为空操作）是能跑的最小版本，让会合模块在并行阶段就能调用和测试；路由、结果记录模块再替换内部实现，不改签名。骨架阶段为后面各模块建好空文件和函数签名（`todo!()` 只允许出现在并行模块名下的文件里，且不允许留到合并后），并行模块在签名内实现。签名需要调整时，改动方在汇报里写清楚，由集成阶段统一。
@@ -80,7 +87,7 @@
   - `cfg: Arc<Config>`
   - `sk: Option<Arc<sign::SecretKey>>`：`get_server_sk` 的结果，KeyExchange、`IdPk` 签名、Leapgate 路径的响应签名（§9.5）和转给被控端的 ICE OFFER 签名（§6 第 10 条）共用这一份（第三期从 `RendezvousServer` 的 `inner.sk` 挪进来）。`-k` 传的是公钥时为 `None`。
 - 模块自己的小状态（登录失败计数、审计 nonce 去重表、第三期 Leapgate 路径的防重放表、ICE 会话表、反射地址证明的内存密钥）放在模块内的 `static`，不进 `AppState`。
-- `PeerMap` 条目上第三期多了两项内存状态：`pinned`（库里 `pk_pinned_at` 的副本，只用来省掉注定失败的写库，以库为准，§6 第 7 条）和 `leapgate_hb`（最近一次验签通过的 Leapgate 心跳的时刻和 Leapgate 版本，只存内存，条目被淘汰就丢，下一次心跳重写；ICE 用它判被控端支不支持：新鲜度 180 秒、版本不低于 0.3.1，§6 第 10 条）。
+- `PeerMap` 条目上第三期多了两项内存状态：`pinned`（库里 `pk_pinned_at` 的副本，只用来省掉注定失败的写库，以库为准，§6 第 7 条）和 `leapgate_hb`（最近一次验签通过的 Leapgate 心跳的时刻、Leapgate 版本和第四期的 `exit`，只存内存，条目被淘汰就丢，下一次心跳整条重写；ICE 用它判被控端支不支持：新鲜度 180 秒、版本不低于 0.3.1，§6 第 10 条；出口目录用它判出口可不可用，§12.4。新鲜度是两者共用的常量 `peer::LEAPGATE_HB_FRESH`）。
 - Leapgate 新增的代码（路由、结果记录、API、GeoIP、新表）里，IP 在比较、查库、落库前先规范化：`::ffff:a.b.c.d` → IPv4（`to_canonical()` 或 `try_into_v4`）。原版会合逻辑里已有的地址处理保持原样（`same_intranet`、`update_addr`/`RegisterPk` 的 ip 比较、`peer.info.ip` 落库、`tcp_punch` 的键），也不要在 accept 处统一改写地址，否则同公网 IP 的设备拿不到局域网直连，或升级后每台设备都被判成"IP 变了"。
 
 ## 4. 存储
@@ -102,7 +109,7 @@
 
 ### 4.2 表结构（`migrations/0001_init.sql` 照此实现，列名、类型、约束不得自行改动）
 
-下面是 `0001` 的原样；之后的迁移除 `0004`、`0005` 加列、`0006` 加表外只动索引，现行索引以迁移文件为准：
+下面是 `0001` 的原样；之后的迁移除 `0004`、`0005` 加列、`0006`、`0007` 加表外只动索引，现行索引以迁移文件为准：
 - `0002`：三张审计表各加 `created_at` 索引（保留期删除，§9.3）；`device_user` 换成 `device_user_seen(user_id, last_seen_at)`。
 - `0003`：`audit_conn_session` 换成 `audit_conn_session_dev(session_id, device_id, conn_type)`（备注更新，§9.3）；`audit_conn_dev` 换成部分索引 `audit_conn_open(device_id, conn_id) where closed_at is null`（认证成功和 close 上报找未关闭的记录，§9.3）；加部分索引 `device_owned_seen(last_seen_at, user_id, id) where user_id is not null`（设备表淘汰）；`token_user` 换成 `token_user_device(user_id, device_id)`。
 - `0004`（第三期）：`alter table peer add column pk_pinned_at integer`，锁定时间（unix 秒），NULL 表示未锁定。放 `peer` 不放 `device`，因为 `device` 行会被淘汰。笔记 02 预留的 `token.device_verified` 没加（第三期没人读写，等签名登录设计时再加）。
@@ -123,6 +130,18 @@
     local_net   text                -- ethernet|wlan|other，connected 才有
   );
   create index if not exists idx_ice_at on ice_result(at);
+  ```
+- `0007`（第四期 01）：新表 `exit_grant`，除主人以外谁能在出口目录里看到这台设备（§12.4），一行授权给一个用户或一个组，照 `ab_rule` 的二选一约束和两个部分唯一索引写。删用户、删组靠外键级联（连接池开着 `foreign_keys`）。`device_id` 不引用 `device`，也不进 §9.3 的淘汰条件：设备行被淘汰时授权不丢，设备再上报、重建行后目录照常列出。不加过期时间、授权人、创建时间列，也不加按 `user_id`、`group_id` 查的索引（表很小，目录查询扫全表）。服务端回退到第三期二进制之前，要先删掉 `exit_grant` 表和 `_sqlx_migrations` 里 0007 那一行（sqlx 拒绝"库里执行过、程序里没有"的迁移）。
+
+  ```sql
+  create table exit_grant (
+    device_id text not null,
+    user_id   integer references user(id) on delete cascade,
+    group_id  integer references user_group(id) on delete cascade,
+    check ((user_id is null) <> (group_id is null))
+  );
+  create unique index exit_grant_user  on exit_grant(device_id, user_id)  where user_id is not null;
+  create unique index exit_grant_group on exit_grant(device_id, group_id) where group_id is not null;
   ```
 
 ```sql
@@ -312,6 +331,13 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 # lat = 0.0; lon = 0.0; country = "XX"; carrier = ""   # 可选，覆盖 IP 库查出的位置
 ```
 
+**hbbr 部署参数**（第四期 E3，只改部署、不改代码）：
+- 只加一个环境变量 `SINGLE_BANDWIDTH=256`：每对中继连接的限速，单位 Mb/s（这里 1 Mb = 2^20 bit），两个方向合计，默认 128。其余参数用默认值：`TOTAL_BANDWIDTH` 1024（整个进程所有会话合计）、`LIMIT_SPEED` 32、`DOWNGRADE_THRESHOLD` 0.66、`DOWNGRADE_START_CHECK` 1800 秒。
+- 降速规则保留：会话从配对起算的平均速率超过 0.66 × 256 ≈ 169 Mb/s、且会话已超过 30 分钟时，降到 32 Mb/s，到会话结束不恢复。
+- 变量名一律写全大写加下划线：本仓库 `873230e` 的 `get_arg` 不分大小写、横线下划线通用，但已发布的官方镜像 1.1.15、1.1.16 只认这一种写法。值必须大于 0，设 0 不能关掉限速，会回到默认值（`relay_server.rs` `check_params`）。
+- 生效时机：随第一期部署那次 hbbr 重启生效。重启后在 hbbr 启动日志里核对 `SINGLE_BANDWIDTH: 256Mb/s` 这一行；同时把 hbbr 镜像钉到具体版本标签，不用 `latest`。
+- 不做：只给出口会话放宽（hbbr 配对只认 uuid，看不到连接类型）、月流量机制。想少用贵的中继，用现成的 `[[relay]] weight`（§7）。
+
 ## 6. 会合模块（`rendezvous_server.rs` 等）
 
 改动都按"只加挂钩、不重写流程"做，行为和原版保持一致，除非下面明确要求。
@@ -456,7 +482,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 - sysinfo 原文（请求体）超过 8 KB 时同样回 403 空 body（真实 sysinfo 只有几百字节；原文整段存进 `device.sysinfo`）。从中拆出来另存的 `hostname`、`username`、`os`、`version` 各截到 253 字节。
 - 按来源限速：心跳、sysinfo、三个审计接口合计，每个来源每分钟最多 1000 次（固定一分钟窗口）。来源取客户端 IP（§10，经本机反代时是 `X-Real-IP`，反代必须覆盖这个头，见 §10 的硬性部署要求），IPv4 按单个地址、IPv6 按 /64 计。1000 的算式：NAT 后面 50 台设备都在会话中，每台每 3 秒一次心跳（空闲时 15 秒一次，每分钟 4 次）= 50 × 20 = 1000 次/分钟，sysinfo 和审计每次会话只有几条，落在不在会话的设备留下的余量里。为什么要限：表满时新建设备行是一个写事务（见下一条），不限速的话一个来源就能让写锁高频翻转，再经 `busy_timeout` 拖慢会合模块的注册写库。超出时：心跳回 `{}`（上游客户端对心跳响应只看键在不在，没有针对状态码或空对象的分支，15 秒后照常再发，rustdesk@bd92623:src/hbbs_http/sync.rs `start_hbbs_sync_async`）；sysinfo 回 403 空 body（120 秒后重试）；审计回 200 + `{"error":"…"}`，客户端当内部错误处理，10 秒、30 秒后重试，nonce 没登记，重试能入库。计数表最多记 65536 个来源（约 3 MB），满了而且没有已结束的窗口时，新来源不限速（同会合模块的 `IP_BLOCKER`：手里有这么多来源的人本来就有这么多份额度）。
 - `device` 表最多 1 万行（最坏一行约 10.5 KB，合计约 0.1 GB），在上报新建行时守住，不靠定时清理（审查 C-10/C-18/C-26：原来每小时清理一次，两次清理之间被删的假设备随时能重建，行数只受累计注册数限制）。心跳、sysinfo 和登录绑定（§11）要新建行时，在一个 `begin immediate` 事务里数行数，到了 1 万就按 `last_seen_at` 从老到新删掉可淘汰的行，删到 1 万 - 1 行再插入，通常删一行。只有导入建行不经这道检查；表因此超出上限时，每次新建行最多删 64 行（`EVICT_BATCH`），删掉至少一行就允许插入，行数不会再涨，之后每次新建行再往下收敛（审查 D-7：原来一次删掉全部超额行，有账号的人靠登录建行能把表撑到几万行，一次删除在写锁里要几秒，超过 20 秒的整请求超时就整体回滚，之后每次新建行都重来；实测 64 行 8 KB 的行一批约 1.5~2.5 ms）。插入用 `on conflict do update`，同一设备两次首次心跳并发也不出错。
-  - 可淘汰的行：没有主人（`user_id IS NULL`），或者主人在这台设备上已经没有令牌（审查 C-19）；`device_policy` 里有这个 id、或 `strategy_option` 里有 `scope` = 这个 id 的行一律不删。这两张表和 `device` 之间没有外键，删设备行不会连带删掉策略。有主行的边界：登录会绑定任何注册过的 id（注册不认证），但每人最多 50 枚令牌，所以免删的有主行最多 50 × 用户数；靠登录挂到自己名下的假设备，令牌被淘汰后也会变成可淘汰。代价：主人在设备上没有令牌的有主设备，表满时都可能被淘汰，重新建行后没有归属（延迟补绑要找该设备的令牌，§11），要主人到设备上重新登录才能恢复。这包括三种情况（审查 D-8）：从 rustdesk-api 导入的归属（令牌不导入，§15，没人打开界面重新登录的无人值守机器一直没有令牌）；主人执行过 `user passwd` 或被 `user disable` 之后，他名下的全部设备（两者都删掉该用户的全部令牌）；令牌被挤出 50 枚上限的设备（每次登录都新插一枚，不按设备去重，同一台设备反复登录也占名额，所以不一定要真在 50 台设备上登录过）。有令牌的有主设备不受影响。
+  - 可淘汰的行：没有主人（`user_id IS NULL`），或者主人在这台设备上已经没有令牌（审查 C-19）；`device_policy` 里有这个 id、或 `strategy_option` 里有 `scope` = 这个 id 的行一律不删（`device_policy` 行来自 `device pin-relay`、`strategy repush`，以及第四期起指定了主人的 `device owner`，§14）。这两张表和 `device` 之间没有外键，删设备行不会连带删掉策略。有主行的边界：登录会绑定任何注册过的 id（注册不认证），但每人最多 50 枚令牌，所以免删的有主行最多 50 × 用户数；靠登录挂到自己名下的假设备，令牌被淘汰后也会变成可淘汰。代价：主人在设备上没有令牌的有主设备，表满时都可能被淘汰，重新建行后没有归属（延迟补绑要找该设备的令牌，§11），要主人到设备上重新登录才能恢复。这包括三种情况（审查 D-8）：从 rustdesk-api 导入的归属（令牌不导入，§15，没人打开界面重新登录的无人值守机器一直没有令牌）；主人执行过 `user passwd` 或被 `user disable` 之后，他名下的全部设备（两者都删掉该用户的全部令牌）；令牌被挤出 50 枚上限的设备（每次登录都新插一枚，不按设备去重，同一台设备反复登录也占名额，所以不一定要真在 50 台设备上登录过）。有令牌的有主设备不受影响。
   - 没有可淘汰行时不建行：心跳照样回有效策略（全局 ⊕ 设备级），但不带 `sysinfo` 键；sysinfo 回 403 空 body（客户端 120 秒后重试）；登录照样成功（令牌照发），只是不建行、不绑定；已经有行的设备照常更新。
   - 被删的设备再上报时重新建行，并因为 `sysinfo = ''` 重新索取 sysinfo（§10）。真实设备每 15 秒心跳一次（`last_seen_at` 最多落后 60 秒，§10），所以正常情况下最老的行是已经不再上报的设备。但上报方能让自己的行一直保持最新（心跳的 `ver` 由上报方自己填，每次换一个就会写 `last_seen_at`），有人故意灌表时，在线的可淘汰设备（无主的，或上面几种没有令牌的有主设备）也可能先被挤掉，丢的是 `first_seen_at`、sysinfo 和那几种设备的归属；连接和策略下发不受影响。
   - 挑最老行不读表里排在 8 KB sysinfo 后面、落在溢出页的 `last_seen_at`（审查 C-16），两支都按 `last_seen_at` 顺序读索引，取够条数就停：无主的一支读迁移 0002 的 `(user_id, last_seen_at)` 索引；有主的一支读迁移 0003 的部分索引 `device_owned_seen(last_seen_at, user_id, id) where user_id is not null`，令牌检查是 0003 的 `token(user_id, device_id)` 索引上的一次查找，最多多读"主人仍有令牌"的有主行（每人最多 50 行），要写 `indexed by`（只有 0002 的索引时优化器对 `user_id IS NOT NULL` 选全表扫描）。审查 D-6：原来有主的一支在 0002 的索引上按 `user_id` 范围扫描后排序全部有主行，逐行回表取 id、逐行查主人的全部令牌；实测（测试机，debug 构建，热缓存）1 万行有主设备、各带 8 KB sysinfo、令牌在最老的 50 台上时，一次 `make_room` 从约 40~90 ms 降到约 0.3~1 ms。
@@ -511,19 +537,24 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 
 **响应签名**：`Leapgate-Server-Sig: <base64url(签名 64 字节)>`，被签内容 `"leapgate-server-v1\0" ‖ 请求的签名(64 字节) ‖ sha256(响应体)`，用 `AppState.sk`。2xx 和 `bad_auth` 以外的 401 带签名；`bad_auth`、400、404、405、413、429、503 不带。服务端没有私钥（`-k` 传公钥）时都不带。
 
-**心跳**（`device::leapgate_heartbeat`）：请求体 JSON 对象，键不出现表示没有：`uuid`、`ver`、`leapgate`（客户端 `libs/leapgate` 的版本）、`strategy_rev`、`sysinfo_hash`（标准 base64 的 sha256）、`sysinfo`（对象，按原始字节收）、`routing_rev`（第三期 02 块：客户端手里那份中继列表的版本，没有为 0）、`probes`（02 块：最近一轮测速，`{routing_rev, age_s, rtt: {原串: 毫秒}, down: [原串]}`，契约 02 §2.2）。`conns` 不读，serde 跳过。`probes` 先收成任意 JSON 值，形状不对只丢这轮测量（§7 第二级），不回 400。流程：
-1. 解析；`uuid` 超长 400；`sysinfo` 原文超过 8 KB 413；`sysinfo` 里 `hostname`、`username`、`os`、`version` 类型不对 400；`routing_rev` 不是整数 400。
-2. 写 `Peer.leapgate_hb = { at: now, leapgate_ver }`，`leapgate_ver = get_version_number(leapgate)` 限到 u32（解析不出为 0）。400、413 的心跳和 Leapgate 审计都不写它。带了 `probes`：`router.record_probes(签名头里的 ID, probes)`；没带（或是 `null`）：`router.forget_probes(签名头里的 ID)`（§7 第二级）。
+**心跳**（`device::leapgate_heartbeat`）：请求体 JSON 对象，键不出现表示没有：`uuid`、`ver`、`leapgate`（客户端 `libs/leapgate` 的版本）、`strategy_rev`、`sysinfo_hash`（标准 base64 的 sha256）、`sysinfo`（对象，按原始字节收）、`routing_rev`（第三期 02 块：客户端手里那份中继列表的版本，没有为 0）、`probes`（02 块：最近一轮测速，`{routing_rev, age_s, rtt: {原串: 毫秒}, down: [原串]}`，契约 02 §2.2）、`exit`（第四期：布尔值，被控端此刻接受出口登录；客户端为真时带 `"exit": true`、为假时不带，服务端不出现当 false，`true`/`false` 两种写法都收；不落库，也不收放行网段）。`conns` 不读，serde 跳过。`probes` 先收成任意 JSON 值，形状不对只丢这轮测量（§7 第二级），不回 400。流程：
+1. 解析；`uuid` 超长 400；`sysinfo` 原文超过 8 KB 413；`sysinfo` 里 `hostname`、`username`、`os`、`version` 类型不对 400；`routing_rev` 不是整数 400；`exit` 出现了但不是布尔值（含 `null`）400。
+2. 写 `Peer.leapgate_hb = { at: now, leapgate_ver, exit }`（整条替换，所以一次不带 `exit` 的心跳就把它改回假），`leapgate_ver = get_version_number(leapgate)` 限到 u32（解析不出为 0）。400、413 的心跳和 Leapgate 审计都不写它。带了 `probes`：`router.record_probes(签名头里的 ID, probes)`；没带（或是 `null`）：`router.forget_probes(签名头里的 ID)`（§7 第二级）。
 3. 带了 `sysinfo`：`store_sysinfo(…, "leapgate")`，原文按请求里的字节原样存。
 4. `touch(…, "leapgate")` 写设备行，得到库里现存的 sysinfo 原文。
 5. 有设备行，且库里 sysinfo 为空或 `base64(sha256(原文)) != sysinfo_hash` → 响应带 `need_sysinfo: true`；没能建行时不带这个键。
 6. `strategy::effective`，`rev != strategy_rev` 时带 `strategy: {rev, options}`（全部生效选项，值一律字符串，空串表示删键）。
 7. `routing_rev` 不等于路由模块当前的列表版本时带 `routing: {rev, probe_interval_secs: 300, relays: [前 32 台原串]}`（§7 第二级；没有配置中继时 `relays` 为 `[]`，客户端停止测速）；相等时不带。
-8. 签名回 200：`{"api": 1, "features": ["ice"], "time": <服务器 unix 秒>, …}`。`features` 是常量数组，05 块合入后为 `["ice"]`（自研 ICE，常量，没有会合私钥时照样宣告；02 块不加特性项，客户端看响应里有没有 `routing`）。查库失败一律 503。
+8. 签名回 200：`{"api": 1, "features": ["ice", "exit"], "time": <服务器 unix 秒>, …}`。`features` 是常量数组：`"ice"` 是自研 ICE（05 块，没有会合私钥时照样宣告；02 块不加特性项，客户端看响应里有没有 `routing`）；`"exit"`（第四期）只表示这台服务端有出口目录接口（§12.4），不表示有可用的出口，客户端靠它决定要不要请求目录。第三期客户端把 `features` 当任意字符串列表存，不认识 `"exit"` 也不受影响。查库失败一律 503。
 
 哈希只算在 sysinfo 这个 JSON 值的原始字节上；服务端原样存那段字节，比对时当场算，不加列。兼容路径存的是整个兼容请求体，哈希必然不同，所以设备从兼容路径切到 Leapgate 路径后会重传一次 sysinfo。
 
 **审计**（`audit::leapgate_conn/file/alarm`）：请求体同兼容接口，`id` 取签名头里的；和兼容 handler 共用结构体、截断规则和写库函数（`conn_inner`、`file_inner`、`alarm_inner` → `report`，身份参数 `Identity::Verified` 不查身份），nonce 去重表两条路径共用，同一条审计从哪条路径到达都只记一次。没有会话备注分支（`conn` 里的 `note` 键忽略，按普通上报处理）。成功（含 nonce 重复）签名回 200 + `{"api":1}`；写库失败 503，nonce 不登记，客户端重试时能入库。
+
+### 9.6 两个 Leapgate 前缀的分工（第四期）
+- `/api/leapgate/v1/`：设备签名的上报接口（§9.5）。错误体 `{"error": <码>, "message": …}`，可以回 503，整请求超时 10 秒（`is_report`），2xx 签名。
+- `/api/leapgate/user/v1/`：Leapgate 客户端凭用户令牌（`Authorization: Bearer`）调的接口，现在只有出口目录 `GET /api/leapgate/user/v1/exits`（§12.4）。照 §9.1 的通则：不回 5xx，错误体 `{"error": …}`，令牌无效、没带、账号禁用回 401 `{"error":"Unauthorized"}`，认证那一步查库失败回 200 `{"error":"Server error"}`（提取器 `CurrentUser` 的现有行为），之后的查库失败回 400 `{"error":"Server error"}`，用错方法 405 `{"error":"Method Not Allowed"}`，整请求超时 20 秒（回 400 `{"error":"Request timeout"}`），请求体上限用默认的 16 KB。响应不签名：现有的响应签名绑定设备的请求签名，套不到用户接口上。`is_leapgate`、`is_report` 按 `devauth::PREFIX` = `/api/leapgate/v1/` 判断，这个前缀不以它开头，所以都不算。
+- 以后再加用户令牌接口，都放后一个前缀。
 
 ## 10. 心跳与策略（`strategy.rs`、`device.rs`）
 
@@ -545,11 +576,13 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 
 - 密码：argon2id（`argon2` crate 默认参数）。校验时按前缀识别 `$argon2id$`、`$2a$/$2b$/$2y$`（bcrypt）、`md5:`（rustdesk-api 旧格式 `md5(明文+"rustdesk-api")`，笔记 05 §3）；旧格式校验通过后当场改存 argon2id，只在库里仍是刚校验的旧哈希时才写（期间 `user passwd` 改过的不覆盖，这次登录回 401）；库里已被另一个并发登录升级成 argon2id、且本次明文能通过它时照常签令牌。`password_hash = ''` 的账号不能密码登录。
 - 令牌：32 字节随机数的 base64url（无填充），库里只存 sha256 hex。没有过期时间，但每个用户最多保留 50 条：登录时在插入新令牌的同一个事务里，删掉该用户按 `last_used_at` 降序（相同再按 rowid 降序）排在 50 名以外的令牌，也就是淘汰最久没用的（否则知道密码的人反复登录就能无限攒令牌行）；改密码、禁用账号时删掉该用户的全部令牌，登出删哪些见下。每次使用更新 `last_used_at`。
-- 登录时把请求体里的设备 `id`/`uuid` 记进令牌行；再做 §9.3 同样的校验：只有 `peer` 表里有这个 id 且 uuid 相符时，才把 `device.user_id` 设成这个用户（设备行不存在就建，建行和上报一样受 §9.3 的行数上限约束：表满且没有可淘汰行时登录照常成功，只是不建行、不绑定，审查 D-7）；uuid 不符时登录照常成功但不改 `device.user_id`（防止别人把你的设备挂到自己名下）；公钥锁定（第三期，§9.5）不影响登录绑定，锁定后照样能凭 uuid 改绑主人。"设备主人"这个身份的加固（已锁定设备的登录不再覆盖已有主人、命令行指定主人）放到第四期，和 Exit Node 一起做；`peer` 表里没有这个 id 时登录照常成功，不建设备行、不绑定（令牌行照样记 id/uuid）。
-- 延迟补绑：登录时还没在 hbbs 注册的设备（例如开着 stop-service 登录、之后才启动服务），由之后的心跳或 sysinfo 补上归属：请求通过 §9.3 的 uuid 校验、且 `device.user_id` 为 NULL（含刚建的行）时，取 `token` 表里 `device_id` = 这个 id、`device_uuid` = 请求里的 uuid、账号 `status = 1` 的令牌中 `last_used_at` 最新的一行，把它的 `user_id` 写进 `device.user_id`。查令牌和写归属在写设备行的同一条语句里完成（`user_id = coalesce(user_id, (select … from token …))`），中间插不进登出（审查 C-24）；心跳只在写库时补绑（§10，最多晚 60 秒）。安全性和登录时绑定相同：令牌行的 uuid 要等于刚和 `peer.uuid` 比对过的那个。已有主人的设备不改。已知边角：A 在设备上登录过、登出请求没送到，B 再登录接管后又登出，下一次心跳会把设备补绑回 A（A 的旧令牌还在）。不处理：登出时连别人的同设备令牌一起删，会让伪造 `device_id` 的人能删掉别人的令牌；归属只决定设备在组面板（§12.3）里列在谁名下，不影响策略和连接权限，而 A 本来就在这台设备上登录过，补错的后果有限。
-- 登出时删掉当前令牌，连同本人 `device_id` 相同、签发不晚于当前令牌（`created_at <= 当前令牌的 created_at`）、而且当前令牌签发以来没再用过（`last_used_at <= 当前令牌的 created_at`）的令牌：一个客户端只持有最新一枚，更早签发又没再用过的是废令牌，留着的话下一次心跳就会把设备补绑回来。签发更晚的（登出请求还在路上时用户重新登录拿到的）和签发后还用过的保留（审查 C-5、C-20）。`device_id` 为空的令牌不受影响。之后若 `device.user_id` 是本人则清空。
-  - 已知边角：同一台机器上多个系统账户登录同一个 Leapgate 账号时，它们上报的 id、uuid 相同，各自存自己的令牌，服务端分不清。一方登出时，另一方的令牌只要在登出那枚签发之后用过就保留（之后写库的心跳会把设备补绑回这个账号，这是对的）；从那以后一直没用过的会被一起删掉，那个系统账户下次调用接口时收到 401、被客户端登出，重新登录即可。
-  - 另一个边角：用户重新登录的瞬间，还在路上的旧令牌请求晚于新令牌到达，会把旧令牌的 `last_used_at` 推后，让它逃过之后那次登出的删除，并把设备补绑回本人，和延迟补绑那条里的"补绑回 A"同类。
+- 登录时把请求体里的设备 `id`/`uuid` 记进令牌行；再做 §9.3 同样的校验：只有 `peer` 表里有这个 id 且 uuid 相符时，才把 `device.user_id` 设成这个用户（设备行不存在就建，建行和上报一样受 §9.3 的行数上限约束：表满且没有可淘汰行时登录照常成功，只是不建行、不绑定，审查 D-7）；uuid 不符时登录照常成功但不改 `device.user_id`（防止别人把你的设备挂到自己名下）。第四期起（A1）：公钥已锁定（`peer.pk_pinned_at` 非空，§9.5）的设备只在没有主人时绑定，另一个账号 uuid 相符的登录不再覆盖已有主人；锁定与否在写设备行的同一条语句里读（`case when exists(… pk_pinned_at is not null) then coalesce(user_id, excluded.user_id) else excluded.user_id end`）。已锁定的设备要换主人：原主人在设备上登出（本人在这台设备上没有别的令牌时，登出清掉本人的绑定，见下），或者运维用 `device owner`（§14）；所以多人轮流登录的共用机器，换人前要先登出上一个账号，登出请求没送到时要运维改。主人被 `user disable` 停用时同理：停用只删令牌、不清主人，他名下已锁定的设备不会被别人的登录接管，要运维用 `device owner` 改（`user enable` 后设备仍归他）。没锁定的设备（原版客户端走兼容路径，永远不会锁定）照旧由后登录的覆盖，`device owner` 设的主人也会被下一次登录换掉。已锁定、此刻没有主人的设备（新装还没人登录过、主人登出后、`device owner <ID> none` 后、设备行被淘汰重建后）登录先到先得：第一个用匹配的 ID 和 uuid 登录的账号成为主人，后果只在归属（组面板、出口目录里的 `own`），能不能用出口仍要过被控端的认证；要固定主人用 `device owner`。表满、没能建行时已锁定设备的登录不绑定，之后有了空位延迟补绑也不会补（令牌签发晚于锁定），要在设备上重新登录。`peer` 表里没有这个 id 时登录照常成功，不建设备行、不绑定（令牌行照样记 id/uuid）。
+- 延迟补绑：登录时还没在 hbbs 注册的设备（例如开着 stop-service 登录、之后才启动服务），由之后的心跳或 sysinfo 补上归属：请求通过 §9.3 的 uuid 校验、且 `device.user_id` 为 NULL（含刚建的行）时，取 `token` 表里 `device_id` = 这个 id、`device_uuid` = 请求里的 uuid、账号 `status = 1` 的令牌中 `last_used_at` 最新的一行，把它的 `user_id` 写进 `device.user_id`。查令牌和写归属在写设备行的同一条语句里完成（`user_id = coalesce(user_id, (select … from token …))`），中间插不进登出（审查 C-24）；心跳只在写库时补绑（§10，最多晚 60 秒）。安全性和登录时绑定相同：令牌行的 uuid 要等于刚和 `peer.uuid` 比对过的那个。已有主人的设备不改。
+  - 第四期起（A1）：已锁定的设备只认锁定之前签发的令牌（`not exists (select 1 from peer p where p.id = ?1 and p.pk_pinned_at < t.created_at)`，比较的是 unix 秒，同一秒签发的算"之前"）。理由：锁定以后设备一定已在会合服务器注册，真主人在它上面登录时由登录直接绑定，用不着补绑；锁定之后签发、却还要靠补绑的令牌，只可能来自"登录时设备已有主人、没绑上"的人（例外见本条末尾的 `device key reset`）。本人在同一台机器另一个系统账户上的令牌不靠补绑：登出时本人在这台设备上还有令牌，就不清主人（下面登出那条）。不加这条，知道设备 ID 和 uuid 的人登录一次就留下令牌，真主人一登出，下一次心跳就把设备补到他名下，设备随之以 `own: true` 出现在他的出口目录里（§12.4）。"先登录、后注册"的新装设备照常补绑：令牌签发时设备还没注册，早于锁定；第一次签名心跳在 `SignedBody` 第 8 步先锁定，handler 里的 `touch` 再补绑。不选"已锁定设备整个关掉补绑"：那样先登录、后注册的新装设备就没有补绑了。这条只防被动补绑，挡不住设备没有主人时的主动登录（见上一条）。`device owner <ID> none` 之后，已锁定的设备只会被锁定之前签发的令牌补回，没锁定的会被这台设备上最近用过令牌的人补回。`device key reset`（不带 `--forget`，§14）之后设备下一次签名上报按当时的时间重新锁定，锁定时间被推后：原锁定到重新锁定之间别的账号在这台设备上留下的令牌（登录时设备已有主人、没绑上的）也算"锁定之前"，设备之后没有主人时（主人登出、`device owner <ID> none` 后）可能被补给其中最近用过令牌的人。后果只在归属，补错了用 `device owner` 改回（契约 01 §7 第 13 条）。
+  - 已知边角（只剩没锁定的设备）：A 在设备上登录过、登出请求没送到，B 再登录接管后又登出，下一次心跳会把设备补绑回 A（A 的旧令牌还在）。不处理：登出时连别人的同设备令牌一起删，会让伪造 `device_id` 的人能删掉别人的令牌；没锁定的设备通常是原版客户端（当不了出口；Leapgate 设备第一次签名心跳就锁定），归属只决定它在组面板（§12.3）里列在谁名下，不影响策略和连接权限，而 A 本来就在这台设备上登录过，补错的后果有限。已锁定的设备上，归属还决定它以 `own: true` 出现在谁的出口目录里，后果不再"有限"，所以才有上面那条。
+- 登出时删掉当前令牌，连同本人 `device_id` 相同、签发不晚于当前令牌（`created_at <= 当前令牌的 created_at`）、而且当前令牌签发以来没再用过（`last_used_at <= 当前令牌的 created_at`）的令牌：一个客户端只持有最新一枚，更早签发又没再用过的是废令牌，留着的话下一次心跳就会把设备补绑回来。签发更晚的（登出请求还在路上时用户重新登录拿到的）和签发后还用过的保留（审查 C-5、C-20）。`device_id` 为空的令牌不受影响。之后若 `device.user_id` 是本人、且本人在这台设备上已没有令牌则清空。
+  - 已知边角：同一台机器上多个系统账户登录同一个 Leapgate 账号时，它们上报的 id、uuid 相同，各自存自己的令牌，服务端分不清。一方登出时，另一方的令牌只要在登出那枚签发之后用过就保留（设备仍归这个账号：登出不清主人）；从那以后一直没用过的会被一起删掉，那个系统账户下次调用接口时收到 401、被客户端登出，重新登录即可。
+  - 另一个边角：用户重新登录的瞬间，还在路上的旧令牌请求晚于新令牌到达，会把旧令牌的 `last_used_at` 推后，让它逃过之后那次登出的删除，设备因此仍归本人，和延迟补绑那条里的"补绑回 A"同类。
 - 走代理或 WebSocket 的客户端在 hbbs 注册不了（会合模块的 TCP 路径不做注册，§1），`peer` 表里没有它们，所以既不会被绑定，心跳也只拿到 `{}`，收不到策略。
 - 登录请求里的 `id` 超过 253 字节（`MAX_PEER_ID_LEN`）或 `uuid` 超过 128 字节时回 400 + `{"error": "…"}`，不写令牌行（和用户名超长一样，在查库前拒绝）。令牌行的 `device_id` 会被结果记录模块复制进每一行 `conn_attempt`（§8），不限长度时登录一次就能让之后每条连接记录都带着任意长的文本。
 - 账号可用的判定写死为 `status = 1`。
@@ -598,6 +631,16 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 - `/api/device-group/accessible` 回 `{"total":0,"data":[]}`。
 - `status`（在线）按 `PeerMap` 的内存在线判定；字段和类型照笔记 03 §3。
 
+### 12.4 出口目录（第四期，`exit.rs`）
+`GET /api/leapgate/user/v1/exits`，头 `Authorization: Bearer <用户令牌>`，没有请求体、查询参数，不分页。错误按 §9.6 的后一个前缀。成功回 200 `{"exits": [{"id", "hostname", "owner", "own"}, …]}`，一个都没有时 `{"exits": []}`：
+- `id` 设备 ID；`hostname` 是 `device.hostname`，没有设备行或还没收到 sysinfo 时为 `""`；`owner` 是主人的用户名，没有主人为 `""`；`own` 表示主人就是请求者。每条恰好这四个键，不给 IP、系统用户名、系统版本、离线设备。
+- 列谁：主人是我的设备（`device.user_id`），加上 `exit_grant` 里授权给我本人、或授权给我所在任一组的设备（查询时按 `group_member` 展开，成员变了当场生效；授权写完立即生效，不需要控制台通知运行中的服务）。同一台设备满足几条也只列一次。先列 `own` 为真的，再按 `id` 排序。管理员和普通用户一样，没有全局视图，要看全部授权用 `exit list`（§14）。
+- 只列此刻可用的（`exit::available`），三条同时成立：UDP 注册在 30 秒内（`last_reg_time`，和组面板的在线判断同一个 `ONLINE_TIMEOUT`）；最近一次验签通过的 Leapgate 心跳在 180 秒内（`LEAPGATE_HB_FRESH`，§3）；那次心跳的 `exit` 为真（§9.5）。在线状态只查内存（`get_in_memory`），不经主池加载：不在内存里的设备 30 秒内没注册过，本来就不可用。不要求公钥已锁定、不看 Leapgate 版本：带 `exit` 的心跳只有第四期客户端会发；设备谎报 `exit` 只影响它出现在谁的目录里（它的主人和被授权的人），不扩大谁能连。
+- 授权给已删除设备、还没上报过的设备时，`left join` 得到空的主机名和主人；它们在线时照样列出。候选是"自己名下的设备行"（受设备表 1 万行约束）加"授权行"（管理员手工维护），所以不分页、不另设上限。
+- 目录只是建议，不是关口：授权表只影响目录，撤销授权不断开已有会话，也挡不住知道设备密码的人（不在目录里的设备照样能手填 ID 使用）。要切断某人，在被控端关掉出口开关。响应不签名，靠部署的 HTTPS 防篡改；控制端只在打开目录时取一次，不轮询。
+- 延迟：开关切换后最多一个心跳周期（空闲时 15 秒）才反映到目录；心跳停了以后 UDP 注册 30 秒过期，最多晚 30 秒消失。服务端重启后，要等设备的下一次注册和心跳才回到目录。走 WebSocket 或代理、在会合服务器注册不了的被控端不会出现在目录里（§1：TCP 注册不做）。
+- 服务端策略下发不了出口开关：`strategy set`、`unset` 本来就拒收 `leapgate-` 开头的键（§14）。
+
 ## 13. 密码字段加密（`crypto.rs`）
 
 - 工作目录下的 `leapgate_secret.key`（32 字节随机数，权限 0600，和 `id_ed25519` 放在一起）。**只有服务模式**在缺失时生成；命令行（含 import）只读已有的文件，不存在就报错退出，提示到服务的工作目录下运行或先启动一次服务（否则在别处跑命令行会多生成一把密钥，导入的密码就解不开了）。服务模式发现文件不存在、库里却已有密文（`select 1 from ab_peer where hash_enc <> '' or password_enc <> '' limit 1` 查到行）时拒绝启动，报错提示恢复密钥文件，或有意清空这两列（已存的密码全部作废）；不生成新密钥。
@@ -614,13 +657,19 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
 - `device list [--legacy]`：id、主机名、账号、客户端类型和版本、最后上报时间；`--legacy` 只列原版客户端（退出兼容时用），并同时列出 `conn_attempt` 里出现过、但 `device` 表里没有的 id（`b_id` 配 `b_version`；`a_device_id` 非空时配 `a_version`），标注"仅见于会合"。输出注明：从不发心跳、也从没参与过连接的设备统计不到。
 - `device key <device>`（第三期，只读）：公钥指纹（小写 hex，每 4 个字符空一格，和客户端 `pk_to_fingerprint` 同格式）、锁定时间或"未锁定"、uuid 字节数、同一 uuid 下的其他 ID（重装后换了 ID 的设备由此能看出来）。新设备装好后用它和设备界面上的指纹核对一次（锁定是首次使用即信任）。
 - `device key reset [--forget] <device>`（第三期，§9.5 的公钥锁定）：**只由命令行改库**，能打开数据库文件就是授权；控制台不认证（本机任一进程都能连），所以不提供改库的命令。
-  - 默认只清锁定：`update peer set pk_pinned_at = null where id = ?`，保留 uuid 和公钥。用途是卸载时删了配置的重装：uuid 来自机器、不变，重装后的设备按现有规则（同 uuid、同 IP 可以换公钥）保住原 ID。要在旧安装停止运行之后、重装的设备重新注册之前执行：旧安装还在跑时，它下一次签名心跳就把旧公钥重新锁上。已经因 `UUID_MISMATCH` 换成随机 ID 的，reset 后在设备上把 ID 改回原来的。
-  - `--forget`：`delete from peer where id = ?`，给 uuid 也变了的情况（换硬件、重装系统）。删行后这个 ID 谁都能注册、抢到的人发一次签名心跳就锁定了自己的公钥，所以只在新设备已经在线（已换成随机 ID）时执行，执行后立刻在设备上把 ID 改回原 ID。`device`、`device_policy`、`strategy_option` 里按 ID 存的行不受影响。
+  - 默认只清锁定：`update peer set pk_pinned_at = null where id = ?`，保留 uuid 和公钥。用途是卸载时删了配置的重装：uuid 来自机器、不变，重装后的设备按现有规则（同 uuid、同 IP 可以换公钥）保住原 ID。要在旧安装停止运行之后、重装的设备重新注册之前执行：旧安装还在跑时，它下一次签名心跳就把旧公钥重新锁上。已经因 `UUID_MISMATCH` 换成随机 ID 的，reset 后在设备上把 ID 改回原来的。重新锁定的时间晚于原锁定，原锁定以来别的账号在这台设备上留下的令牌也算"锁定之前"，设备之后没有主人时可能被延迟补绑给其中一人（§11、契约 01 §7 第 13 条）；补错了用 `device owner` 改回。不在 reset 时删别人的令牌：那样会把同一台机器上其他系统账户里登录着别的账号的人一起登出。
+  - `--forget`：`delete from peer where id = ?`，给 uuid 也变了的情况（换硬件、重装系统）。删行后这个 ID 谁都能注册、抢到的人发一次签名心跳就锁定了自己的公钥，所以只在新设备已经在线（已换成随机 ID）时执行，执行后立刻在设备上把 ID 改回原 ID。`device`、`device_policy`、`strategy_option`、`exit_grant` 里按 ID 存的行不受影响：这些行（含设备主人和出口授权）会被下一个注册这个 ID 的设备继承。
   - 改完库后连控制台发 `kl <id>`，让运行中的服务按库重载这个条目。回复以 `<id>: ` 开头（服务端的三种正常回复）才算成功，把回复接在输出后面，退出码 0。连不上控制台、或回复是别的（`Failed: …`、空串），库已改好、不回滚，报错说明服务端没有重载、附上回复原文，提示"服务若在运行，需要重启 leapgate-server 才会生效"，退出码非零。没重载时，解锁也会在设备下一次用新公钥注册时生效（§6 第 7 条：注册前先按库重载锁定的条目）；删行则由服务端在下一次注册时发现行不在、移除条目。
   - 库里没有这个 ID 时报错，并提示"如果上次重置时服务端没有重载，请重启 leapgate-server"。ID 为空或含空白（控制台按空格拆命令）时报错。
 - 控制台 `kl <id>` / `key-reload <id>`（第三期）：只按库重载内存，谁都能触发，效果只是让内存和库对齐。条目在内存里：库里有行就把内存刷成库里的值（含 `pinned`），回 `<id>: reloaded from the database`；库里没有行就移除条目，回 `<id>: not in the database, dropped from memory`。不在内存里回 `<id>: not in memory, nothing to reload`。走主池（连接任务，不占会合池）。
 - `strategy show [<device>]`（列出生效选项和 rev）、`strategy set <device|'*'> <key> <value>`、`strategy unset <device|'*'> <key>`（写成墓碑 `''`，让客户端删掉这个键；`set`、`unset` 拒收 `leapgate-` 开头的键，§10）、`strategy forget <device|'*'> <key>`（删行，不再下发这个键；设备级删掉后回到全局值）、`strategy repush <device|'*'>`（递增 epoch）
 - `device pin-relay <device> <host|none>`
+- `device owner <device> <user|none>`（第四期 A1）：在一个 `begin immediate` 事务里 `update device set user_id = ? where id = ?`，`none` 写 NULL。只写 `device.user_id`，不另存"命令行指定"的标记：组面板、`device list`、登出清主人、延迟补绑和出口目录读的都是这一列。要求设备行已存在（在线的出口设备一定有行），影响 0 行时报错 `<device> has no device row (it has not reported to this server, or its row was evicted)`，什么都不写；不替设备建行，免得绕过设备表上限。没有这个用户时报错（名叫 `none` 的用户不能用这个命令指定，同 `pin-relay` 的 `none`）。指定了用户时同一事务里 `insert into device_policy(device_id) values(?) on conflict do nothing`：只为借用 §9.3 的淘汰保护，新行的 `relay_pin` 默认 `''`、`strategy_epoch` 默认 0，和没有这一行等价，策略 rev 不变；已有的行不动。`none` 不删这一行（它可能带着 `pin-relay` 的设置）。输出：设了主人时 `<device> is now owned by <user>`，设备没锁定时追加一行 `<device> has no pinned key yet: the next login on it replaces the owner`；`none` 时 `<device> has no owner now; a login on it, or a login token left on it (late binding), may bind it again`。
+- `exit grant|revoke <device> --user <u>|--group <g>`、`exit list`（第四期，§12.4）：
+  - `grant`：先查 `peer` 表有没有这个 ID，没有时报错 `<device> is not registered with this server`（挡手误，也挡"先授权、后被人抢注这个 ID"）；不查在线和出口开关。用户、组查不到时报错；`--user`、`--group` 恰好给一个。重复授权不报错、只留一行；给主人本人授权不拒绝（目录里去重）。输出 `user:bob may use exit <device>: it shows in their exit directory while it is online with the exit on`。
+  - `revoke`：不查 `peer` 表（已删除设备的授权也能撤）。没有这条授权时输出 `user:bob had no grant on exit <device>`，否则输出 `Revoked user:bob on exit <device>. This only changes the exit directory: sessions already open stay, and anyone who knows the device's password can still use it`。
+  - `exit list`（只读）：一台设备一行，列 `DEVICE`、`OWNER`、`GRANTED TO`（`user:bob, group:ops`，用户在前）；没有授权时输出 `(no exit grants)`。末尾固定一行 `Owners always see their own devices. Whether an exit is online and on is known only to the running server.`：命令行进程读不到服务进程的内存，所以没有"此刻哪些出口在线"的命令。
+  - 授权每次查目录时都现查库，写完立即生效，不需要控制台通知运行中的服务。
 - `relay status`（控制台 `rs`；第三期末尾多一行 `measurements: <N> devices, <M> fresh`，§7 第二级）、`route test <ipA> <ipB> [--a <device>] [--b <device>]`（控制台 `tg <ipA> <ipB> <idA|-> <idB|->`，`-` 表示没有；ID 为空、是 `-` 或含空白时报错）。带 ID 时用这两台设备的第二级测量，每台可达中继后面标出两段用的是实测（`rtt 23ms` / `down`）还是估计（`est 21.3ms`，没有位置为 `est ?`），被实测 `down` 去掉的标 `no cost (measured down)`，这一行里用估计的那一端显示 `-`（没参加计算，没有值）；不带 ID 时输出和第一级一样。
 - `geo lookup <ip>`（直接读本地 mmdb：国家、经纬度、ASN、运营商组）、`geo update`（走控制台 `gu`，由服务进程执行下载、校验和热切换并回显结果；连不上控制台即服务没在运行时，才在命令行进程里直接下载，不做目录清理）
 - `stats [--days N]`：中继回落率和各结果计数（§8）；第三期 05 起另列一张 `ICE OUTCOME | COUNT` 表（`ice_result` 按 `at` 取同一时间范围），并注明"ICE 胜出的连接在上面仍按上游信令记成 relay/direct_tcp，上面的回落率会偏高，ICE 的实际直连看这里的 `connected`"。不加 `relay status` 的会话数一行，也不加别的命令：ICE 没有需要运维改的运行时状态
@@ -660,6 +709,7 @@ multi_bgp = false                 # 多线 BGP 机房：不算跨运营商
   - 会合集成（Harness，带 Key 的 `listener_as`、`online_ice`）：OFFER 转成 FORWARD（会合公钥验签、B 的私钥解密）；没做 KeyExchange 或 WebSocket 上发 OFFER 被断开；`OFFLINE`、`RELAY`、`UNSUPPORTED`（没锁定、心跳过期、版本 3009、小阶点）、`BUSY`（同一来源第 9 个）、`BAD`（Key 不对、15 字节 session、17 条候选）各一条；重发同字节、发往 B 的新地址、第三条忽略；ANSWER 带签过的 `IdPk` 到 A，A 不发 RESULT 就关 → 一行 `abandoned`；ANSWER 不合规、`get_pk` 为空 → A 收到 REJECT、A 关连接后没有 `abandoned`；B 的 REJECT 原样到 A；RESULT 只记第一条（版本不对、session 不对、第二条都忽略），之后关连接不再记 `abandoned`；STUN 回包、证明能打开、门槛和令牌桶、`::ffff:` 来源还原。
   - `conn_tracker`：RESULT 转成固定文字（`connected` 才记选中对的字段，不认识的数字记 `unknown`/NULL）；ICE 的两个上限单独计数、和 `conn_attempt` 互不占用；`ice_result` 的写入、90 天删除、20 万行修剪和 `stats` 计数。迁移 0006 在跑过 0001~0005、带数据的库上执行；`_sqlx_migrations` 条数等于 `migrations/` 的文件数（`migrates_existing_hbbs_database`）。
   - 变异验证：REJECT 各分支、公网 IPv4 证明、FORWARD 的签名和加密，以及 RESULT 的三条忽略规则、`abandoned` 的判定、ICE 上限单独计数，各改掉被测的那一行，测试都失败。
+- 第四期 01 块（出口目录与设备主人，契约 01 §5.1）的测试：迁移 0007（二选一约束、两个唯一索引、删用户和删组级联、删设备行不影响授权；条数由 `migrates_existing_hbbs_database` 覆盖）；心跳 `exit`（不带为假、带 `true` 为真、之后不带改回假、非布尔值 400 且不改内存记录，`features` 为 `["ice", "exit"]`）；`available` 的三个条件各差一点（注册 29/31 秒、心跳 179/181 秒、`exit` 假、没有心跳记录）；目录接口（401 的三种、405 和库关掉后 200 `{"error":"Server error"}` 的通则格式，主人、授权给本人、授权给组、组员移除和删组、去重、没有设备行的 ID、管理员没有全局视图、恰好四个键、排序，以及真实签名心跳带 `exit` 后在 UDP 注册时列出）；登录绑定（已锁定有主不改、已锁定无主照绑、原主人登出后下一个登录绑定）；延迟补绑（`touch` 的更新、插入和 `store_sysinfo` 三条路径上锁定之后签发的令牌不补绑、同一秒的照补，没锁定照旧，先登录后注册的设备第一次签名心跳既锁定又补绑）；`device owner`（写主人和默认 `device_policy` 行、已有行不变、rev 不变、`none`、报错时不写、没锁定时的提示行、之后别人的登录不改主人、组面板和目录里是新主人、表满时不被淘汰）；`exit grant|revoke|list`（各种报错、重复授权一行、输出文案、表格和末尾行、撤销不查 `peer`）；`changes_database` 对 `exit list` 为假、对 `exit grant`、`exit revoke`、`device owner` 为真。变异验证：延迟补绑的锁定条件、登录绑定的 `case`、`available` 的三个条件、目录查询的组授权分支。
 - 第一期验收（部署后由维护者用原版客户端做）：登录、地址簿、设备列表、审计正常；被控端本地写死的中继能被远程清掉；中继按双方位置选择；控制端勾选 IPv6 后两端都有 IPv6 时能直连。
 
 ## 17. 工程约定

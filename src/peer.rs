@@ -110,7 +110,13 @@ pub(crate) struct Peer {
 pub(crate) struct LeapgateHb {
     pub at: Instant,
     pub leapgate_ver: u32,
+    /// The heartbeat's `exit` (phase 4): the device accepts exit logins now.
+    pub exit: bool,
 }
+
+/// How recent the last signed Leapgate heartbeat must be: ICE support (`ice_signal::b_supports_ice`)
+/// and an available exit (`api::exit::available`). One is due every 15 s, backing off to 60 on failures.
+pub(crate) const LEAPGATE_HB_FRESH: Duration = Duration::from_secs(180);
 
 impl Default for Peer {
     fn default() -> Self {

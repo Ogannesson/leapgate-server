@@ -9,6 +9,7 @@ pub(crate) mod account;
 pub(crate) mod audit;
 pub(crate) mod devauth;
 pub(crate) mod device;
+pub(crate) mod exit;
 pub(crate) mod group;
 mod listen;
 
@@ -84,6 +85,8 @@ pub(crate) fn router(state: AppState) -> axum::Router {
         .route("/api/leapgate/v1/audit/conn", post(audit::leapgate_conn).layer(limit(AUDIT_BODY_LIMIT)))
         .route("/api/leapgate/v1/audit/file", post(audit::leapgate_file).layer(limit(AUDIT_BODY_LIMIT)))
         .route("/api/leapgate/v1/audit/alarm", post(audit::leapgate_alarm).layer(limit(AUDIT_BODY_LIMIT)))
+        // Leapgate clients signed in with a user token (exit.rs; LEAPGATE.md §9.6)
+        .route("/api/leapgate/user/v1/exits", get(exit::exits))
         // Address book (ab.rs)
         .route("/api/ab/personal", post(ab::personal))
         .route("/api/ab/settings", post(ab::settings))

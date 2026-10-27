@@ -46,7 +46,7 @@ const MAX_SYSINFO_FIELD_LEN: usize = 253;
 /// fields, the id and uuid; measured with 4 KB pages, the primary key index included): 10,000 rows ≈
 /// 0.1 GB. Rows `make_room` may not evict are kept even past this, and reports and logins then
 /// create no rows; imports add rows without this check.
-const MAX_DEVICES: i64 = 10_000;
+pub(crate) const MAX_DEVICES: i64 = 10_000;
 /// Rows one `make_room` deletes at most when the table is past `MAX_DEVICES` (review D-7: deleting
 /// the whole excess in one write transaction held the write lock for seconds, and past the request
 /// timeout it was rolled back and started over by every next new row). 64 rows of 10.5 KB read cold
@@ -159,9 +159,13 @@ pub(crate) async fn uuid_matches(db: &SqlitePool, id: &str, uuid: Option<&str>) 
 /// uuid. The newest such token (`last_used_at`) of an enabled account gives the owner. As safe as
 /// the login's binding: the token's uuid is the one just checked against hbbs. Reading the token
 /// and writing the owner in one statement keeps a logout from deleting the token in between and
-/// being undone (review C-24).
+/// being undone (review C-24). A device whose key is pinned takes only a token issued before it was
+/// pinned (same second included, phase 4 A1): after pinning, its owner's login binds it directly,
+/// so a later token left to bind it is a login that found it owned, and must not take it over
+/// once the owner logs out.
 const OWNER_FROM_TOKEN: &str = "(select t.user_id from token t join user u on u.id = t.user_id
      where t.device_id = ?1 and t.device_uuid = ?2 and u.status = 1
+       and not exists (select 1 from peer p where p.id = ?1 and p.pk_pinned_at < t.created_at)
      order by t.last_used_at desc limit 1)";
 
 /// The `?1` oldest (`last_seen_at`) rows a report may delete to make room: unowned ones, and owned
@@ -459,7 +463,8 @@ pub(crate) async fn touch(
 
 /// Features of this server the Leapgate client may use (response `features`); block 05 (self-built
 /// ICE) adds `"ice"`, announced with or without the rendezvous private key (contract 05 §2.12).
-const LEAPGATE_FEATURES: &[&str] = &["ice"];
+/// `"exit"` (phase 4): this server has the exit directory `/api/leapgate/user/v1/exits`.
+const LEAPGATE_FEATURES: &[&str] = &["ice", "exit"];
 
 /// `POST /api/leapgate/v1/heartbeat` body (contract 01 §2.3, 02 §2.2); absent keys are absent values.
 /// The id comes from the signature (`SignedBody`). `conns` is not used.
@@ -485,6 +490,9 @@ struct LeapgateHeartbeatReq {
     /// The client's latest round of relay measurements; any JSON here, a bad one only drops the
     /// round (`Router::record_probes`), never the heartbeat.
     probes: Option<serde_json::Value>,
+    /// Phase 4: the device accepts exit logins now (`LeapgateHb::exit`); absent = false.
+    #[serde(default)]
+    exit: bool,
 }
 
 #[derive(Serialize)]
@@ -546,6 +554,7 @@ pub(crate) async fn leapgate_heartbeat(State(state): State<AppState>, signed: Si
     signed.peer.write().await.leapgate_hb = Some(LeapgateHb {
         at: Instant::now(),
         leapgate_ver,
+        exit: req.exit,
     });
     // Under the verified id: nobody can report measurements for another device.
     match &req.probes {
@@ -1215,10 +1224,137 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(left, ["newer", "sibling"]);
-        // Unbound by the logout; the spared tokens bind the device back on its next written heartbeat.
-        assert_eq!(owner(db, "111").await, None);
-        heartbeat(&t.app, json!({"id": "111", "uuid": uuid, "ver": 1005010, "modified_at": 0})).await;
+        // The spared tokens keep the owner.
         assert_eq!(owner(db, "111").await, Some(amy));
+    }
+
+    // ---- Phase 4 A1: owners of pinned devices ----
+
+    /// A login binds a pinned device only while it has no owner; the owner's logout frees it.
+    #[tokio::test]
+    async fn login_does_not_take_over_a_pinned_device() {
+        let t = testutil::app().await;
+        let db = &t.state.db;
+        let uuid = b64(UUID);
+        let (amy, _) = testutil::create_user(db, "pl-amy", "pw", false).await;
+        let (bob, _) = testutil::create_user(db, "pl-bob", "pw", false).await;
+        add_peer(db, "111", UUID).await;
+        pin(db, "111").await;
+        let amy_t = login(&t.app, "pl-amy", "111", &uuid).await;
+        assert_eq!(owner(db, "111").await, Some(amy));
+        login(&t.app, "pl-bob", "111", &uuid).await;
+        assert_eq!(owner(db, "111").await, Some(amy));
+        let (status, _, _) = send(&t.app, "POST", "/api/logout", Some(&amy_t), "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(owner(db, "111").await, None);
+        login(&t.app, "pl-bob", "111", &uuid).await;
+        assert_eq!(owner(db, "111").await, Some(bob));
+    }
+
+    /// The owner logged in on two system accounts of the same machine: logging out of one keeps the
+    /// device (no late binding brings it back once pinned); logging out of the last frees it.
+    #[tokio::test]
+    async fn pinned_device_stays_with_an_owner_still_logged_in() {
+        let t = testutil::app().await;
+        let db = &t.state.db;
+        let uuid = b64(UUID);
+        let (amy, _) = testutil::create_user(db, "po-amy", "pw", false).await;
+        add_peer(db, "111", UUID).await;
+        pin(db, "111").await;
+        let t1 = login(&t.app, "po-amy", "111", &uuid).await;
+        let t2 = login(&t.app, "po-amy", "111", &uuid).await;
+        sqlx::query("update token set last_used_at = created_at + 50 where token_hash = ?")
+            .bind(crate::auth::token_hash(&t2))
+            .execute(db)
+            .await
+            .unwrap();
+        let (status, _, _) = send(&t.app, "POST", "/api/logout", Some(&t1), "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(owner(db, "111").await, Some(amy));
+        let (status, _, _) = send(&t.app, "POST", "/api/logout", Some(&t2), "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(owner(db, "111").await, None);
+    }
+
+    /// The late binding of a pinned device takes only a token issued before (or in the same second
+    /// as) the pin, on each statement that writes the row.
+    #[tokio::test]
+    async fn late_binding_of_pinned_devices() {
+        let t = testutil::app().await;
+        let db = &t.state.db;
+        let uuid = b64(UUID);
+        let (bob, _) = testutil::create_user(db, "lp-bob", "pw", false).await;
+        const PINNED_AT: i64 = 1_700_000_000;
+        let token = |id: &'static str, created: i64| {
+            let uuid = uuid.clone();
+            async move {
+                sqlx::query("delete from token where device_id = ?").bind(id).execute(db).await.unwrap();
+                sqlx::query(
+                    "insert into token(token_hash, user_id, device_id, device_uuid, created_at, last_used_at)
+                     values(?, ?, ?, ?, ?, ?)",
+                )
+                .bind(format!("{id}-{created}"))
+                .bind(bob)
+                .bind(id)
+                .bind(uuid)
+                .bind(created)
+                .bind(created)
+                .execute(db)
+                .await
+                .unwrap();
+            }
+        };
+        let reset = |id: &'static str| async move {
+            sqlx::query("delete from device where id = ?").bind(id).execute(db).await.unwrap();
+        };
+        for id in ["upd", "ins", "sys"] {
+            add_peer(db, id, UUID).await;
+            sqlx::query("update peer set pk_pinned_at = ? where id = ?").bind(PINNED_AT).bind(id).execute(db).await.unwrap();
+        }
+        // `touch`'s update: the row is there (written on a changed `ver`).
+        for (created, want) in [(PINNED_AT + 1, None), (PINNED_AT, Some(bob))] {
+            token("upd", created).await;
+            reset("upd").await;
+            sqlx::query("insert into device(id, first_seen_at, last_seen_at) values('upd', 0, 0)").execute(db).await.unwrap();
+            super::touch(db, "upd", &uuid, created, "1.2.3.4", "leapgate").await.unwrap();
+            assert_eq!(owner(db, "upd").await, want, "update, token at {created}");
+        }
+        // `touch`'s insert.
+        for (created, want) in [(PINNED_AT + 1, None), (PINNED_AT, Some(bob))] {
+            token("ins", created).await;
+            reset("ins").await;
+            super::touch(db, "ins", &uuid, 1, "1.2.3.4", "leapgate").await.unwrap();
+            assert_eq!(owner(db, "ins").await, want, "insert, token at {created}");
+        }
+        // `store_sysinfo`.
+        for (created, want) in [(PINNED_AT + 1, None), (PINNED_AT, Some(bob))] {
+            token("sys", created).await;
+            reset("sys").await;
+            assert!(super::store_sysinfo(db, "sys", &uuid, "{}", Default::default(), "leapgate").await.unwrap());
+            assert_eq!(owner(db, "sys").await, want, "sysinfo, token at {created}");
+        }
+        // Unpinned: any token, as before.
+        sqlx::query("update peer set pk_pinned_at = null where id = 'ins'").execute(db).await.unwrap();
+        token("ins", PINNED_AT + 1).await;
+        reset("ins").await;
+        super::touch(db, "ins", &uuid, 1, "1.2.3.4", "leapgate").await.unwrap();
+        assert_eq!(owner(db, "ins").await, Some(bob));
+    }
+
+    /// Logged in before registering: the first signed heartbeat pins the key and binds the owner.
+    #[tokio::test]
+    async fn first_signed_heartbeat_pins_and_binds() {
+        let t = testutil::app().await;
+        let db = &t.state.db;
+        let uuid = b64(UUID);
+        let (amy, _) = testutil::create_user(db, "fs-amy", "pw", false).await;
+        login(&t.app, "fs-amy", "fresh1", &uuid).await;
+        assert_eq!(owner(db, "fresh1").await, None);
+        let dev = testutil::leapgate_device(&t.state, "fresh1", UUID).await;
+        let r = dev.post(&t.app, "heartbeat", json!({"uuid": uuid, "ver": 1}).to_string().as_bytes()).await;
+        assert_eq!(r.status, StatusCode::OK);
+        assert_eq!(count(db, "select count(*) from peer where id = 'fresh1' and pk_pinned_at is not null").await, 1);
+        assert_eq!(owner(db, "fresh1").await, Some(amy));
     }
 
     #[tokio::test]
@@ -1369,7 +1505,7 @@ mod tests {
         let rev = v["strategy"]["rev"].as_i64().unwrap();
         assert_eq!(rev, crate::strategy::effective(db, "leapgate1").await.unwrap().0);
         assert_eq!(v["strategy"]["options"], json!({"relay-server": ""}));
-        assert_eq!((&v["api"], &v["features"], &v["need_sysinfo"]), (&json!(1), &json!(["ice"]), &json!(true)));
+        assert_eq!((&v["api"], &v["features"], &v["need_sysinfo"]), (&json!(1), &json!(["ice", "exit"]), &json!(true)));
         assert!((v["time"].as_i64().unwrap() - crate::common::now() as i64).abs() <= 2);
         assert_eq!(device_row(db, "leapgate1").await, (String::new(), String::new(), "leapgate".into(), 1005010));
 
@@ -1459,6 +1595,36 @@ mod tests {
         // An unreadable version is 0.
         dev.post(&t.app, "heartbeat", json!({"leapgate": "x", "ver": 2}).to_string().as_bytes()).await;
         assert_eq!(peer.read().await.leapgate_hb.as_ref().unwrap().leapgate_ver, 0);
+    }
+
+    /// Phase 4 contract 01 §2.1: `exit` absent is false; each heartbeat replaces the record; a
+    /// non-boolean one is a 400 that leaves the record alone.
+    #[tokio::test]
+    async fn leapgate_heartbeat_exit() {
+        let t = testutil::app().await;
+        let dev = testutil::leapgate_device(&t.state, "leapgate5", UUID).await;
+        let exit = || async {
+            let p = t.state.pm.get_in_memory("leapgate5").await.unwrap();
+            let p = p.read().await;
+            p.leapgate_hb.as_ref().unwrap().exit
+        };
+        for (body, want) in [
+            (json!({"ver": 1}), false),
+            (json!({"ver": 2, "exit": true}), true),
+            (json!({"ver": 3, "exit": false}), false),
+            (json!({"ver": 4, "exit": true}), true),
+            (json!({"ver": 5}), false),
+            (json!({"ver": 6, "exit": true}), true),
+        ] {
+            let r = dev.post(&t.app, "heartbeat", body.to_string().as_bytes()).await;
+            assert_eq!(r.status, StatusCode::OK, "{body}");
+            assert_eq!(exit().await, want, "{body}");
+        }
+        for bad in [json!({"ver": 7, "exit": "yes"}), json!({"ver": 8, "exit": 1}), json!({"ver": 9, "exit": null})] {
+            let r = dev.post(&t.app, "heartbeat", bad.to_string().as_bytes()).await;
+            assert_eq!((r.status, &r.json()["error"]), (StatusCode::BAD_REQUEST, &json!("bad_request")), "{bad}");
+            assert!(exit().await, "{bad}");
+        }
     }
 
     /// Contract 02 §3.4: `routing` when the client's `routing_rev` is not the server's; `probes` are
